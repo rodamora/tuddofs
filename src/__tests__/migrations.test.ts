@@ -50,7 +50,10 @@ const frozenColumns = [
   ['afs_heads', 'size_bytes'],
 ] as const
 
-function fakePool(schema = frozenColumns.map(([table_name, column_name]) => ({ table_name, column_name }))) {
+function fakePool(
+  schema = frozenColumns.map(([table_name, column_name]) => ({ table_name, column_name })),
+  extraTables: readonly string[] = [],
+) {
   const state = { migrations: [] as { version: number; name: string }[], ddlApplications: 0 }
   return {
     state,
@@ -61,7 +64,13 @@ function fakePool(schema = frozenColumns.map(([table_name, column_name]) => ({ t
             return { rows: state.migrations as Row[], rowCount: state.migrations.length }
           }
           if (text.includes('FROM information_schema.tables')) {
-            const tables = [...new Set(schema.map(column => column.table_name)), 'afs_migrations'].sort()
+            const allTables = [
+              ...new Set([...schema.map(column => column.table_name), ...extraTables, 'afs_migrations']),
+            ]
+            const tables = text.includes("LIKE 'afs\\_%'")
+              ? allTables.filter(table_name => table_name.startsWith('afs_'))
+              : allTables
+            tables.sort()
             return { rows: tables.map(table_name => ({ table_name })) as Row[], rowCount: tables.length }
           }
           if (text.includes('FROM information_schema.columns')) {
@@ -85,6 +94,44 @@ function fakePool(schema = frozenColumns.map(([table_name, column_name]) => ({ t
     },
   }
 }
+
+test('migrate records migration 001 and makes the second call a schema-checked no-op', async () => {
+  const pool = fakePool()
+
+  await migrate(pool)
+  const firstDdlApplications = pool.state.ddlApplications
+  await migrate(pool)
+
+  assert.deepEqual(pool.state.migrations, [{ version: 1, name: 'initial schema' }])
+  assert.equal(pool.state.ddlApplications, firstDdlApplications)
+})
+
+test('migrate ignores cohabiting afsx_ tables when checking the frozen schema', async () => {
+  const pool = fakePool(undefined, ['afsx_cache'])
+
+  await migrate(pool)
+
+  assert.deepEqual(pool.state.migrations, [{ version: 1, name: 'initial schema' }])
+})
+
+test('migrate rejects a drifted frozen table with a typed error', async () => {
+  const schema = frozenColumns
+    .filter(([, column_name]) => column_name !== 'size_bytes')
+    .map(([table_name, column_name]) => ({ table_name, column_name }))
+  const pool = fakePool(schema)
+
+  await assert.rejects(migrate(pool), error => error instanceof SchemaDriftError)
+})
+
+test('migrate checks frozen schema drift when migration ledger is already applied', async () => {
+  const schema = frozenColumns
+    .filter(([, column_name]) => column_name !== 'size_bytes')
+    .map(([table_name, column_name]) => ({ table_name, column_name }))
+  const pool = fakePool(schema)
+  pool.state.migrations.push({ version: 1, name: 'initial schema' })
+
+  await assert.rejects(migrate(pool), error => error instanceof SchemaDriftError)
+})
 
 test('migrate records migration 001 and makes the second call a schema-checked no-op', async () => {
   const pool = fakePool()

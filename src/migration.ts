@@ -146,7 +146,7 @@ async function assertFrozenSchema(client: AgentFsClient): Promise<void> {
   const tables = await client.query<{ table_name: string }>(
     `SELECT table_name
      FROM information_schema.tables
-     WHERE table_schema = 'public' AND table_name LIKE 'afs_%'
+     WHERE table_schema = 'public' AND table_name LIKE 'afs\\_%'
      ORDER BY table_name`,
   )
   const expectedTables = [...tableNames, 'afs_migrations'].sort()
