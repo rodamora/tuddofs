@@ -1,0 +1,30 @@
+{
+  "name": "@cowork/agent-fs",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Canonical primitives for the Cowork agent filesystem",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "NODE_ENV=test node --import tsx --test 'src/**/__tests__/**/*.test.ts'",
+    "typecheck": "tsgo --noEmit -p tsconfig.typecheck.json",
+    "typecheck:tsc": "tsc --noEmit -p tsconfig.typecheck.json",
+    "lint": "eslint ."
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "eslint": "^9.39.2",
+    "tsx": "^4.21.0",
+    "typescript": "^5.6.0",
+    "typescript-eslint": "^8.55.0"
+  }
+}
