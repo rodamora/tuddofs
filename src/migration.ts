@@ -9,7 +9,7 @@ export interface AgentFsClient {
     text: string,
     values?: readonly unknown[],
   ): Promise<{ rows: Row[]; rowCount: number | null }>
-  release(): void
+  release(error?: Error): void
 }
 
 export interface AgentFsPool {

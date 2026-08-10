@@ -323,14 +323,47 @@ test('concurrent writers retry and leave heads equal to the resulting tip tree',
   ])
 })
 
-test('onCommit is fire-and-forget and logs hook failures', async () => {
+test('onCommit starts only after write cleanup and caller settlement', async () => {
+  const unlockCalled = deferred<void>()
+  const unlockGate = deferred<void>()
   const hookStarted = deferred<void>()
   const hookGate = deferred<void>()
   const logged = deferred<void>()
   const errors: unknown[] = []
+  let writeSettled = false
+  let hookStartedBeforeWriteSettled = false
+  const realPool = pool
+  const gatedPool = {
+    async connect() {
+      const client = await realPool.connect()
+      return {
+        query: async <Row extends Record<string, unknown>>(text: string, values?: readonly unknown[]) => {
+          if (text.includes('pg_advisory_unlock')) {
+            unlockCalled.resolve()
+            await unlockGate.promise
+          }
+          return client.query<Row>(text, values as unknown[])
+        },
+        release: (error?: Error) => client.release(error),
+      }
+    },
+  }
+  const storage = {
+    async put() {},
+    async head() {
+      return null
+    },
+    async get() {
+      return Readable.from([])
+    },
+    async delete() {},
+  }
   const fs = createAgentFs({
-    pool,
+    pool: gatedPool,
+    storage,
+    inlineMaxBytes: 1,
     onCommit: async () => {
+      hookStartedBeforeWriteSettled = !writeSettled
       hookStarted.resolve()
       await hookGate.promise
       throw new Error('hook failed')
@@ -352,11 +385,81 @@ test('onCommit is fire-and-forget and logs hook failures', async () => {
     bytes: Buffer.from('hook'),
     authorUser: actor,
   })
-  const completed = await Promise.race([writePromise.then(() => 'write'), hookStarted.promise.then(() => 'hook')])
-  assert.equal(completed, 'write')
+  await unlockCalled.promise
+  await new Promise<void>(resolve => setImmediate(resolve))
+  await new Promise<void>(resolve => setImmediate(resolve))
+  const startedTooSoon = hookStartedBeforeWriteSettled
+  unlockGate.resolve()
+  await writePromise
+  writeSettled = true
+  await hookStarted.promise
   hookGate.resolve()
   await logged.promise
   assert.equal(errors.length, 1)
+  assert.equal(startedTooSoon, false)
+  assert.equal(hookStartedBeforeWriteSettled, false)
+})
+
+test('unlock failure destroys the client before the tenant can write again', async () => {
+  const storage = {
+    async put() {},
+    async head() {
+      return null
+    },
+    async get() {
+      return Readable.from([])
+    },
+    async delete() {},
+  }
+  const backendPids: number[] = []
+  const releaseErrors: unknown[] = []
+  let failUnlock = true
+  const realPool = pool
+  const guardedPool = {
+    async connect() {
+      const client = await realPool.connect()
+      const pid = await client.query<{ pid: number }>('SELECT pg_backend_pid() AS pid')
+      backendPids.push(pid.rows[0]?.pid as number)
+      return {
+        query: async <Row extends Record<string, unknown>>(text: string, values?: readonly unknown[]) => {
+          if (text.includes('pg_advisory_unlock') && failUnlock) {
+            failUnlock = false
+            throw new Error('simulated unlock failure')
+          }
+          return client.query<Row>(text, values as unknown[])
+        },
+        release: (error?: Error) => {
+          releaseErrors.push(error)
+          client.release(error)
+        },
+      }
+    },
+  }
+  const fs = createAgentFs({ pool: guardedPool, storage, inlineMaxBytes: 1 })
+  const branch = await fs.fork({ tenant, mount, sessionId: 'unlock-failure', authorUser: actor })
+  assert.ok(branch)
+  backendPids.length = 0
+  releaseErrors.length = 0
+  await fs
+    .write({
+      tenant,
+      mount,
+      ref: branch.ref,
+      path: '/first.txt',
+      bytes: Buffer.from('first'),
+      authorUser: actor,
+    })
+    .catch(() => undefined)
+  assert.ok(releaseErrors[0] instanceof Error)
+  await fs.write({
+    tenant,
+    mount,
+    ref: branch.ref,
+    path: '/second.txt',
+    bytes: Buffer.from('second'),
+    authorUser: actor,
+  })
+  assert.notEqual(backendPids[0], backendPids[1])
 })
 
 test('read validates a supplied mount key before resolving grants', async () => {

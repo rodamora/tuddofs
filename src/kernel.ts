@@ -1293,13 +1293,18 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
     // RefConflictError.attempts field reports that same budget.
     for (let attempt = 0; attempt < maxCasRetries; attempt += 1) {
       const client = await options.pool.connect()
-      let lockHeld = false
+      const storageBacked = bytes.length > inlineMaxBytes
+      let lockState: 'none' | 'acquiring' | 'held' | 'uncertain' = 'none'
+      let failure: unknown
       try {
-        // Hold the tenant GC lock before uploading. GC keeps the same lock
-        // through its orphan sweep, so no package write can upload and commit
-        // a reference in the sweep's delete window.
-        await client.query('SELECT pg_advisory_lock(hashtext($1))', [`afs:gc:${input.tenant}`])
-        lockHeld = true
+        if (storageBacked) {
+          // Hold the tenant GC lock while uploading. GC keeps the same lock
+          // through its orphan sweep, so no package write can upload and commit
+          // a reference in the sweep's delete window.
+          lockState = 'acquiring'
+          await client.query('SELECT pg_advisory_lock(hashtext($1))', [`afs:gc:${input.tenant}`])
+          lockState = 'held'
+        }
         const objectKey = await ensureStorage(options.storage, input.tenant, bytes, sha256, inlineMaxBytes, context)
         await client.query('BEGIN')
         const ref = await loadRef(client, input.tenant, input.ref, context)
@@ -1360,32 +1365,47 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
           commitSha: commit.sha,
           changedPaths: [path],
         }
+        if (lockState === 'held') {
+          lockState = 'uncertain'
+          await client.query('SELECT pg_advisory_unlock(hashtext($1))', [`afs:gc:${input.tenant}`])
+          lockState = 'none'
+        }
         if (options.onCommit) {
           setImmediate(() => {
-            setImmediate(() => {
-              void Promise.resolve()
-                .then(() => options.onCommit?.(event))
-                .catch(error => {
-                  try {
-                    if (options.logger) options.logger.error(error, event)
-                    else console.error('AgentFs onCommit hook failed', error, event)
-                  } catch (loggerError) {
-                    console.error('AgentFs onCommit hook logger failed', loggerError, { error, event })
-                  }
-                })
-            })
+            void Promise.resolve()
+              .then(() => options.onCommit?.(event))
+              .catch(error => {
+                try {
+                  if (options.logger) options.logger.error(error, event)
+                  else console.error('AgentFs onCommit hook failed', error, event)
+                } catch (loggerError) {
+                  console.error('AgentFs onCommit hook logger failed', loggerError, { error, event })
+                }
+              })
           })
         }
         return { path, sha256, sizeBytes: BigInt(bytes.length), commitSha: commit.sha }
       } catch (error) {
+        failure = error
         await client.query('ROLLBACK').catch(() => undefined)
         throw error
       } finally {
-        if (lockHeld)
-          await client
-            .query('SELECT pg_advisory_unlock(hashtext($1))', [`afs:gc:${input.tenant}`])
-            .catch(() => undefined)
-        client.release()
+        if (lockState === 'held') {
+          lockState = 'uncertain'
+          try {
+            await client.query('SELECT pg_advisory_unlock(hashtext($1))', [`afs:gc:${input.tenant}`])
+            lockState = 'none'
+          } catch (error) {
+            failure ??= error
+          }
+        }
+        if (lockState !== 'none') {
+          const releaseError =
+            failure instanceof Error ? failure : new Error('Agent FS advisory lock state is uncertain')
+          client.release(releaseError)
+        } else {
+          client.release()
+        }
       }
     }
     throw new RefConflictError(context, maxCasRetries)

@@ -111,14 +111,21 @@ test('gc deletes old orphan uploads under afs tenant prefix but keeps young and 
 })
 test('seeded randomized GC preserves reachable forks, merge-shaped parents, and tags', async () => {
   const fs = createAgentFs({ pool, now: () => now })
-  let seed = 0x9e3779b9
+  const configuredSeed = process.env.AGENT_FS_PROPERTY_SEED
+  const initialSeed = configuredSeed === undefined ? 0x9e3779b9 : Number(configuredSeed)
+  assert.ok(
+    Number.isInteger(initialSeed) && initialSeed >= 0 && initialSeed <= 0xffffffff,
+    'AGENT_FS_PROPERTY_SEED must be an unsigned 32-bit integer',
+  )
+  let seed = initialSeed
   const next = (): number => {
     seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0
     return seed
   }
   const refs: string[] = []
+  let iteration = 0
   try {
-    for (let iteration = 0; iteration < 24; iteration += 1) {
+    for (; iteration < 24; iteration += 1) {
       const branch = await fs.fork({
         tenant,
         mount,
@@ -173,7 +180,7 @@ test('seeded randomized GC preserves reachable forks, merge-shaped parents, and 
         }
       }
       const gcResult = await fs.gc({ tenant, graceMs: 0 })
-      assert.equal(gcResult.skipped, false, `seed=${seed}`)
+      assert.equal(gcResult.skipped, false, `seed=${initialSeed} iteration=${iteration}`)
       for (const ref of refs.slice(-2)) {
         const head = await pool.query<{ path: string }>(
           'SELECT path FROM afs_heads WHERE tenant = $1 AND ref_name = $2 ORDER BY path LIMIT 1',
@@ -185,7 +192,7 @@ test('seeded randomized GC preserves reachable forks, merge-shaped parents, and 
       }
     }
   } catch (error) {
-    throw new Error(`seed=${seed}`, { cause: error })
+    throw new Error(`seed=${initialSeed} iteration=${iteration}`, { cause: error })
   }
 })
 
