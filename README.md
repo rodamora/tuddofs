@@ -4,7 +4,7 @@
 
 A **multi-tenant, permission-confined, branchable filesystem for AI agents.** Postgres + object storage. Embeddable TypeScript library.
 
-One sentence: *git's object model with your application's permissions, built for agents that run anywhere.*
+One sentence: _git's object model with your application's permissions, built for agents that run anywhere._
 
 Files here are not agent scratch — they are **governed user data**: scoped to org/workspace/project/team/user, access-controlled by your app's live permission logic, with agent changes flowing through branches and honest merges.
 
@@ -36,16 +36,16 @@ Files here are not agent scratch — they are **governed user data**: scoped to 
 
 ## Concepts
 
-| Term | Meaning |
-|---|---|
-| **Tenant** | Hard isolation boundary (your customer org). On every row; nothing crosses it. |
-| **Mount** | One scope of files an agent can see (e.g. `project:crm`, `user:settings`). A session assembles several mounts into one view. Ref-backed (versioned) or **virtual** (live app data, §6.1). |
-| **Session** | An agent's window onto its mounts. First write to a mount lazily **forks** a private branch from the mount tip (§4.6); the agent works isolated until merge. |
-| **Commit** | Immutable snapshot of one mount's tree, attributed to *user + agent kind + thread + run* (§4.1). Content-addressed (sha256); history is append-only — no force-push exists anywhere (§6). |
-| **Merge** | Per-mount, all-or-nothing, honest: concurrent edits to the same path surface as **conflicts** (data, not exceptions), classified by the 14-row decision table (§8). |
-| **Heads** | Derived per-ref `path → blob` index making reads O(1). Rebuildable; never a source of truth (§4.1). |
+| Term        | Meaning                                                                                                                                                                                   |
+| ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Tenant**  | Hard isolation boundary (your customer org). On every row; nothing crosses it.                                                                                                            |
+| **Mount**   | One scope of files an agent can see (e.g. `project:crm`, `user:settings`). A session assembles several mounts into one view. Ref-backed (versioned) or **virtual** (live app data, §6.1). |
+| **Session** | An agent's window onto its mounts. First write to a mount lazily **forks** a private branch from the mount tip (§4.6); the agent works isolated until merge.                              |
+| **Commit**  | Immutable snapshot of one mount's tree, attributed to _user + agent kind + thread + run_ (§4.1). Content-addressed (sha256); history is append-only — no force-push exists anywhere (§6). |
+| **Merge**   | Per-mount, all-or-nothing, honest: concurrent edits to the same path surface as **conflicts** (data, not exceptions), classified by the 14-row decision table (§8).                       |
+| **Heads**   | Derived per-ref `path → blob` index making reads O(1). Rebuildable; never a source of truth (§4.1).                                                                                       |
 
-Identity is never collapsed (§5.1): *attribution* (whose behalf), *execution* (session actor), *provenance* (which agent/run), *authorization* (whose grant, may differ under staged approval), and *tenant* are separate fields by design.
+Identity is never collapsed (§5.1): _attribution_ (whose behalf), _execution_ (session actor), _provenance_ (which agent/run), _authorization_ (whose grant, may differ under staged approval), and _tenant_ are separate fields by design.
 
 ## Requirements & install
 
@@ -79,26 +79,26 @@ const grants: GrantResolver = {
 
 export const agentFs = createAgentFs({
   pool: new Pool({ connectionString: process.env.DATABASE_URL }),
-  storage: myBlobStore,          // see "Storage backends"
+  storage: myBlobStore, // see "Storage backends"
   grants,
-  logger,                        // your structured logger
+  logger, // your structured logger
   config: { inlineMaxBytes: 131072 },
 })
 
-await agentFs.migrate()          // idempotent; run alongside your app migrations
+await agentFs.migrate() // idempotent; run alongside your app migrations
 ```
 
 ## Sessions & the file API
 
 ```ts
 const fs = await agentFs.open({
-  actor: { id: user.id, tenant: org.id },     // the EXECUTING user — never a system actor (§5.6)
-  sessionId: thread.id,                        // scopes branch refs: agent/<sessionId>/<mountKey>
+  actor: { id: user.id, tenant: org.id }, // the EXECUTING user — never a system actor (§5.6)
+  sessionId: thread.id, // scopes branch refs: agent/<sessionId>/<mountKey>
   attribution: { agentKind: 'file-agent', threadId: thread.id, runId: run.id },
   mounts: [
-    { key: 'project:crm' },                    // follow (default): forks from the live tip
-    { key: 'org:handbook', mode: { pin: 'tag/org:handbook/v3' } },  // read-only snapshot (§5)
-    { key: 'team:roster', virtual: rosterHandler },                 // live data, no history (§6.1)
+    { key: 'project:crm' }, // follow (default): forks from the live tip
+    { key: 'org:handbook', mode: { pin: 'tag/org:handbook/v3' } }, // read-only snapshot (§5)
+    { key: 'team:roster', virtual: rosterHandler }, // live data, no history (§6.1)
   ],
 })
 ```
@@ -107,15 +107,15 @@ Paths are `mountKey:/relative/path`. Nothing outside the mount table is reachabl
 
 ```ts
 // Reads
-const text  = await fs.read('project:crm:/notes/plan.md')          // string (utf-8)
-const bytes = await fs.readBytes('project:crm:/assets/logo.png')   // Buffer
-const stat  = await fs.stat('project:crm:/notes/plan.md')          // { path, sha256, sizeBytes, mode }
-const files = await fs.list('project:crm:/notes')                  // direct children
-const hits  = await fs.glob('project:crm:/**/*.md')
+const text = await fs.read('project:crm:/notes/plan.md') // string (utf-8)
+const bytes = await fs.readBytes('project:crm:/assets/logo.png') // Buffer
+const stat = await fs.stat('project:crm:/notes/plan.md') // { path, sha256, sizeBytes, mode }
+const files = await fs.list('project:crm:/notes') // direct children
+const hits = await fs.glob('project:crm:/**/*.md')
 
 // Writes — every write is a commit on the session's private branch
 const w = await fs.write('project:crm:/notes/plan.md', 'v2', {
-  ifSha: stat.sha256,   // optimistic concurrency: mismatch → PreconditionFailedError, re-read and retry
+  ifSha: stat.sha256, // optimistic concurrency: mismatch → PreconditionFailedError, re-read and retry
 })
 // w: { path, sha256, sizeBytes, commitSha }
 
@@ -142,7 +142,7 @@ const results = await fs.merge()
 
 for (const [mountKey, r] of Object.entries(results)) {
   if (r === 'merged') continue
-  if (r === 'pendingApproval') await queueForApprover(mountKey)      // see recipe D
+  if (r === 'pendingApproval') await queueForApprover(mountKey) // see recipe D
   if (typeof r === 'object') showConflicts(r.conflicts)
   // Conflict: { path, baseSha?, oursSha?, theirsSha? } — computed, never stored (§4.7)
 }
@@ -159,12 +159,12 @@ for (const [mountKey, r] of Object.entries(results)) {
 Everything is a commit; nothing is ever rewritten (§6):
 
 ```ts
-await fs.history('project:crm:/notes/plan.md')       // commits touching this path
-await fs.timeline({ runId: 'r_8842' })               // everything one run did — audit view
-await fs.diff(commitA, commitB)                      // per-path changes
+await fs.history('project:crm:/notes/plan.md') // commits touching this path
+await fs.timeline({ runId: 'r_8842' }) // everything one run did — audit view
+await fs.diff(commitA, commitB) // per-path changes
 
-await fs.tag('project:crm', 'before-cleanup')        // durable label; never auto-GC'd
-await fs.restore('project:crm', 'before-cleanup')    // NEW commit with the old tree — undo without rewriting
+await fs.tag('project:crm', 'before-cleanup') // durable label; never auto-GC'd
+await fs.restore('project:crm', 'before-cleanup') // NEW commit with the old tree — undo without rewriting
 ```
 
 "Restore the project to before the run" = `timeline({ runId })` → first commit → `restore(mountKey, thatCommit.parent)`.
@@ -182,7 +182,7 @@ The contract (§5, each rule is a test in the package):
 
 1. **Fail closed.** Resolver throws or times out (5s) → treated as no access, surfaced as `GrantResolverError`. Never fail open.
 2. **Live resolution.** Cached ≤30s per `(actorId, mountKey)`; call `agentFs.invalidate(actorId, mountKey?)` on permission changes. Merge and fork always bypass the cache.
-3. **Permission never travels through time.** Fork checks read at fork time; writes check at write time; merge re-resolves *inside* the merge transaction — mid-run revocation takes effect immediately.
+3. **Permission never travels through time.** Fork checks read at fork time; writes check at write time; merge re-resolves _inside_ the merge transaction — mid-run revocation takes effect immediately.
 4. **`staged` never escalates.** A staged writer's merge returns `'pendingApproval'`; landing it requires an approver whose live grant is `'direct'`.
 5. **Multi-worker:** `invalidate()` is per-process. Unless you transport invalidation (pub/sub), correctness rests on the 30s TTL — never lengthen it to reduce resolver load.
 
@@ -194,9 +194,15 @@ Serve live app data (rosters, tasks, profiles) through the same file surface —
 
 ```ts
 const rosterHandler: VirtualMountHandler = {
-  async list(dir, actor)  { return teamMembersAsEntries(actor) },
-  async read(path, actor) { return renderMemberMarkdown(path, actor) },
-  async write(path, bytes, actor) { await applyRosterEdit(path, bytes, actor) }, // omit → read-only
+  async list(dir, actor) {
+    return teamMembersAsEntries(actor)
+  },
+  async read(path, actor) {
+    return renderMemberMarkdown(path, actor)
+  },
+  async write(path, bytes, actor) {
+    await applyRosterEdit(path, bytes, actor)
+  }, // omit → read-only
 }
 ```
 
@@ -210,7 +216,7 @@ No machinery — your tool functions call the session (§7.3):
 
 ```ts
 const tools = {
-  read_file:  ({ path }) => fs.read(path),
+  read_file: ({ path }) => fs.read(path),
   write_file: ({ path, content }) => fs.write(path, content),
   list_files: ({ dir }) => fs.list(dir),
 }
@@ -245,11 +251,11 @@ import { createSyncEngine } from '@cowork/agent-fs/sync'
 
 const engine = createSyncEngine({ session: fs, target: myBlaxelTarget, root: '/work' })
 
-await engine.materialize()        // Phase 1: real files under /work/<mountKey>/…; warm re-acquire ≈0.1s
+await engine.materialize() // Phase 1: real files under /work/<mountKey>/…; warm re-acquire ≈0.1s
 // point the agent's cwd at /work — its default file tools now just work
 
-await engine.captureAfterExec()   // Phase 3: after every shell-capable tool call (fire-and-forget)
-await engine.reconcile()          // Phase 4: at turn end (authoritative; picks up deletes)
+await engine.captureAfterExec() // Phase 3: after every shell-capable tool call (fire-and-forget)
+await engine.reconcile() // Phase 4: at turn end (authoritative; picks up deletes)
 ```
 
 What the engine guarantees (§7.2):
@@ -266,9 +272,9 @@ What the engine guarantees (§7.2):
 When the executing user's grant is `write: 'staged'`, their work lands only via an approver (§5.4):
 
 ```ts
-const results = await fs.merge()                       // → 'pendingApproval'
+const results = await fs.merge() // → 'pendingApproval'
 // later, in your approval UI/flow:
-await fs.merge({ approver: { id: admin.id, tenant: org.id } })  // approver's LIVE grant must be 'direct'
+await fs.merge({ approver: { id: admin.id, tenant: org.id } }) // approver's LIVE grant must be 'direct'
 ```
 
 ## Storage backends
@@ -277,10 +283,10 @@ The package ships **no storage SDK**. You inject a 5-verb `BlobStore` (§10b.3):
 
 ```ts
 interface BlobStore {
-  put(key: string, bytes: Buffer): Promise<void>              // idempotent
+  put(key: string, bytes: Buffer): Promise<void> // idempotent
   head(key: string): Promise<{ sizeBytes: number } | null>
   get(key: string): Promise<Readable>
-  delete(key: string): Promise<void>                          // best-effort (GC)
+  delete(key: string): Promise<void> // best-effort (GC)
   presignPut(key: string, opts: { ttlSeconds: number; checksumSha256: string }): Promise<string>
   presignGet(key: string, opts: { ttlSeconds: number }): Promise<string>
 }
@@ -296,16 +302,16 @@ Any S3-compatible store satisfies it — AWS S3, **MinIO** (`endpoint` + `forceP
 ## Maintenance: migrate, gc, verify
 
 ```ts
-await agentFs.migrate()                    // package-owned, numbered, idempotent (§10b.2)
+await agentFs.migrate() // package-owned, numbered, idempotent (§10b.2)
 
-await agentFs.gc()                         // reachability GC (§4.8): five sweeps incl. orphaned
-                                           // object-storage uploads; single-flight per tenant;
-                                           // settled branches reclaimed after 7 days; tags never
+await agentFs.gc() // reachability GC (§4.8): five sweeps incl. orphaned
+// object-storage uploads; single-flight per tenant;
+// settled branches reclaimed after 7 days; tags never
 
-const report = await agentFs.verify()      // fsck (§4.9): recompute tree/commit hashes, diff heads
-                                           // vs tips, spot-check object storage, check parents[]
-                                           // integrity. Schedule it — receipts nobody audits are
-                                           // not receipts.
+const report = await agentFs.verify() // fsck (§4.9): recompute tree/commit hashes, diff heads
+// vs tips, spot-check object storage, check parents[]
+// integrity. Schedule it — receipts nobody audits are
+// not receipts.
 ```
 
 Run `gc` on a schedule from **one** worker role; concurrent invocations skip safely. `verify()` accepts `{ tenant, sample }` for targeted checks.
@@ -322,19 +328,21 @@ Hooks run **after** commit, queued; a hook failure is logged and never fails the
 
 ## Error taxonomy
 
-All errors are typed, exported, and carry `{ tenant, mount?, path?, ref? }` context (§9). Conflicts are a merge *result*, not an exception.
+All errors are typed, exported, and carry `{ tenant, mount?, path?, ref? }` context (§9). Conflicts are a merge _result_, not an exception.
 
-| Error | Meaning | Retryable? |
-|---|---|---|
-| `InvalidPathError` | path rule violation (§4.3) | no |
-| `PermissionDeniedError` | grant refused (read, write mode, or pinned mount) | no — re-auth is a user action |
-| `PreconditionFailedError` | `ifSha` mismatch | after re-read |
-| `RefConflictError` | ref CAS exhausted retries | yes (rare) |
-| `NotFoundError` | path/ref/commit absent | no |
-| `BranchSettledError` | write to a merged/abandoned branch | no — open a new session |
-| `MergePendingApprovalError` | staged writer attempted self-merge | no — needs an approver |
-| `GrantResolverError` | your resolver threw/timed out (failed **closed**) | host-side issue |
-| `StorageError` | object storage failure | yes, with backoff |
+| Error                         | Meaning                                            | Retryable?                    |
+| ----------------------------- | -------------------------------------------------- | ----------------------------- |
+| `InvalidPathError`            | path rule violation (§4.3)                         | no                            |
+| `InvalidMountKeyError`        | mount key rule violation (§4.4)                    | no                            |
+| `InvalidCommitTimestampError` | timestamp is not canonical UTC milliseconds (§4.2) | no                            |
+| `PermissionDeniedError`       | grant refused (read, write mode, or pinned mount)  | no — re-auth is a user action |
+| `PreconditionFailedError`     | `ifSha` mismatch                                   | after re-read                 |
+| `RefConflictError`            | ref CAS exhausted retries                          | yes (rare)                    |
+| `NotFoundError`               | path/ref/commit absent                             | no                            |
+| `BranchSettledError`          | write to a merged/abandoned branch                 | no — open a new session       |
+| `MergePendingApprovalError`   | staged writer attempted self-merge                 | no — needs an approver        |
+| `GrantResolverError`          | your resolver threw/timed out (failed **closed**)  | host-side issue               |
+| `StorageError`                | object storage failure                             | yes, with backoff             |
 
 ## Rules & guarantees
 
@@ -347,17 +355,19 @@ All errors are typed, exported, and carry `{ tenant, mount?, path?, ref? }` cont
 
 ## Milestone availability
 
-| API surface | Available from |
-|---|---|
-| Kernel (schema, hashing, write, fork, GC) | M0 |
-| `open()`, file API, `discard`, history/timeline/diff, direct adapter, GrantResolver | M1 |
-| Sync engine + `SyncTarget` (sandboxed agents) | M2 |
-| Multi-mount follow/pin, `merge`/`resolveMerge`, staged approvals, `restore`/`tag` | M3 |
-| Large-blob presigned streaming | M4 |
-| Standalone npm publish | M5 |
+| API surface                                                                         | Available from |
+| ----------------------------------------------------------------------------------- | -------------- |
+| Kernel (schema, hashing, write, fork, GC)                                           | M0             |
+| `open()`, file API, `discard`, history/timeline/diff, direct adapter, GrantResolver | M1             |
+| Sync engine + `SyncTarget` (sandboxed agents)                                       | M2             |
+| Multi-mount follow/pin, `merge`/`resolveMerge`, staged approvals, `restore`/`tag`   | M3             |
+| Large-blob presigned streaming                                                      | M4             |
+| Standalone npm publish                                                              | M5             |
 
 ## Development
 
 - Docs discipline is binding (spec §15.7): exported symbols carry TSDoc citing their spec section; README updates ship in the same PR as API changes; README examples are compiled in a test.
 - Tests: golden-value tests pin the hash byte formats forever; property tests cover the DAG; the §8 decision table and §9 taxonomy get one test per row/error; integration tests run against real Postgres (and MinIO) containers.
 - Iterate with the package suite only: `pnpm --filter @cowork/agent-fs test`.
+- The hermetic `test` script never connects to Postgres. For integration checks, start a disposable database (`docker run --rm --name agent-fs-it -e POSTGRES_USER=agentfs -e POSTGRES_PASSWORD=agentfs -e POSTGRES_DB=agentfs_it -p 55434:5432 postgres:16-alpine`), then run `AGENT_FS_DATABASE_URL=postgresql://agentfs:agentfs@127.0.0.1:55434/agentfs_it pnpm test:integration` from this package. Do not point it at Cowork development or production databases.
+- Run the real-database smoke demo with `AGENT_FS_DATABASE_URL=postgresql://agentfs:agentfs@127.0.0.1:55434/agentfs_it pnpm demo`.

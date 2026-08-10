@@ -16,15 +16,23 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "test": "NODE_ENV=test node --import tsx --test 'src/**/__tests__/**/*.test.ts'",
+    "test:integration": "AGENT_FS_DATABASE_URL=${AGENT_FS_DATABASE_URL:-postgresql://agentfs:agentfs@127.0.0.1:55434/agentfs_it} node --import tsx --test 'src/integration/**/*.integration.test.ts'",
+    "demo": "node --import tsx scripts/demo.ts",
     "typecheck": "tsgo --noEmit -p tsconfig.typecheck.json",
     "typecheck:tsc": "tsc --noEmit -p tsconfig.typecheck.json",
+    "format": "prettier --write 'src/**/*.ts' 'scripts/**/*.ts' 'README.md' 'package.json'",
+    "format:check": "prettier --check 'src/**/*.ts' 'scripts/**/*.ts' 'README.md' 'package.json'",
     "lint": "eslint ."
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
+    "@types/pg": "^8.20.0",
     "eslint": "^9.39.2",
     "tsx": "^4.21.0",
     "typescript": "^5.6.0",
     "typescript-eslint": "^8.55.0"
+  },
+  "dependencies": {
+    "pg": "^8.20.0"
   }
 }
