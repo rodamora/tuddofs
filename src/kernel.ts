@@ -5,6 +5,7 @@ import {
   AgentFsError,
   BranchSettledError,
   GrantResolverError,
+  InvariantError,
   NotFoundError,
   PermissionDeniedError,
   PreconditionFailedError,
@@ -31,8 +32,19 @@ export interface Actor {
 
 export type WriteMode = 'direct' | 'staged' | 'none'
 
+/**
+ * Resolve live permissions. An omitted read mount is passed as `key: ''` to
+ * represent an unmounted read; resolvers MUST deny unknown keys (including
+ * `''` when they do not support unmounted reads) rather than fail open.
+ * @see spec §5
+ */
 export interface GrantResolver {
   resolve(actor: Actor, mount: { key: string }): Promise<{ read: boolean; write: WriteMode }>
+}
+
+/** Receives post-commit hook failures without affecting write durability. @see spec §10b */
+export interface AgentFsLogger {
+  error(error: unknown, context?: object): void
 }
 
 export interface ForkInput {
@@ -104,6 +116,7 @@ export interface AgentFsOptions {
   readonly pool: AgentFsPool
   readonly storage?: BlobStore
   readonly grants?: GrantResolver
+  readonly logger?: AgentFsLogger
   readonly inlineMaxBytes?: number
   readonly maxCasRetries?: number
   readonly now?: () => Date
@@ -154,10 +167,10 @@ type Entry = {
 const DEFAULT_INLINE_MAX_BYTES = 131_072
 const DEFAULT_CAS_RETRIES = 3
 
-function asBigInt(value: unknown, field: string): bigint {
+function asBigInt(value: unknown, field: string, context?: ErrorContext): bigint {
   if (typeof value === 'bigint') return value
   if (typeof value === 'string' && /^\d+$/.test(value)) return BigInt(value)
-  throw new Error(`Invalid BIGINT ${field} returned by Postgres`)
+  throw new InvariantError(`Invalid BIGINT ${field} returned by Postgres`, context)
 }
 
 function contextFor(input: { tenant: string; mount?: string; path?: string; ref?: string }): ErrorContext {
@@ -230,6 +243,7 @@ async function insertBlob(
   sha256: string,
   inlineMaxBytes: number,
   objectKey: string | null,
+  context: ErrorContext,
 ): Promise<bigint> {
   const result = await client.query<{ id: string }>(
     `INSERT INTO afs_blobs (tenant, sha256, size_bytes, inline, object_key)
@@ -238,23 +252,24 @@ async function insertBlob(
      RETURNING id::text`,
     [tenant, sha256, bytes.length.toString(), bytes.length <= inlineMaxBytes ? bytes : null, objectKey],
   )
-  if (result.rows[0]) return asBigInt(result.rows[0].id, 'afs_blobs.id')
+  if (result.rows[0]) return asBigInt(result.rows[0].id, 'afs_blobs.id', context)
   const existing = await client.query<{ id: string; size_bytes: string }>(
     'SELECT id::text, size_bytes::text FROM afs_blobs WHERE tenant = $1 AND sha256 = $2',
     [tenant, sha256],
   )
   const row = existing.rows[0]
-  if (!row) throw new Error(`Blob insert/select failed for ${sha256}`)
-  if (asBigInt(row.size_bytes, 'afs_blobs.size_bytes') !== BigInt(bytes.length)) {
-    throw new Error(`Blob collision for ${sha256}`)
+  if (!row) throw new InvariantError(`Blob insert/select failed for ${sha256}`, context)
+  if (asBigInt(row.size_bytes, 'afs_blobs.size_bytes', context) !== BigInt(bytes.length)) {
+    throw new InvariantError(`Blob collision for ${sha256}`, context)
   }
-  return asBigInt(row.id, 'afs_blobs.id')
+  return asBigInt(row.id, 'afs_blobs.id', context)
 }
 
 async function insertTree(
   client: Queryable,
   tenant: string,
   entries: Map<string, Entry>,
+  context: ErrorContext,
 ): Promise<{ id: bigint; sha: string }> {
   const treeEntries: TreeEntry[] = [...entries].map(([path, entry]) => ({
     path,
@@ -270,8 +285,8 @@ async function insertTree(
     [tenant, treeSha],
   )
   const treeId = inserted.rows[0]
-    ? asBigInt(inserted.rows[0].id, 'afs_trees.id')
-    : await loadTreeId(client, tenant, treeSha)
+    ? asBigInt(inserted.rows[0].id, 'afs_trees.id', context)
+    : await loadTreeId(client, tenant, treeSha, context)
   if (inserted.rows[0]) {
     const rows = [...entries]
     for (let offset = 0; offset < rows.length; offset += 5000) {
@@ -294,14 +309,14 @@ async function insertTree(
   return { id: treeId, sha: treeSha }
 }
 
-async function loadTreeId(client: Queryable, tenant: string, treeSha: string): Promise<bigint> {
+async function loadTreeId(client: Queryable, tenant: string, treeSha: string, context: ErrorContext): Promise<bigint> {
   const selected = await client.query<{ id: string }>(
     'SELECT id::text FROM afs_trees WHERE tenant = $1 AND tree_sha = $2',
     [tenant, treeSha],
   )
   const row = selected.rows[0]
-  if (!row) throw new Error(`Tree insert/select failed for ${treeSha}`)
-  return asBigInt(row.id, 'afs_trees.id')
+  if (!row) throw new InvariantError(`Tree insert/select failed for ${treeSha}`, context)
+  return asBigInt(row.id, 'afs_trees.id', context)
 }
 
 async function insertCommit(
@@ -319,6 +334,7 @@ async function insertCommit(
     op: string
     message: string | null
     createdAt: Date
+    context: ErrorContext
   },
 ): Promise<{ id: bigint; sha: string }> {
   const createdAtIso = input.createdAt.toISOString()
@@ -354,16 +370,15 @@ async function insertCommit(
       input.createdAt,
     ],
   )
-  if (inserted.rows[0]) return { id: asBigInt(inserted.rows[0].id, 'afs_commits.id'), sha: commitSha }
+  if (inserted.rows[0]) return { id: asBigInt(inserted.rows[0].id, 'afs_commits.id', input.context), sha: commitSha }
   const selected = await client.query<{ id: string }>(
     'SELECT id::text FROM afs_commits WHERE tenant = $1 AND commit_sha = $2',
     [input.tenant, commitSha],
   )
   const row = selected.rows[0]
-  if (!row) throw new Error(`Commit insert/select failed for ${commitSha}`)
-  return { id: asBigInt(row.id, 'afs_commits.id'), sha: commitSha }
+  if (!row) throw new InvariantError(`Commit insert/select failed for ${commitSha}`, input.context)
+  return { id: asBigInt(row.id, 'afs_commits.id', input.context), sha: commitSha }
 }
-
 async function loadRef(client: Queryable, tenant: string, ref: string, context: ErrorContext): Promise<RefRow> {
   const result = await client.query<RefRow>(
     `SELECT r.commit_id::text, r.base_commit::text, c.commit_sha, r.kind, r.state
@@ -381,6 +396,7 @@ async function loadHeads(
   tenant: string,
   ref: string,
   commitId: bigint,
+  context: ErrorContext,
 ): Promise<Map<string, Entry>> {
   const result = await client.query<HeadRow>(
     `SELECT h.path, h.blob_id::text, h.sha256, h.size_bytes::text,
@@ -395,9 +411,9 @@ async function loadHeads(
     result.rows.map(row => [
       row.path,
       {
-        blobId: asBigInt(row.blob_id, 'afs_heads.blob_id'),
+        blobId: asBigInt(row.blob_id, 'afs_heads.blob_id', context),
         sha256: row.sha256,
-        sizeBytes: asBigInt(row.size_bytes, 'afs_heads.size_bytes'),
+        sizeBytes: asBigInt(row.size_bytes, 'afs_heads.size_bytes', context),
         mode: row.mode,
       },
     ]),
@@ -459,7 +475,7 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
       )
       if (!mountRef.rows[0]) {
         const created = timestamp(now, context)
-        const emptyTree = await insertTree(client, input.tenant, new Map())
+        const emptyTree = await insertTree(client, input.tenant, new Map(), context)
         const genesis = await insertCommit(client, {
           tenant: input.tenant,
           treeId: emptyTree.id,
@@ -473,6 +489,7 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
           op: 'import',
           message: 'genesis',
           createdAt: created.date,
+          context,
         })
         await client.query(
           `INSERT INTO afs_refs (tenant, name, kind, commit_id, base_commit, state)
@@ -489,28 +506,35 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
       }
       const tip = mountRef.rows[0]
       if (!tip) throw new NotFoundError(`Mount ref not found: mount/${input.mount}`, context)
-      await client.query(
+      const branchInsert = await client.query(
         `INSERT INTO afs_refs (tenant, name, kind, commit_id, base_commit, state)
          VALUES ($1, $2, 'branch', $3::bigint, $3::bigint, 'open')
          ON CONFLICT (tenant, name) DO NOTHING`,
         [input.tenant, ref, tip.commit_id],
       )
+      const branchCreated = (branchInsert.rowCount ?? 0) > 0
       const branch = await loadRef(client, input.tenant, ref, context)
-      await client.query(
-        `INSERT INTO afs_heads (tenant, ref_name, path, blob_id, sha256, size_bytes)
-         SELECT tenant, $2, path, blob_id, sha256, size_bytes
-         FROM afs_heads
-         WHERE tenant = $1 AND ref_name = $3
-         ON CONFLICT (tenant, ref_name, path) DO NOTHING`,
-        [input.tenant, ref, `mount/${input.mount}`],
-      )
+      if (branchCreated) {
+        // Seed from the captured tip tree, never live mount heads: the tip is
+        // the branch's snapshot even if a concurrent mount write races here.
+        await client.query(
+          `INSERT INTO afs_heads (tenant, ref_name, path, blob_id, sha256, size_bytes)
+           SELECT $1, $2, e.path, e.blob_id, b.sha256, b.size_bytes
+           FROM afs_commits c
+           JOIN afs_tree_entries e ON e.tree_id = c.tree_id
+           JOIN afs_blobs b ON b.id = e.blob_id
+           WHERE c.id = $3::bigint
+           ON CONFLICT (tenant, ref_name, path) DO NOTHING`,
+          [input.tenant, ref, tip.commit_id],
+        )
+      }
       await client.query('COMMIT')
       return {
         tenant: input.tenant,
         mount: input.mount,
         ref,
-        commitId: asBigInt(branch.commit_id, 'afs_refs.commit_id'),
-        baseCommitId: asBigInt(branch.base_commit ?? branch.commit_id, 'afs_refs.base_commit'),
+        commitId: asBigInt(branch.commit_id, 'afs_refs.commit_id', context),
+        baseCommitId: asBigInt(branch.base_commit ?? branch.commit_id, 'afs_refs.base_commit', context),
         commitSha: branch.commit_sha,
       }
     } catch (error) {
@@ -532,13 +556,21 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
     const sha256 = hashSha256(bytes)
     const objectKey = await ensureStorage(options.storage, input.tenant, bytes, sha256, inlineMaxBytes, context)
 
+    // Interpret §4.5 step 9's “max 3” as three total attempts; the
+    // RefConflictError.attempts field reports that same budget.
     for (let attempt = 0; attempt < maxCasRetries; attempt += 1) {
       const client = await options.pool.connect()
       try {
         await client.query('BEGIN')
         const ref = await loadRef(client, input.tenant, input.ref, context)
         if (ref.kind === 'branch' && ref.state !== 'open') throw new BranchSettledError(ref.state, context)
-        const heads = await loadHeads(client, input.tenant, input.ref, asBigInt(ref.commit_id, 'afs_refs.commit_id'))
+        const heads = await loadHeads(
+          client,
+          input.tenant,
+          input.ref,
+          asBigInt(ref.commit_id, 'afs_refs.commit_id', context),
+          context,
+        )
         const current = heads.get(path)
         if (input.ifSha !== undefined && input.ifSha !== (current?.sha256 ?? null)) {
           throw new PreconditionFailedError(input.ifSha, current?.sha256 ?? null, context)
@@ -548,16 +580,18 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
           return { path, sha256, sizeBytes: current.sizeBytes, commitSha: ref.commit_sha }
         }
 
-        const blobId = await insertBlob(client, input.tenant, bytes, sha256, inlineMaxBytes, objectKey)
+        // Spec §4.5 lists blob insertion earlier; doing it after ref checks
+        // avoids orphan blob rows on precondition or settled-branch exits.
+        const blobId = await insertBlob(client, input.tenant, bytes, sha256, inlineMaxBytes, objectKey, context)
         const next = new Map(heads)
         next.set(path, { blobId, sha256, sizeBytes: BigInt(bytes.length), mode: current?.mode ?? 420 })
-        const tree = await insertTree(client, input.tenant, next)
+        const tree = await insertTree(client, input.tenant, next, context)
         const createdAt = timestamp(now, context)
         const commit = await insertCommit(client, {
           tenant: input.tenant,
           treeId: tree.id,
           treeSha: tree.sha,
-          parentIds: [asBigInt(ref.commit_id, 'afs_refs.commit_id')],
+          parentIds: [asBigInt(ref.commit_id, 'afs_refs.commit_id', context)],
           parentShas: [ref.commit_sha],
           authorUser: input.authorUser,
           agentKind: input.agentKind ?? null,
@@ -566,6 +600,7 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
           op: input.op ?? 'write',
           message: input.message ?? null,
           createdAt: createdAt.date,
+          context,
         })
         const updated = await client.query(
           `UPDATE afs_refs SET commit_id = $3::bigint
@@ -578,18 +613,24 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
         }
         await updateHead(client, input.tenant, input.ref, path, next.get(path) as Entry)
         await client.query('COMMIT')
+        const event: CommitEvent = {
+          tenant: input.tenant,
+          mount: input.mount,
+          ref: input.ref,
+          commitSha: commit.sha,
+          changedPaths: [path],
+        }
         if (options.onCommit) {
-          try {
-            await options.onCommit({
-              tenant: input.tenant,
-              mount: input.mount,
-              ref: input.ref,
-              commitSha: commit.sha,
-              changedPaths: [path],
+          void Promise.resolve()
+            .then(() => options.onCommit?.(event))
+            .catch(error => {
+              try {
+                if (options.logger) options.logger.error(error, event)
+                else console.error('AgentFs onCommit hook failed', error, event)
+              } catch (loggerError) {
+                console.error('AgentFs onCommit hook logger failed', loggerError, { error, event })
+              }
             })
-          } catch {
-            // Hooks are post-commit notifications and never change write durability.
-          }
         }
         return { path, sha256, sizeBytes: BigInt(bytes.length), commitSha: commit.sha }
       } catch (error) {
@@ -603,8 +644,10 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
   }
 
   async function read(input: ReadInput): Promise<ReadResult> {
-    const context = contextFor(input)
-    const path = validatePath(input.path, context)
+    const initialContext = contextFor(input)
+    if (input.mount !== undefined) validateMountKey(input.mount, initialContext)
+    const path = validatePath(input.path, initialContext)
+    const context = contextFor({ ...input, path })
     if (!(await grant(options.grants, 'read', input)))
       throw new PermissionDeniedError('Read permission denied', context)
     const client = await options.pool.connect()
@@ -640,14 +683,11 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
       return {
         path: row.path,
         sha256: row.sha256,
-        sizeBytes: asBigInt(row.size_bytes, 'afs_heads.size_bytes'),
+        sizeBytes: asBigInt(row.size_bytes, 'afs_heads.size_bytes', context),
         mode: row.mode,
         bytes,
         commitSha: row.commit_sha,
       }
-    } catch (error) {
-      if (error instanceof AgentFsError) throw error
-      throw error
     } finally {
       client.release()
     }

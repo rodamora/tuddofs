@@ -13,6 +13,7 @@ export { createAgentFs } from './kernel.js'
 export type {
   Actor,
   AgentFsKernel,
+  AgentFsLogger,
   AgentFsOptions,
   BlobStore,
   CommitEvent,
@@ -29,11 +30,13 @@ export {
   AgentFsError,
   BranchSettledError,
   GrantResolverError,
+  InvariantError,
   MergePendingApprovalError,
   NotFoundError,
   PermissionDeniedError,
   PreconditionFailedError,
   RefConflictError,
+  SchemaDriftError,
   StorageError,
 } from './errors.js'
 export type { ErrorContext, KernelError } from './errors.js'

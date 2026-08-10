@@ -11,6 +11,14 @@ const tenant = 'integration-tenant'
 const mount = 'project:kernel'
 const actor = 'user-1'
 
+function deferred<T>() {
+  let resolve!: (value?: T | PromiseLike<T>) => void
+  const promise = new Promise<T>(resolvePromise => {
+    resolve = value => resolvePromise(value as T)
+  })
+  return { promise, resolve }
+}
+
 before(async () => {
   await migrate(pool)
 })
@@ -25,7 +33,7 @@ after(async () => {
   await pool.end()
 })
 
-test('migrate is idempotent and creates exactly the frozen afs tables', async () => {
+test('migrate is idempotent, records migration 001, and preserves the frozen schema', async () => {
   await migrate(pool)
   await migrate(pool)
   const tables = await pool.query<{ table_name: string }>(
@@ -36,15 +44,20 @@ test('migrate is idempotent and creates exactly the frozen afs tables', async ()
   )
   assert.deepEqual(
     tables.rows.map(row => row.table_name),
-    ['afs_blobs', 'afs_commits', 'afs_heads', 'afs_refs', 'afs_tree_entries', 'afs_trees'],
+    ['afs_blobs', 'afs_commits', 'afs_heads', 'afs_migrations', 'afs_refs', 'afs_tree_entries', 'afs_trees'],
   )
   const columns = await pool.query<{ table_name: string; column_name: string }>(
     `SELECT table_name, column_name
      FROM information_schema.columns
-     WHERE table_schema = 'public' AND table_name LIKE 'afs_%'
+     WHERE table_schema = 'public' AND table_name IN
+       ('afs_blobs', 'afs_commits', 'afs_heads', 'afs_refs', 'afs_tree_entries', 'afs_trees')
      ORDER BY table_name, ordinal_position`,
   )
   assert.equal(columns.rows.length, 41)
+  const ledger = await pool.query<{ version: number; name: string }>(
+    'SELECT version, name FROM afs_migrations ORDER BY version',
+  )
+  assert.deepEqual(ledger.rows, [{ version: 1, name: 'initial schema' }])
 })
 
 test('fork creates genesis, seeds heads, and re-fork is idempotent', async () => {
@@ -107,6 +120,65 @@ test('fork seeds existing mount heads idempotently', async () => {
     [tenant, first.ref],
   )
   assert.equal(heads.rows[0]?.count, '1')
+})
+test('re-fork does not reseed heads beyond the existing branch tip', async () => {
+  const fs = createAgentFs({ pool })
+  const first = await fs.fork({ tenant, mount, sessionId: 're-fork', authorUser: actor })
+  assert.ok(first)
+  await fs.write({
+    tenant,
+    mount,
+    ref: first.ref,
+    path: '/mine.txt',
+    bytes: Buffer.from('mine'),
+    authorUser: actor,
+  })
+  await fs.write({
+    tenant,
+    mount,
+    ref: `mount/${mount}`,
+    path: '/late.txt',
+    bytes: Buffer.from('late'),
+    authorUser: actor,
+  })
+  await fs.fork({ tenant, mount, sessionId: 're-fork', authorUser: actor })
+
+  const heads = await pool.query<{ path: string }>(
+    'SELECT path FROM afs_heads WHERE tenant = $1 AND ref_name = $2 ORDER BY path',
+    [tenant, first.ref],
+  )
+  const tipTree = await pool.query<{ path: string }>(
+    `SELECT e.path
+     FROM afs_refs r
+     JOIN afs_commits c ON c.id = r.commit_id
+     JOIN afs_tree_entries e ON e.tree_id = c.tree_id
+     WHERE r.tenant = $1 AND r.name = $2
+     ORDER BY e.path`,
+    [tenant, first.ref],
+  )
+  assert.deepEqual(heads.rows, tipTree.rows)
+})
+
+test('first fork seeds heads from the captured tip tree, not live mount heads', async () => {
+  const fs = createAgentFs({ pool })
+  await fs.fork({ tenant, mount, sessionId: 'seed-source-tree', authorUser: actor })
+  await fs.write({
+    tenant,
+    mount,
+    ref: `mount/${mount}`,
+    path: '/from-tree.txt',
+    bytes: Buffer.from('tree'),
+    authorUser: actor,
+  })
+  await pool.query('DELETE FROM afs_heads WHERE tenant = $1 AND ref_name = $2', [tenant, `mount/${mount}`])
+
+  const child = await fs.fork({ tenant, mount, sessionId: 'seed-tree-child', authorUser: actor })
+  assert.ok(child)
+  const heads = await pool.query<{ path: string }>(
+    'SELECT path FROM afs_heads WHERE tenant = $1 AND ref_name = $2 ORDER BY path',
+    [tenant, child.ref],
+  )
+  assert.deepEqual(heads.rows, [{ path: '/from-tree.txt' }])
 })
 
 test('large writes use the injected object store before the transaction', async () => {
@@ -223,4 +295,84 @@ test('CAS retries and reports RefConflictError after three failed compares', asy
     error => error instanceof RefConflictError,
   )
   assert.equal(forcedConflicts, 3)
+})
+test('concurrent writers retry and leave heads equal to the resulting tip tree', async () => {
+  const fs = createAgentFs({ pool })
+  const branch = await fs.fork({ tenant, mount, sessionId: 'cas-recovery', authorUser: actor })
+  assert.ok(branch)
+
+  const results = await Promise.all(
+    ['/one.txt', '/two.txt'].map(path =>
+      fs.write({ tenant, mount, ref: branch.ref, path, bytes: Buffer.from(path), authorUser: actor }),
+    ),
+  )
+  assert.equal(results.length, 2)
+  const state = await pool.query<{ path: string; in_tree: boolean }>(
+    `SELECT h.path, (e.path IS NOT NULL) AS in_tree
+     FROM afs_heads h
+     LEFT JOIN afs_refs r ON r.tenant = h.tenant AND r.name = h.ref_name
+     LEFT JOIN afs_commits c ON c.id = r.commit_id
+     LEFT JOIN afs_tree_entries e ON e.tree_id = c.tree_id AND e.path = h.path
+     WHERE h.tenant = $1 AND h.ref_name = $2
+     ORDER BY h.path`,
+    [tenant, branch.ref],
+  )
+  assert.deepEqual(state.rows, [
+    { path: '/one.txt', in_tree: true },
+    { path: '/two.txt', in_tree: true },
+  ])
+})
+
+test('onCommit is fire-and-forget and logs hook failures', async () => {
+  const hookStarted = deferred<void>()
+  const hookGate = deferred<void>()
+  const logged = deferred<void>()
+  const errors: unknown[] = []
+  const fs = createAgentFs({
+    pool,
+    onCommit: async () => {
+      hookStarted.resolve()
+      await hookGate.promise
+      throw new Error('hook failed')
+    },
+    logger: {
+      error: error => {
+        errors.push(error)
+        logged.resolve()
+      },
+    },
+  })
+  const branch = await fs.fork({ tenant, mount, sessionId: 'hook', authorUser: actor })
+  assert.ok(branch)
+  const writePromise = fs.write({
+    tenant,
+    mount,
+    ref: branch.ref,
+    path: '/hook.txt',
+    bytes: Buffer.from('hook'),
+    authorUser: actor,
+  })
+  const completed = await Promise.race([writePromise.then(() => 'write'), hookStarted.promise.then(() => 'hook')])
+  assert.equal(completed, 'write')
+  hookGate.resolve()
+  await logged.promise
+  assert.equal(errors.length, 1)
+})
+
+test('read validates a supplied mount key before resolving grants', async () => {
+  const seen: string[] = []
+  const fs = createAgentFs({
+    pool,
+    grants: {
+      async resolve(_actor, mountRef) {
+        seen.push(mountRef.key)
+        return { read: true, write: 'direct' }
+      },
+    },
+  })
+  await assert.rejects(
+    fs.read({ tenant, mount: 'INVALID MOUNT', ref: 'missing', path: '/file' }),
+    error => error instanceof Error && error.name === 'InvalidMountKeyError',
+  )
+  assert.deepEqual(seen, [])
 })

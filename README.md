@@ -178,11 +178,16 @@ interface GrantResolver {
 }
 ```
 
+The kernel passes `mount.key === ''` for a read without a mounted key. Treat
+that as an unmounted read only when supported; unknown keys (including `''`)
+must deny access (fail closed). A supplied mount key is validated before the
+resolver runs.
+
 The contract (§5, each rule is a test in the package):
 
 1. **Fail closed.** Resolver throws or times out (5s) → treated as no access, surfaced as `GrantResolverError`. Never fail open.
 2. **Live resolution.** Cached ≤30s per `(actorId, mountKey)`; call `agentFs.invalidate(actorId, mountKey?)` on permission changes. Merge and fork always bypass the cache.
-3. **Permission never travels through time.** Fork checks read at fork time; writes check at write time; merge re-resolves _inside_ the merge transaction — mid-run revocation takes effect immediately.
+3. **Permission never travels through time.** Fork checks read at fork time; writes check write at write time; merge re-resolves _inside_ the merge transaction — mid-run revocation takes effect immediately.
 4. **`staged` never escalates.** A staged writer's merge returns `'pendingApproval'`; landing it requires an approver whose live grant is `'direct'`.
 5. **Multi-worker:** `invalidate()` is per-process. Unless you transport invalidation (pub/sub), correctness rests on the 30s TTL — never lengthen it to reduce resolver load.
 
@@ -324,7 +329,9 @@ agentFs.onCommit((commit, changedPaths) => {
 })
 ```
 
-Hooks run **after** commit, queued; a hook failure is logged and never fails the write (§10). The package never knows its listeners.
+Hooks run **after** commit, queued; a hook failure is sent to the injected
+`logger.error` (or process diagnostics when no logger is provided) and never
+fails the write (§10). The package never knows its listeners.
 
 ## Error taxonomy
 
@@ -343,6 +350,8 @@ All errors are typed, exported, and carry `{ tenant, mount?, path?, ref? }` cont
 | `MergePendingApprovalError`   | staged writer attempted self-merge                 | no — needs an approver        |
 | `GrantResolverError`          | your resolver threw/timed out (failed **closed**)  | host-side issue               |
 | `StorageError`                | object storage failure                             | yes, with backoff             |
+| `SchemaDriftError`            | frozen package schema differs from live Postgres   | no — repair schema            |
+| `InvariantError`              | internal content-addressed state is impossible     | no — investigate              |
 
 ## Rules & guarantees
 

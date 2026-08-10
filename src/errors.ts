@@ -34,6 +34,20 @@ export class AgentFsError extends Error {
   }
 }
 
+/** The package-owned schema no longer matches the frozen §4.1 contract. @see spec §9 */
+export class SchemaDriftError extends AgentFsError {
+  constructor(reason = 'Agent FS schema drift detected', context?: Partial<ErrorContext>) {
+    super(reason, context, 'SchemaDriftError')
+  }
+}
+
+/** An internal content-addressed invariant was violated. @see spec §9 */
+export class InvariantError extends AgentFsError {
+  constructor(reason: string, context?: Partial<ErrorContext>) {
+    super(reason, context, 'InvariantError')
+  }
+}
+
 /** Grant refused a filesystem operation. @see spec §9 */
 export class PermissionDeniedError extends AgentFsError {
   constructor(reason = 'Permission denied', context?: Partial<ErrorContext>) {
@@ -121,3 +135,5 @@ export type KernelError =
   | MergePendingApprovalError
   | GrantResolverError
   | StorageError
+  | SchemaDriftError
+  | InvariantError
