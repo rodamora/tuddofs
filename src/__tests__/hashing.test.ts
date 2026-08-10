@@ -107,5 +107,20 @@ describe('commit hashing', () => {
     }
     assert.throws(() => commitPreimage({ ...base, ts: '2026-08-10T12:00:00Z' }), InvalidCommitTimestampError)
     assert.throws(() => commitPreimage({ ...base, ts: '2026-08-10T14:00:00.000+02:00' }), InvalidCommitTimestampError)
+    assert.throws(() => commitPreimage({ ...base, ts: '2026-13-45T99:99:99.999Z' }), InvalidCommitTimestampError)
+  })
+  it('accepts valid UTC millisecond timestamps', () => {
+    const commit: CommitHashInput = {
+      treeSha: fixture.trees[0].treeSha,
+      parents: [],
+      authorUser: 'user_1',
+      agentKind: null,
+      threadId: null,
+      runId: null,
+      ts: '2026-08-10T12:00:00.123Z',
+      op: 'import',
+    }
+
+    assert.doesNotThrow(() => commitPreimage(commit))
   })
 })

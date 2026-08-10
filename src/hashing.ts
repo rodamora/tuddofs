@@ -73,6 +73,10 @@ export function commitPreimage(commit: CommitHashInput): Buffer {
   if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(commit.ts)) {
     throw new InvalidCommitTimestampError(commit.ts)
   }
+  const parsedTimestamp = new Date(commit.ts)
+  if (Number.isNaN(parsedTimestamp.getTime()) || parsedTimestamp.toISOString() !== commit.ts) {
+    throw new InvalidCommitTimestampError(commit.ts)
+  }
 
   let serialized = `tree\0${commit.treeSha}\n`
   for (const parent of commit.parents) {
