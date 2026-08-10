@@ -37,9 +37,10 @@ export interface GcOptions {
   readonly graceMs?: number
   readonly settledBranchRetentionMs?: number
 }
-/** Counts returned by a GC cycle; `skipped` is true when its advisory lock was busy. @see spec §4.8 */
+/** Counts returned by a GC cycle; `skipped` is true only when no tenant could run. @see spec §4.8 */
 export interface GcReport {
   readonly skipped: boolean
+  readonly skippedTenants: readonly string[]
   readonly tenant?: string
   readonly deletedCommits: number
   readonly deletedTrees: number
@@ -63,6 +64,7 @@ export type VerifyFinding =
     }
   | {
       readonly kind: 'heads-drift'
+      readonly tenant: string
       readonly ref: string
       readonly path: string
       readonly issue: 'missing' | 'unexpected' | 'mismatch'
@@ -84,6 +86,7 @@ export type VerifyFinding =
     }
   | {
       readonly kind: 'orphaned-head'
+      readonly tenant: string
       readonly ref: string
       readonly path: string
     }
@@ -93,7 +96,7 @@ export type VerifyFinding =
       readonly path: string
       readonly blobId: string
     }
-/** Limits fsck scope to one tenant and an optional deterministic row sample. @see spec §4.9 */
+/** Limits fsck scope to one tenant and randomizes the tree, commit, and CAS spot-check samples. Ref/head drift remains full-scope. @see spec §4.9 */
 export interface VerifyOptions {
   readonly tenant?: string
   readonly sample?: number
@@ -596,17 +599,28 @@ async function deleteMaintenanceBatch(
   }
 }
 
+async function maintenanceTransaction<T>(client: Queryable, work: () => Promise<T>): Promise<T> {
+  await client.query('BEGIN')
+  try {
+    const result = await work()
+    await client.query('COMMIT')
+    return result
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined)
+    throw error
+  }
+}
+
 async function collectTenant(
   client: Queryable,
   tenant: string,
   cutoff: Date,
   settledCutoff: Date,
-): Promise<{ counts: GcCounts; objectKeys: string[] }> {
+): Promise<{ counts: GcCounts }> {
   const counts = emptyGcCounts()
-  const objectKeys: string[] = []
-  await client.query('BEGIN')
-  try {
-    for (;;) {
+
+  for (;;) {
+    const count = await maintenanceTransaction(client, async () => {
       const settled = await client.query<{ name: string }>(
         `SELECT name
          FROM afs_refs
@@ -616,7 +630,7 @@ async function collectTenant(
          LIMIT $3`,
         [tenant, settledCutoff, MAINTENANCE_BATCH_SIZE],
       )
-      if (settled.rows.length === 0) break
+      if (settled.rows.length === 0) return 0
       const names = settled.rows.map(row => row.name)
       await client.query('DELETE FROM afs_heads WHERE tenant = $1 AND ref_name = ANY($2::text[])', [tenant, names])
       const deleted = await client.query<{ name: string }>(
@@ -625,24 +639,40 @@ async function collectTenant(
          RETURNING name`,
         [tenant, names],
       )
-      counts.settledBranches += deleted.rowCount ?? deleted.rows.length
-    }
+      return deleted.rowCount ?? deleted.rows.length
+    })
+    counts.settledBranches += count
+    if (count === 0) break
+  }
 
-    for (;;) {
+  for (;;) {
+    const count = await maintenanceTransaction(client, async () => {
       const deleted = await deleteMaintenanceBatch(
         client,
         `WITH RECURSIVE reachable(id) AS (
-           SELECT commit_id FROM afs_refs WHERE tenant = $1
+           SELECT commit_id
+           FROM afs_refs
+           WHERE tenant = $1
            UNION
            SELECT parent_id
            FROM reachable r
            JOIN afs_commits c ON c.id = r.id AND c.tenant = $1
            CROSS JOIN LATERAL unnest(c.parents) AS parents(parent_id)
          ),
+         grace_protected(id) AS (
+           SELECT id
+           FROM afs_commits
+           WHERE tenant = $1 AND created_at > $2
+         ),
          protected_ids(id) AS (
            SELECT id FROM reachable
            UNION
-           SELECT id FROM afs_commits WHERE tenant = $1 AND created_at > $2
+           SELECT id FROM grace_protected
+           UNION
+           SELECT parent_id
+           FROM protected_ids p
+           JOIN afs_commits c ON c.id = p.id AND c.tenant = $1
+           CROSS JOIN LATERAL unnest(c.parents) AS parents(parent_id)
          ),
          doomed AS (
            SELECT c.id
@@ -653,6 +683,12 @@ async function collectTenant(
                SELECT 1 FROM afs_refs r
                WHERE r.tenant = c.tenant AND (r.commit_id = c.id OR r.base_commit = c.id)
              )
+             AND NOT EXISTS (
+               SELECT 1
+               FROM afs_commits child
+               CROSS JOIN LATERAL unnest(child.parents) AS parents(parent_id)
+               WHERE child.tenant = $1 AND parents.parent_id = c.id
+             )
            ORDER BY c.id
            LIMIT $3
          )
@@ -662,11 +698,14 @@ async function collectTenant(
          RETURNING c.id`,
         [tenant, cutoff, MAINTENANCE_BATCH_SIZE],
       )
-      if ((deleted.rowCount ?? deleted.rows.length) === 0) break
-      counts.deletedCommits += deleted.rowCount ?? deleted.rows.length
-    }
+      return deleted.rowCount ?? deleted.rows.length
+    })
+    counts.deletedCommits += count
+    if (count === 0) break
+  }
 
-    for (;;) {
+  for (;;) {
+    const count = await maintenanceTransaction(client, async () => {
       const deleted = await deleteMaintenanceBatch(
         client,
         `WITH doomed AS (
@@ -683,11 +722,14 @@ async function collectTenant(
          RETURNING t.id`,
         [tenant, cutoff, MAINTENANCE_BATCH_SIZE],
       )
-      if ((deleted.rowCount ?? deleted.rows.length) === 0) break
-      counts.deletedTrees += deleted.rowCount ?? deleted.rows.length
-    }
+      return deleted.rowCount ?? deleted.rows.length
+    })
+    counts.deletedTrees += count
+    if (count === 0) break
+  }
 
-    for (;;) {
+  for (;;) {
+    const count = await maintenanceTransaction(client, async () => {
       const deleted = await deleteMaintenanceBatch(
         client,
         `WITH doomed AS (
@@ -701,23 +743,16 @@ async function collectTenant(
          DELETE FROM afs_blobs b
          USING doomed
          WHERE b.id = doomed.id
-         RETURNING b.object_key`,
+         RETURNING b.id`,
         [tenant, cutoff, MAINTENANCE_BATCH_SIZE],
       )
-      const rowCount = deleted.rowCount ?? deleted.rows.length
-      if (rowCount === 0) break
-      counts.deletedBlobs += rowCount
-      for (const row of deleted.rows) {
-        if (typeof row.object_key === 'string' && row.object_key.startsWith('afs/')) objectKeys.push(row.object_key)
-      }
-    }
-
-    await client.query('COMMIT')
-  } catch (error) {
-    await client.query('ROLLBACK').catch(() => undefined)
-    throw error
+      return deleted.rowCount ?? deleted.rows.length
+    })
+    counts.deletedBlobs += count
+    if (count === 0) break
   }
-  return { counts, objectKeys }
+
+  return { counts }
 }
 
 async function discoverTenants(client: Queryable): Promise<string[]> {
@@ -757,12 +792,14 @@ type VerifyCommitRow = {
 }
 
 type VerifyRefRow = {
+  tenant: string
   name: string
   commit_id: string
   tree_id: string
 }
 
 type VerifyHeadRow = {
+  tenant: string
   ref_name: string
   path: string
   blob_id: string
@@ -795,73 +832,58 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
     }
 
     const total = emptyGcCounts()
-    let skipped = false
+    const skippedTenants: string[] = []
+    let ranTenants = 0
     const cutoff = new Date(now().getTime() - graceMs)
     const settledCutoff = new Date(now().getTime() - retentionMs)
     for (const tenant of tenants) {
       const client = await options.pool.connect()
       let locked = false
-      const deletedObjectKeys = new Set<string>()
       try {
         const lock = await client.query<{ locked: boolean }>(`SELECT pg_try_advisory_lock(hashtext($1)) AS locked`, [
           `afs:gc:${tenant}`,
         ])
         locked = lock.rows[0]?.locked === true
         if (!locked) {
-          skipped = true
+          skippedTenants.push(tenant)
           continue
         }
+        ranTenants += 1
         const collected = await collectTenant(client, tenant, cutoff, settledCutoff)
         total.deletedCommits += collected.counts.deletedCommits
         total.deletedTrees += collected.counts.deletedTrees
         total.deletedBlobs += collected.counts.deletedBlobs
         total.settledBranches += collected.counts.settledBranches
-        for (const key of collected.objectKeys) deletedObjectKeys.add(key)
 
-        if (options.storage) {
-          for (const key of deletedObjectKeys) {
-            try {
-              await options.storage.delete(key)
-              total.deletedObjects += 1
-            } catch (error) {
-              options.logger?.error(error, { tenant, objectKey: key, operation: 'gc' })
-            }
-          }
-          if (options.storage.list) {
-            try {
-              const prefix = `afs/${tenant}/`
-              const listed = await options.storage.list(prefix)
-              const candidates = listed.filter(object => object.key.startsWith('afs/'))
-              if (candidates.length > 0) {
-                const known = await client.query<{ object_key: string }>(
-                  `SELECT object_key
-                   FROM afs_blobs
-                   WHERE tenant = $1 AND object_key = ANY($2::text[])`,
-                  [tenant, candidates.map(object => object.key)],
-                )
-                const knownKeys = new Set(known.rows.map(row => row.object_key))
-                const nowMs = now().getTime()
-                for (const object of candidates) {
-                  const modified = dateFromPostgres(object.lastModified)
-                  if (
-                    !modified ||
-                    !object.key.startsWith(prefix) ||
-                    knownKeys.has(object.key) ||
-                    nowMs - modified.getTime() <= graceMs ||
-                    deletedObjectKeys.has(object.key)
-                  )
-                    continue
-                  try {
-                    await options.storage.delete(object.key)
-                    total.deletedObjects += 1
-                  } catch (error) {
-                    options.logger?.error(error, { tenant, objectKey: object.key, operation: 'gc' })
-                  }
+        // A collected row must not directly delete its object key. The key
+        // may have been uploaded and referenced again after the batch commit.
+        if (options.storage?.list) {
+          try {
+            const prefix = `afs/${tenant}/`
+            const listed = await options.storage.list(prefix)
+            const candidates = listed.filter(object => object.key.startsWith(prefix))
+            if (candidates.length > 0) {
+              const known = await client.query<{ object_key: string }>(
+                `SELECT object_key
+                 FROM afs_blobs
+                 WHERE tenant = $1 AND object_key = ANY($2::text[])`,
+                [tenant, candidates.map(object => object.key)],
+              )
+              const knownKeys = new Set(known.rows.map(row => row.object_key))
+              const nowMs = now().getTime()
+              for (const object of candidates) {
+                const modified = dateFromPostgres(object.lastModified)
+                if (!modified || knownKeys.has(object.key) || nowMs - modified.getTime() <= graceMs) continue
+                try {
+                  await options.storage.delete(object.key)
+                  total.deletedObjects += 1
+                } catch (error) {
+                  options.logger?.error(error, { tenant, objectKey: object.key, operation: 'gc' })
                 }
               }
-            } catch (error) {
-              options.logger?.error(error, { tenant, operation: 'gc-orphan-list' })
             }
+          } catch (error) {
+            options.logger?.error(error, { tenant, operation: 'gc-orphan-list' })
           }
         }
       } finally {
@@ -870,9 +892,13 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
         client.release()
       }
     }
-    return { skipped, ...(input.tenant === undefined ? {} : { tenant: input.tenant }), ...total }
+    return {
+      skipped: ranTenants === 0,
+      skippedTenants,
+      ...(input.tenant === undefined ? {} : { tenant: input.tenant }),
+      ...total,
+    }
   }
-
   async function verify(input: VerifyOptions = {}): Promise<VerifyReport> {
     const client = await options.pool.connect()
     const findings: VerifyFinding[] = []
@@ -883,14 +909,24 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
     const headWhere = input.tenant === undefined ? '' : ' WHERE h.tenant = $1'
     const blobWhere =
       input.tenant === undefined ? ' WHERE object_key IS NOT NULL' : ' WHERE tenant = $1 AND object_key IS NOT NULL'
-    const qualifiedTenantWhere = input.tenant === undefined ? '' : ' WHERE t.tenant = $1'
+    const treeWhere = input.tenant === undefined ? '' : ' WHERE t.tenant = $1'
+    const treeSampleWhere =
+      limit === null
+        ? ''
+        : input.tenant === undefined
+          ? ` WHERE t.id IN (SELECT t_sample.id FROM afs_trees t_sample ORDER BY random() LIMIT ${limit})`
+          : ` AND t.id IN (
+               SELECT t_sample.id FROM afs_trees t_sample
+               WHERE t_sample.tenant = $1
+               ORDER BY random() LIMIT ${limit}
+             )`
     try {
       const treesResult = await client.query<VerifyTreeRow>(
         `SELECT t.id::text, t.tree_sha, e.path, e.mode, e.blob_id::text, b.sha256 AS blob_sha,
                 b.size_bytes::text AS blob_size
          FROM afs_trees t
          LEFT JOIN afs_tree_entries e ON e.tree_id = t.id
-         LEFT JOIN afs_blobs b ON b.id = e.blob_id${qualifiedTenantWhere}
+         LEFT JOIN afs_blobs b ON b.id = e.blob_id${treeWhere}${treeSampleWhere}
          ORDER BY t.id, e.path`,
         params,
       )
@@ -934,13 +970,31 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
                 c.thread_id, c.run_id, c.op, c.created_at
          FROM afs_commits c
          LEFT JOIN afs_trees t ON t.id = c.tree_id${commitWhere}
-         ORDER BY c.id`,
+         ${limit === null ? 'ORDER BY c.id' : `ORDER BY random() LIMIT ${limit}`}`,
         params,
       )
-      const commits = new Map(commitsResult.rows.map(row => [row.id, row]))
-      const sampledCommits = commitsResult.rows.slice(0, limit ?? commitsResult.rows.length)
+      const sampledCommits = commitsResult.rows
+      const sampledParentIds = [...new Set(sampledCommits.flatMap(row => stringArray(row.parents)))]
+      const parentParams: readonly unknown[] = [...params, sampledParentIds]
+      const parentWhere =
+        input.tenant === undefined
+          ? ' WHERE c.id = ANY($1::bigint[])'
+          : ' WHERE c.tenant = $1 AND c.id = ANY($2::bigint[])'
+      const parentRows =
+        sampledParentIds.length === 0
+          ? []
+          : (
+              await client.query<VerifyCommitRow>(
+                `SELECT c.id::text, c.commit_sha, t.tree_sha, c.parents, c.author_user, c.agent_kind,
+                        c.thread_id, c.run_id, c.op, c.created_at
+                 FROM afs_commits c
+                 LEFT JOIN afs_trees t ON t.id = c.tree_id${parentWhere}`,
+                parentParams,
+              )
+            ).rows
+      const commits = new Map([...commitsResult.rows, ...parentRows].map(row => [row.id, row]))
       let parentCount = 0
-      for (const row of commitsResult.rows) {
+      for (const row of sampledCommits) {
         const parentIds = stringArray(row.parents)
         parentCount += parentIds.length
         const parentShas: string[] = []
@@ -953,7 +1007,6 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
             parentShas.push(parent.commit_sha)
           }
         }
-        if (!sampledCommits.includes(row)) continue
         let computed = ''
         const created = dateFromPostgres(row.created_at)
         if (row.tree_sha && created) {
@@ -982,32 +1035,64 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
       }
 
       const refsResult = await client.query<VerifyRefRow>(
-        `SELECT r.name, r.commit_id::text, c.tree_id::text
+        `SELECT r.tenant, r.name, r.commit_id::text, c.tree_id::text
          FROM afs_refs r JOIN afs_commits c ON c.id = r.commit_id${refWhere}
-         ORDER BY r.name`,
+         ORDER BY r.tenant, r.name`,
         params,
       )
+      const refEntriesResult = await client.query<{
+        tenant: string
+        name: string
+        path: string | null
+        blob_id: string | null
+        blob_sha: string | null
+        blob_size: string | null
+      }>(
+        `SELECT r.tenant, r.name, e.path, e.blob_id::text, b.sha256 AS blob_sha, b.size_bytes::text AS blob_size
+         FROM afs_refs r
+         JOIN afs_commits c ON c.id = r.commit_id
+         LEFT JOIN afs_tree_entries e ON e.tree_id = c.tree_id
+         LEFT JOIN afs_blobs b ON b.id = e.blob_id${refWhere}
+         ORDER BY r.tenant, r.name, e.path`,
+        params,
+      )
+      const expectedByRef = new Map<string, Map<string, { blobId: string; sha256: string; sizeBytes: string }>>()
+      for (const row of refEntriesResult.rows) {
+        if (row.path === null || row.blob_id === null || row.blob_sha === null || row.blob_size === null) continue
+        const refKey = `${row.tenant}\u0000${row.name}`
+        const expected = expectedByRef.get(refKey) ?? new Map()
+        expected.set(row.path, { blobId: row.blob_id, sha256: row.blob_sha, sizeBytes: row.blob_size })
+        expectedByRef.set(refKey, expected)
+      }
       const headsResult = await client.query<VerifyHeadRow>(
-        `SELECT h.ref_name, h.path, h.blob_id::text, h.sha256, h.size_bytes::text
+        `SELECT h.tenant, h.ref_name, h.path, h.blob_id::text, h.sha256, h.size_bytes::text
          FROM afs_heads h${headWhere}
-         ORDER BY h.ref_name, h.path`,
+         ORDER BY h.tenant, h.ref_name, h.path`,
         params,
       )
       const headsByRef = new Map<string, Map<string, VerifyHeadRow>>()
       for (const row of headsResult.rows) {
-        const byPath = headsByRef.get(row.ref_name) ?? new Map<string, VerifyHeadRow>()
+        const refKey = `${row.tenant}\u0000${row.ref_name}`
+        const byPath = headsByRef.get(refKey) ?? new Map<string, VerifyHeadRow>()
         byPath.set(row.path, row)
-        headsByRef.set(row.ref_name, byPath)
+        headsByRef.set(refKey, byPath)
       }
-      const refs = new Set(refsResult.rows.map(row => row.name))
-      const treesById = new Map(trees)
+      const refs = new Set(refsResult.rows.map(row => `${row.tenant}\u0000${row.name}`))
       for (const ref of refsResult.rows) {
-        const expected = treesById.get(ref.tree_id)?.expected ?? new Map()
-        const actual = headsByRef.get(ref.name) ?? new Map<string, VerifyHeadRow>()
+        const refKey = `${ref.tenant}\u0000${ref.name}`
+        const expected = expectedByRef.get(refKey) ?? new Map()
+        const actual = headsByRef.get(refKey) ?? new Map<string, VerifyHeadRow>()
         for (const [path, entry] of expected) {
           const head = actual.get(path)
           if (!head) {
-            findings.push({ kind: 'heads-drift', ref: ref.name, path, issue: 'missing', expected: entry })
+            findings.push({
+              kind: 'heads-drift',
+              tenant: ref.tenant,
+              ref: ref.name,
+              path,
+              issue: 'missing',
+              expected: entry,
+            })
           } else if (
             head.blob_id !== entry.blobId ||
             head.sha256 !== entry.sha256 ||
@@ -1015,6 +1100,7 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
           ) {
             findings.push({
               kind: 'heads-drift',
+              tenant: ref.tenant,
               ref: ref.name,
               path,
               issue: 'mismatch',
@@ -1025,20 +1111,38 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
         }
         for (const path of actual.keys()) {
           if (!expected.has(path))
-            findings.push({ kind: 'heads-drift', ref: ref.name, path, issue: 'unexpected', actual: undefined })
+            findings.push({
+              kind: 'heads-drift',
+              tenant: ref.tenant,
+              ref: ref.name,
+              path,
+              issue: 'unexpected',
+              actual: actual.has(path)
+                ? {
+                    blobId: actual.get(path)?.blob_id ?? '',
+                    sha256: actual.get(path)?.sha256 ?? '',
+                    sizeBytes: actual.get(path)?.size_bytes ?? '',
+                  }
+                : undefined,
+            })
         }
       }
       for (const row of headsResult.rows) {
-        if (!refs.has(row.ref_name)) findings.push({ kind: 'orphaned-head', ref: row.ref_name, path: row.path })
+        if (!refs.has(`${row.tenant}\u0000${row.ref_name}`))
+          findings.push({ kind: 'orphaned-head', tenant: row.tenant, ref: row.ref_name, path: row.path })
       }
 
-      const blobsResult = await client.query<VerifyBlobRow>(
-        `SELECT id::text, object_key, size_bytes::text
-         FROM afs_blobs${blobWhere}
-         ORDER BY id`,
-        params,
-      )
-      const blobs = blobsResult.rows.slice(0, limit ?? blobsResult.rows.length)
+      const blobs = options.storage
+        ? (
+            await client.query<VerifyBlobRow>(
+              `SELECT id::text, object_key, size_bytes::text
+               FROM afs_blobs${blobWhere}
+               ${limit === null ? '' : `ORDER BY random() LIMIT ${limit}`}
+               ${limit === null ? 'ORDER BY id' : ''}`,
+              params,
+            )
+          ).rows
+        : []
       if (options.storage) {
         for (const blob of blobs) {
           try {
@@ -1095,6 +1199,7 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
     const client = await options.pool.connect()
     try {
       await client.query('BEGIN')
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`afs:gc:${input.tenant}`])
       await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`${input.tenant}:mount/${input.mount}`])
       let mountRef = await client.query<RefRow>(
         `SELECT r.commit_id::text, r.base_commit::text, c.commit_sha, r.kind, r.state
@@ -1183,13 +1288,19 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
       throw new PermissionDeniedError('Write permission denied', context)
     const bytes = bytesFor(input.bytes)
     const sha256 = hashSha256(bytes)
-    const objectKey = await ensureStorage(options.storage, input.tenant, bytes, sha256, inlineMaxBytes, context)
 
     // Interpret §4.5 step 9's “max 3” as three total attempts; the
     // RefConflictError.attempts field reports that same budget.
     for (let attempt = 0; attempt < maxCasRetries; attempt += 1) {
       const client = await options.pool.connect()
+      let lockHeld = false
       try {
+        // Hold the tenant GC lock before uploading. GC keeps the same lock
+        // through its orphan sweep, so no package write can upload and commit
+        // a reference in the sweep's delete window.
+        await client.query('SELECT pg_advisory_lock(hashtext($1))', [`afs:gc:${input.tenant}`])
+        lockHeld = true
+        const objectKey = await ensureStorage(options.storage, input.tenant, bytes, sha256, inlineMaxBytes, context)
         await client.query('BEGIN')
         const ref = await loadRef(client, input.tenant, input.ref, context)
         if (ref.kind === 'branch' && ref.state !== 'open') throw new BranchSettledError(ref.state, context)
@@ -1250,22 +1361,30 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
           changedPaths: [path],
         }
         if (options.onCommit) {
-          void Promise.resolve()
-            .then(() => options.onCommit?.(event))
-            .catch(error => {
-              try {
-                if (options.logger) options.logger.error(error, event)
-                else console.error('AgentFs onCommit hook failed', error, event)
-              } catch (loggerError) {
-                console.error('AgentFs onCommit hook logger failed', loggerError, { error, event })
-              }
+          setImmediate(() => {
+            setImmediate(() => {
+              void Promise.resolve()
+                .then(() => options.onCommit?.(event))
+                .catch(error => {
+                  try {
+                    if (options.logger) options.logger.error(error, event)
+                    else console.error('AgentFs onCommit hook failed', error, event)
+                  } catch (loggerError) {
+                    console.error('AgentFs onCommit hook logger failed', loggerError, { error, event })
+                  }
+                })
             })
+          })
         }
         return { path, sha256, sizeBytes: BigInt(bytes.length), commitSha: commit.sha }
       } catch (error) {
         await client.query('ROLLBACK').catch(() => undefined)
         throw error
       } finally {
+        if (lockHeld)
+          await client
+            .query('SELECT pg_advisory_unlock(hashtext($1))', [`afs:gc:${input.tenant}`])
+            .catch(() => undefined)
         client.release()
       }
     }

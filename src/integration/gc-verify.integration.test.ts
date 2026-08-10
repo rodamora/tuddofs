@@ -8,6 +8,7 @@ import { createAgentFs, migrate, type BlobStore } from '../index.js'
 
 const pool = new Pool({ connectionString: process.env.AGENT_FS_DATABASE_URL })
 const tenant = 'gc-verify-tenant'
+const tenant2 = 'gc-verify-tenant-two'
 const mount = 'project:gc'
 const actor = 'gc-user'
 const now = new Date('2026-08-10T12:00:00.000Z')
@@ -108,24 +109,276 @@ test('gc deletes old orphan uploads under afs tenant prefix but keeps young and 
   assert.equal(storage.objects.has(`afs/${tenant}/young-orphan`), true)
   assert.equal(storage.objects.has(`other/${tenant}/must-stay`), true)
 })
-test('property suite runs GC inside every DAG iteration and never collects reachable state', async () => {
+test('seeded randomized GC preserves reachable forks, merge-shaped parents, and tags', async () => {
   const fs = createAgentFs({ pool, now: () => now })
-  const paths = ['/a.txt', '/b.txt', '/c.txt']
-  for (let iteration = 0; iteration < 12; iteration += 1) {
-    const branch = await fs.fork({
-      tenant,
-      mount,
-      sessionId: `property-${iteration}`,
-      authorUser: actor,
-    })
-    assert.ok(branch)
-    const path = paths[iteration % paths.length] as string
-    const bytes = `property-${iteration}`
-    await fs.write({ tenant, mount, ref: branch.ref, path, bytes, authorUser: actor })
-    const gcResult = await fs.gc({ tenant, graceMs: 0 })
-    assert.equal(gcResult.skipped, false)
-    assert.equal((await fs.read({ tenant, ref: branch.ref, path })).bytes.toString(), bytes)
+  let seed = 0x9e3779b9
+  const next = (): number => {
+    seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0
+    return seed
   }
+  const refs: string[] = []
+  try {
+    for (let iteration = 0; iteration < 24; iteration += 1) {
+      const branch = await fs.fork({
+        tenant,
+        mount,
+        sessionId: `property-${iteration}`,
+        authorUser: actor,
+      })
+      assert.ok(branch)
+      refs.push(branch.ref)
+      const writes = 1 + (next() % 3)
+      for (let write = 0; write < writes; write += 1) {
+        const path = `/random-${next() % 5}.txt`
+        const bytes = `property-${iteration}-${write}-${next()}`
+        await fs.write({ tenant, mount, ref: branch.ref, path, bytes, authorUser: actor })
+        assert.equal((await fs.read({ tenant, ref: branch.ref, path })).bytes.toString(), bytes)
+      }
+      if (iteration > 0 && next() % 2 === 0) {
+        await pool.query(
+          `INSERT INTO afs_refs (tenant, name, kind, commit_id, state)
+         SELECT tenant, $2, 'tag', commit_id, 'open'
+         FROM afs_refs WHERE tenant = $1 AND name = $3`,
+          [tenant, `tag/property-${iteration}`, branch.ref],
+        )
+      }
+      if (iteration > 1 && next() % 3 === 0) {
+        const merge = await pool.query<{ id: string }>(
+          `WITH current AS (
+           SELECT r.commit_id, c.tree_id, c.commit_sha, c.parents, c.author_user, c.agent_kind,
+                  c.thread_id, c.run_id, c.op
+           FROM afs_refs r JOIN afs_commits c ON c.id = r.commit_id
+           WHERE r.tenant = $1 AND r.name = $2
+         ), other AS (
+           SELECT commit_id FROM afs_refs
+           WHERE tenant = $1 AND name <> $2
+           ORDER BY name LIMIT 1
+         )
+         INSERT INTO afs_commits
+           (tenant, commit_sha, tree_id, parents, author_user, agent_kind, thread_id, run_id, op, created_at)
+         SELECT $1, repeat(md5(random()::text), 2), current.tree_id,
+                ARRAY[current.commit_id, other.commit_id]::bigint[], current.author_user,
+                current.agent_kind, current.thread_id, current.run_id, current.op, now()
+         FROM current CROSS JOIN other
+         RETURNING id::text AS id`,
+          [tenant, branch.ref],
+        )
+        const mergeId = merge.rows[0]?.id
+        if (mergeId) {
+          await pool.query('UPDATE afs_refs SET commit_id = $3::bigint WHERE tenant = $1 AND name = $2', [
+            tenant,
+            branch.ref,
+            mergeId,
+          ])
+        }
+      }
+      const gcResult = await fs.gc({ tenant, graceMs: 0 })
+      assert.equal(gcResult.skipped, false, `seed=${seed}`)
+      for (const ref of refs.slice(-2)) {
+        const head = await pool.query<{ path: string }>(
+          'SELECT path FROM afs_heads WHERE tenant = $1 AND ref_name = $2 ORDER BY path LIMIT 1',
+          [tenant, ref],
+        )
+        if (head.rows[0]) {
+          await fs.read({ tenant, ref, path: head.rows[0].path })
+        }
+      }
+    }
+  } catch (error) {
+    throw new Error(`seed=${seed}`, { cause: error })
+  }
+})
+
+test('gc protects ancestors of grace-protected commits and collects both after grace expiry', async () => {
+  const fs = createAgentFs({ pool, now: () => now })
+  const branch = await fs.fork({ tenant, mount, sessionId: 'grace-ancestor', authorUser: actor })
+  assert.ok(branch)
+  await pool.query('DELETE FROM afs_refs WHERE tenant = $1', [tenant])
+  await pool.query('UPDATE afs_commits SET created_at = $2 WHERE tenant = $1 AND id = $3', [
+    tenant,
+    new Date(now.getTime() - 2 * 24 * 60 * 60 * 1000),
+    branch.commitId.toString(),
+  ])
+  const child = await pool.query<{ id: string }>(
+    `INSERT INTO afs_commits
+       (tenant, commit_sha, tree_id, parents, author_user, op, created_at)
+     SELECT tenant, repeat('a', 64), tree_id, ARRAY[$2::bigint], $3, 'write', $4
+     FROM afs_commits WHERE tenant = $1 AND id = $2
+     RETURNING id::text AS id`,
+    [tenant, branch.commitId.toString(), actor, now],
+  )
+  assert.equal(child.rows.length, 1)
+
+  await fs.gc({ tenant, graceMs: 24 * 60 * 60 * 1000 })
+  assert.equal(
+    (
+      await pool.query('SELECT 1 FROM afs_commits WHERE tenant = $1 AND id = ANY($2::bigint[])', [
+        tenant,
+        [branch.commitId.toString(), child.rows[0]?.id],
+      ])
+    ).rowCount,
+    2,
+  )
+
+  await pool.query('UPDATE afs_commits SET created_at = $2 WHERE tenant = $1 AND id = $3', [
+    tenant,
+    new Date(now.getTime() - 2 * 24 * 60 * 60 * 1000),
+    child.rows[0]?.id,
+  ])
+  await fs.gc({ tenant, graceMs: 24 * 60 * 60 * 1000 })
+  assert.equal(
+    (
+      await pool.query('SELECT 1 FROM afs_commits WHERE tenant = $1 AND id = ANY($2::bigint[])', [
+        tenant,
+        [branch.commitId.toString(), child.rows[0]?.id],
+      ])
+    ).rowCount,
+    0,
+  )
+})
+
+test('gc deletes unreachable commit children before parents across maintenance batches', async () => {
+  const fs = createAgentFs({ pool, now: () => now })
+  const branch = await fs.fork({ tenant, mount, sessionId: 'batch-chain', authorUser: actor })
+  assert.ok(branch)
+  await pool.query('DELETE FROM afs_refs WHERE tenant = $1', [tenant])
+  const old = new Date(now.getTime() - 2 * 24 * 60 * 60 * 1000)
+  await pool.query(
+    `DO $$
+     DECLARE
+       parent_id BIGINT := ${branch.commitId.toString()}::bigint;
+       idx INTEGER;
+     BEGIN
+       UPDATE afs_commits
+       SET created_at = TIMESTAMPTZ '${old.toISOString()}'
+       WHERE tenant = '${tenant}' AND id = parent_id;
+       FOR idx IN 0..519 LOOP
+         INSERT INTO afs_commits
+           (tenant, commit_sha, tree_id, parents, author_user, op, created_at)
+         SELECT '${tenant}', repeat(md5(idx::text), 2), tree_id, ARRAY[parent_id],
+                '${actor}', 'write', TIMESTAMPTZ '${old.toISOString()}'
+         FROM afs_commits
+         WHERE tenant = '${tenant}' AND id = parent_id;
+       END LOOP;
+     END $$`,
+  )
+  await fs.gc({ tenant, graceMs: 0 })
+  assert.equal((await pool.query('SELECT 1 FROM afs_commits WHERE tenant = $1', [tenant])).rowCount, 0)
+  assert.equal(
+    (
+      await pool.query(
+        `SELECT 1
+         FROM afs_commits child
+         CROSS JOIN LATERAL unnest(child.parents) AS parent_ids(parent_id)
+         WHERE child.tenant = $1
+           AND NOT EXISTS (SELECT 1 FROM afs_commits parent WHERE parent.tenant = $1 AND parent.id = parent_ids.parent_id)`,
+        [tenant],
+      )
+    ).rowCount,
+    0,
+  )
+})
+test('gc race keeps a blob readable when an identical write lands during orphan deletion', async () => {
+  const storage = new MemoryStore()
+  const fs = createAgentFs({ pool, storage, inlineMaxBytes: 1, now: () => now })
+  const oldBranch = await fs.fork({ tenant, mount, sessionId: 'race-old', authorUser: actor })
+  const liveBranch = await fs.fork({ tenant, mount, sessionId: 'race-live', authorUser: actor })
+  assert.ok(oldBranch)
+  assert.ok(liveBranch)
+  const bytes = 'race-large-content'
+  const oldWrite = await fs.write({ tenant, mount, ref: oldBranch.ref, path: '/race.bin', bytes, authorUser: actor })
+  await pool.query(
+    `UPDATE afs_blobs SET created_at = $2
+     WHERE tenant = $1 AND sha256 = $3`,
+    [tenant, new Date(now.getTime() - 2 * 24 * 60 * 60 * 1000), oldWrite.sha256],
+  )
+  const object = storage.objects.get(`afs/${tenant}/${oldWrite.sha256}`)
+  assert.ok(object)
+  object.lastModified = new Date(now.getTime() - 2 * 24 * 60 * 60 * 1000)
+  await pool.query(
+    `UPDATE afs_commits SET created_at = $2
+     WHERE tenant = $1 AND id = (SELECT commit_id FROM afs_refs WHERE tenant = $1 AND name = $3)`,
+    [tenant, new Date(now.getTime() - 2 * 24 * 60 * 60 * 1000), oldBranch.ref],
+  )
+  await pool.query('UPDATE afs_refs SET state = $3, settled_at = $4 WHERE tenant = $1 AND name = $2', [
+    tenant,
+    oldBranch.ref,
+    'merged',
+    new Date(now.getTime() - 2 * 24 * 60 * 60 * 1000),
+  ])
+  let started!: () => void
+  const startedPromise = new Promise<void>(resolve => {
+    started = resolve
+  })
+  let unblock!: () => void
+  const gate = new Promise<void>(resolve => {
+    unblock = resolve
+  })
+  storage.listStarted = () => started()
+  storage.listGate = gate
+  const gcPromise = fs.gc({ tenant, graceMs: 0, settledBranchRetentionMs: 0 })
+  await startedPromise
+  const rewritePromise = fs.write({ tenant, mount, ref: liveBranch.ref, path: '/race.bin', bytes, authorUser: actor })
+  unblock()
+  await gcPromise
+  await rewritePromise
+  assert.equal((await fs.read({ tenant, ref: liveBranch.ref, path: '/race.bin' })).bytes.toString(), bytes)
+})
+
+test('verify keeps same-named refs isolated across tenants', async () => {
+  const fs = createAgentFs({ pool, now: () => now })
+  const first = await fs.fork({ tenant, mount, sessionId: 'same-ref', authorUser: actor })
+  const second = await fs.fork({ tenant: tenant2, mount, sessionId: 'same-ref', authorUser: actor })
+  assert.ok(first)
+  assert.ok(second)
+  await fs.write({ tenant, mount, ref: first.ref, path: '/tenant-one', bytes: 'one', authorUser: actor })
+  await fs.write({ tenant: tenant2, mount, ref: second.ref, path: '/tenant-two', bytes: 'two', authorUser: actor })
+  const report = await fs.verify()
+  assert.equal(report.findings.length, 0)
+})
+
+test('verify reports zero checked blobs when storage sampling is unavailable', async () => {
+  const fs = createAgentFs({ pool, now: () => now })
+  const branch = await fs.fork({ tenant, mount, sessionId: 'verify-no-storage', authorUser: actor })
+  assert.ok(branch)
+  await fs.write({ tenant, mount, ref: branch.ref, path: '/inline', bytes: 'inline', authorUser: actor })
+  const report = await fs.verify({ tenant })
+  assert.equal(report.checked.blobs, 0)
+})
+test('verify SQL sampling limits hash and storage checks without false ref drift', async () => {
+  const storage = new MemoryStore()
+  const fs = createAgentFs({ pool, storage, inlineMaxBytes: 1, now: () => now })
+  const branch = await fs.fork({ tenant, mount, sessionId: 'verify-sample', authorUser: actor })
+  assert.ok(branch)
+  await fs.write({ tenant, mount, ref: branch.ref, path: '/sample.bin', bytes: 'sample', authorUser: actor })
+  const report = await fs.verify({ tenant, sample: 1 })
+  assert.equal(report.ok, true)
+  assert.ok(report.checked.trees <= 1)
+  assert.ok(report.checked.commits <= 1)
+  assert.ok(report.checked.blobs <= 1)
+})
+
+test('tag-only commits survive collection after their branch ref is removed', async () => {
+  const fs = createAgentFs({ pool, now: () => now })
+  const branch = await fs.fork({ tenant, mount, sessionId: 'tag-only', authorUser: actor })
+  assert.ok(branch)
+  const tagName = 'tag/project:gc/tag-only'
+  await fs.write({ tenant, mount, ref: branch.ref, path: '/tagged', bytes: 'tagged', authorUser: actor })
+  const tip = await pool.query<{ id: string }>(
+    'SELECT commit_id::text AS id FROM afs_refs WHERE tenant = $1 AND name = $2',
+    [tenant, branch.ref],
+  )
+  await pool.query(
+    `INSERT INTO afs_refs (tenant, name, kind, commit_id, state)
+     VALUES ($1, $2, 'tag', $3::bigint, 'open')`,
+    [tenant, tagName, tip.rows[0]?.id],
+  )
+  await pool.query('DELETE FROM afs_refs WHERE tenant = $1 AND name = $2', [tenant, branch.ref])
+  await fs.gc({ tenant, graceMs: 0 })
+  assert.equal(
+    (await pool.query('SELECT 1 FROM afs_commits WHERE tenant = $1 AND id = $2', [tenant, tip.rows[0]?.id])).rowCount,
+    1,
+  )
 })
 
 test('concurrent gc skips when the tenant advisory lock is already held', async () => {
@@ -147,6 +400,23 @@ test('concurrent gc skips when the tenant advisory lock is already held', async 
   assert.equal(second.skipped, true)
   release()
   assert.equal((await first).skipped, false)
+})
+test('unscoped gc reports busy tenants separately from tenants it processed', async () => {
+  const fs = createAgentFs({ pool, now: () => now })
+  const first = await fs.fork({ tenant, mount, sessionId: 'busy-tenant', authorUser: actor })
+  const second = await fs.fork({ tenant: tenant2, mount, sessionId: 'free-tenant', authorUser: actor })
+  assert.ok(first)
+  assert.ok(second)
+  const holder = await pool.connect()
+  await holder.query('SELECT pg_advisory_lock(hashtext($1))', [`afs:gc:${tenant}`])
+  try {
+    const report = await fs.gc({ graceMs: 0 })
+    assert.equal(report.skipped, false)
+    assert.deepEqual(report.skippedTenants, [tenant])
+  } finally {
+    await holder.query('SELECT pg_advisory_unlock(hashtext($1))', [`afs:gc:${tenant}`])
+    holder.release()
+  }
 })
 
 test('gc removes settled branch refs and heads atomically after retention', async () => {
@@ -200,6 +470,37 @@ test('verify reports heads drift as a finding without throwing', async () => {
 
   const report = await fs.verify({ tenant })
   assert.ok(report.findings.some(finding => finding.kind === 'heads-drift'))
+})
+test('verify includes actual values for unexpected heads drift', async () => {
+  const fs = createAgentFs({ pool, now: () => now })
+  const branch = await fs.fork({ tenant, mount, sessionId: 'verify-unexpected-head', authorUser: actor })
+  assert.ok(branch)
+  const write = await fs.write({
+    tenant,
+    mount,
+    ref: branch.ref,
+    path: '/expected',
+    bytes: 'expected',
+    authorUser: actor,
+  })
+  const blob = await pool.query<{ id: string; size_bytes: string }>(
+    'SELECT id::text, size_bytes::text FROM afs_blobs WHERE tenant = $1 AND sha256 = $2',
+    [tenant, write.sha256],
+  )
+  await pool.query(
+    `INSERT INTO afs_heads (tenant, ref_name, path, blob_id, sha256, size_bytes)
+     VALUES ($1, $2, '/unexpected', $3::bigint, $4, $5::bigint)`,
+    [tenant, branch.ref, blob.rows[0]?.id, write.sha256, blob.rows[0]?.size_bytes],
+  )
+  const report = await fs.verify({ tenant })
+  const finding = report.findings.find(
+    candidate => candidate.kind === 'heads-drift' && candidate.issue === 'unexpected',
+  )
+  assert.deepEqual(finding && 'actual' in finding ? finding.actual : undefined, {
+    blobId: blob.rows[0]?.id,
+    sha256: write.sha256,
+    sizeBytes: blob.rows[0]?.size_bytes,
+  })
 })
 
 test('verify reports missing CAS storage as a finding without throwing', async () => {

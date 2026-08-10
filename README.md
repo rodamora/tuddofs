@@ -382,6 +382,6 @@ All errors are typed, exported, and carry `{ tenant, mount?, path?, ref? }` cont
 - The hermetic `test` script never connects to Postgres. For integration checks, start a disposable database (`docker run --rm --name agent-fs-it -e POSTGRES_USER=agentfs -e POSTGRES_PASSWORD=agentfs -e POSTGRES_DB=agentfs_it -p 55434:5432 postgres:16-alpine`), then run `AGENT_FS_DATABASE_URL=postgresql://agentfs:agentfs@127.0.0.1:55434/agentfs_it pnpm test:integration` from this package. Do not point it at Cowork development or production databases.
 - Run the focused GC/verify integration tests against a disposable database:
   `AGENT_FS_DATABASE_URL=postgresql://agentfs:agentfs@127.0.0.1:55434/agentfs_it pnpm test:integration -- --test-concurrency=1`.
-- `gc({ tenant })` acquires a non-blocking per-tenant advisory lock; a concurrent invocation returns `{ skipped: true }`.
-- `verify({ tenant, sample })` returns typed findings as data and does not abort when one record is corrupt.
+- `gc({ tenant })` acquires a non-blocking per-tenant advisory lock; a busy scoped invocation returns `{ skipped: true, skippedTenants: [tenant] }`. An unscoped run reports busy tenants in `skippedTenants` and sets `skipped` only when no tenant ran.
+- `verify({ tenant, sample })` returns typed findings as data and does not abort when one record is corrupt; `sample` randomizes tree, commit, and CAS checks while ref/head drift remains full-scope.
 - Run the real-database smoke demo with `AGENT_FS_DATABASE_URL=postgresql://agentfs:agentfs@127.0.0.1:55434/agentfs_it pnpm demo`.
