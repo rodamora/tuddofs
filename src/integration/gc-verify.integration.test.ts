@@ -89,6 +89,14 @@ test('gc keeps every commit reachable from refs and tags while collecting unreac
   assert.ok(rows.rows.some(row => row.id === branch.commitId.toString()))
   assert.ok(!rows.rows.some(row => row.id === unreachable.rows[0]?.id))
 })
+test('gc reports skipped false when no tenants are available', async () => {
+  const fs = createAgentFs({ pool, now: () => now })
+
+  const result = await fs.gc({ graceMs: 0 })
+
+  assert.equal(result.skipped, false)
+  assert.deepEqual(result.skippedTenants, [])
+})
 
 test('gc deletes old orphan uploads under afs tenant prefix but keeps young and foreign keys', async () => {
   const storage = new MemoryStore()

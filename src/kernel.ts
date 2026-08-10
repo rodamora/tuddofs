@@ -893,7 +893,7 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
       }
     }
     return {
-      skipped: ranTenants === 0,
+      skipped: tenants.length > 0 && ranTenants === 0,
       skippedTenants,
       ...(input.tenant === undefined ? {} : { tenant: input.tenant }),
       ...total,
