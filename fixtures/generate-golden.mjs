@@ -1,0 +1,139 @@
+// Reference generator for the canonical hash golden vectors (spec §4.2, §15.1).
+//
+// This is an INDEPENDENT reference implementation of the pinned byte formats —
+// deliberately separate from the kernel so the M0 kernel is implemented TOWARD
+// these digests rather than generating its own goldens (which would pin bugs).
+//
+// golden-hashes.json is append-only once merged: if a kernel change makes a
+// vector fail, the change is wrong, not the vector (spec §15.1).
+//
+// Regenerate (should be byte-identical): node packages/agent-fs/fixtures/generate-golden.mjs
+
+import { createHash } from 'node:crypto'
+import { writeFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+const sha256 = (buf) => createHash('sha256').update(buf).digest('hex')
+
+// ---- tree_sha (§4.2) --------------------------------------------------------
+// Entries sorted by path as UTF-8 bytes ascending (Buffer.compare — NEVER JS
+// string sort; UTF-16 code-unit order diverges for astral-plane code points).
+// Each entry: path + \0 + mode(decimal) + \0 + blob_sha256_hex + \n
+function treePreimage(entries) {
+  const sorted = [...entries].sort((a, b) => Buffer.compare(Buffer.from(a.path, 'utf8'), Buffer.from(b.path, 'utf8')))
+  return Buffer.concat(sorted.map((e) => Buffer.from(`${e.path}\0${e.mode}\0${e.blobSha}\n`, 'utf8')))
+}
+
+// ---- commit_sha (§4.2) ------------------------------------------------------
+// tree\0<tree_sha>\n
+// parent\0<parent_commit_sha>\n            (one per parent, stored order)
+// author\0<author_user>\0<agent_kind ?? ''>\0<thread_id ?? ''>\0<run_id ?? ''>\n
+// ts\0<ISO-8601 UTC, millisecond precision>\n
+// op\0<op>\n
+// NULL and '' hash identically by design; storage canonicalizes to NULL (§4.2).
+function commitPreimage(c) {
+  let s = `tree\0${c.treeSha}\n`
+  for (const p of c.parents) s += `parent\0${p}\n`
+  s += `author\0${c.authorUser}\0${c.agentKind ?? ''}\0${c.threadId ?? ''}\0${c.runId ?? ''}\n`
+  s += `ts\0${c.ts}\n`
+  s += `op\0${c.op}\n`
+  return Buffer.from(s, 'utf8')
+}
+
+// ---- fixtures ---------------------------------------------------------------
+const blobs = {
+  hello: { content: 'hello world\n', sha: sha256(Buffer.from('hello world\n', 'utf8')) },
+  plan: { content: '# Plan\n', sha: sha256(Buffer.from('# Plan\n', 'utf8')) },
+  empty: { content: '', sha: sha256(Buffer.alloc(0)) },
+}
+
+const trees = [
+  {
+    name: 'empty tree',
+    note: 'empty tree = sha256 of empty string (§4.2)',
+    entries: [],
+  },
+  {
+    name: 'single file',
+    entries: [{ path: '/hello.md', mode: 420, blobSha: blobs.hello.sha }],
+  },
+  {
+    name: 'sort edge cases',
+    note:
+      'UTF-8 byte order: /A.md < /a.md < /a/x.md (0x2E < 0x2F) < /bin/run < /\uFF61.md (EF BD A1) < /\u{1F600}.md (F0 9F 98 80). ' +
+      'JS string sort would place the astral-plane path BEFORE U+FF61 (surrogate D83D < FF61) — hashing that order is the §4.2 gotcha / Hermes #53404 bug.',
+    entries: [
+      { path: '/\u{1F600}.md', mode: 420, blobSha: blobs.hello.sha },
+      { path: '/a/x.md', mode: 420, blobSha: blobs.hello.sha },
+      { path: '/A.md', mode: 420, blobSha: blobs.hello.sha },
+      { path: '/bin/run', mode: 493, blobSha: blobs.empty.sha },
+      { path: '/\uFF61.md', mode: 420, blobSha: blobs.plan.sha },
+      { path: '/a.md', mode: 420, blobSha: blobs.plan.sha },
+    ],
+  },
+]
+
+const treeVectors = trees.map((t) => {
+  const preimage = treePreimage(t.entries)
+  return { ...t, preimageBase64: preimage.toString('base64'), treeSha: sha256(preimage) }
+})
+
+const commits = [
+  {
+    name: 'genesis (no parents, null attribution)',
+    treeSha: treeVectors[0].treeSha,
+    parents: [],
+    authorUser: 'user_1',
+    agentKind: null,
+    threadId: null,
+    runId: null,
+    ts: '2026-08-10T12:00:00.000Z',
+    op: 'import',
+  },
+  {
+    name: 'single-parent write with full attribution',
+    treeSha: treeVectors[1].treeSha,
+    parents: [], // filled below with genesis sha
+    authorUser: 'user_1',
+    agentKind: 'file-agent',
+    threadId: 'thr_9001',
+    runId: 'r_8842',
+    ts: '2026-08-10T12:00:01.000Z',
+    op: 'write',
+  },
+  {
+    name: 'merge (two parents, stored order [theirs, ours])',
+    treeSha: treeVectors[2].treeSha,
+    parents: [], // filled below with [write, genesis]
+    authorUser: 'user_1',
+    agentKind: 'file-agent',
+    threadId: 'thr_9001',
+    runId: 'r_8842',
+    ts: '2026-08-10T12:00:02.500Z',
+    op: 'merge',
+  },
+]
+
+const commitVectors = []
+for (const c of commits) {
+  if (c.name.startsWith('single-parent')) c.parents = [commitVectors[0].commitSha]
+  if (c.name.startsWith('merge')) c.parents = [commitVectors[1].commitSha, commitVectors[0].commitSha]
+  const preimage = commitPreimage(c)
+  commitVectors.push({ ...c, preimageBase64: preimage.toString('base64'), commitSha: sha256(preimage) })
+}
+
+const out = {
+  $comment:
+    'Golden hash vectors for spec §4.2. Append-only (§15.1). Generated by generate-golden.mjs — an independent reference; the kernel must reproduce these digests. preimageBase64 is the exact hashed bytes, for debugging divergence.',
+  spec: 'docs/specs/2026-08-10-agent-fs-architecture.md §4.2',
+  blobs,
+  trees: treeVectors,
+  commits: commitVectors,
+}
+
+const dest = join(dirname(fileURLToPath(import.meta.url)), 'golden-hashes.json')
+writeFileSync(dest, JSON.stringify(out, null, 2) + '\n')
+console.log(`wrote ${dest}`)
+for (const t of treeVectors) console.log(`tree   ${t.treeSha}  ${t.name}`)
+for (const c of commitVectors) console.log(`commit ${c.commitSha}  ${c.name}`)
