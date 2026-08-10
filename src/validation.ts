@@ -27,6 +27,20 @@ export class InvalidMountKeyError extends Error {
 }
 
 /**
+ * Error raised when a commit timestamp is not canonical UTC millisecond precision.
+ * @see spec §4.2
+ */
+export class InvalidCommitTimestampError extends Error {
+  readonly timestamp: unknown
+
+  constructor(timestamp: unknown) {
+    super('Invalid commit timestamp: must match ISO-8601 UTC millisecond precision')
+    this.name = 'InvalidCommitTimestampError'
+    this.timestamp = timestamp
+  }
+}
+
+/**
  * Normalize a path to NFC, then validate it without repairing invalid syntax.
  * @see spec §4.3
  */

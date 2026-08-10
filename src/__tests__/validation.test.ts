@@ -50,6 +50,12 @@ describe('path validation', () => {
     rejectsPath(`/${'a'.repeat(1024)}`)
   })
 
+  it('accepts a path that is exactly 1024 UTF-8 bytes', () => {
+    const path = `/${'a'.repeat(1023)}`
+    assert.equal(Buffer.byteLength(path, 'utf8'), 1024)
+    assert.equal(validatePath(path), path)
+  })
+
   it('keeps path case-sensitive', () => {
     assert.notEqual(validatePath('/A.md'), validatePath('/a.md'))
   })
@@ -66,6 +72,10 @@ describe('mount-key validation', () => {
 
   it('rejects an uppercase first character', () => {
     rejectsMountKey('Project')
+  })
+
+  it('rejects an uppercase character after the first position', () => {
+    rejectsMountKey('projectKey')
   })
 
   it('rejects an invalid character', () => {

@@ -6,6 +6,7 @@ import assert from 'node:assert/strict'
 
 import { commitPreimage, hashCommit, hashTree, sha256, treePreimage } from '../hashing.js'
 import type { CommitHashInput, TreeEntry } from '../hashing.js'
+import { InvalidCommitTimestampError, InvalidPathError } from '../validation.js'
 
 type GoldenFixture = {
   blobs: Record<string, { content: string; sha: string }>
@@ -38,6 +39,34 @@ describe('tree hashing', () => {
       assert.equal(hashTree(vector.entries), vector.treeSha)
     })
   }
+
+  it('rejects non-NFC paths instead of hashing a silently normalized path', () => {
+    assert.throws(
+      () =>
+        treePreimage([
+          {
+            path: '/cafe\u0301.md',
+            mode: 0o100644,
+            blobSha: 'a'.repeat(64),
+          },
+        ]),
+      InvalidPathError,
+    )
+  })
+
+  it('rejects invalid paths before hashing', () => {
+    assert.throws(
+      () =>
+        treePreimage([
+          {
+            path: 'notes.md',
+            mode: 0o100644,
+            blobSha: 'a'.repeat(64),
+          },
+        ]),
+      InvalidPathError,
+    )
+  })
 })
 
 describe('commit hashing', () => {
@@ -63,5 +92,20 @@ describe('commit hashing', () => {
     const empty = { ...base, agentKind: '', threadId: '', runId: '' }
 
     assert.equal(hashCommit(base), hashCommit(empty))
+  })
+
+  it('rejects timestamps without UTC millisecond precision', () => {
+    const base: CommitHashInput = {
+      treeSha: fixture.trees[0].treeSha,
+      parents: [],
+      authorUser: 'user_1',
+      agentKind: null,
+      threadId: null,
+      runId: null,
+      ts: '2026-08-10T12:00:00.000Z',
+      op: 'import',
+    }
+    assert.throws(() => commitPreimage({ ...base, ts: '2026-08-10T12:00:00Z' }), InvalidCommitTimestampError)
+    assert.throws(() => commitPreimage({ ...base, ts: '2026-08-10T14:00:00.000+02:00' }), InvalidCommitTimestampError)
   })
 })

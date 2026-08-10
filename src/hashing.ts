@@ -1,5 +1,7 @@
 import { createHash } from 'node:crypto'
 
+import { InvalidCommitTimestampError, InvalidPathError, validatePath } from './validation.js'
+
 /**
  * A regular file entry in a canonical tree.
  * @see spec §4.2
@@ -39,8 +41,14 @@ export function sha256(input: Uint8Array | string): string {
  */
 export function treePreimage(entries: readonly TreeEntry[]): Buffer {
   const serialized = entries.map(entry => {
+    const normalizedPath = validatePath(entry.path)
+    if (normalizedPath !== entry.path) {
+      throw new InvalidPathError(entry.path, 'must be NFC-normalized')
+    }
+
     const pathBytes = Buffer.from(entry.path, 'utf8')
-    const bytes = Buffer.from(`${entry.path}\0${entry.mode}\0${entry.blobSha}\n`, 'utf8')
+    const suffixBytes = Buffer.from(`\0${entry.mode}\0${entry.blobSha}\n`, 'utf8')
+    const bytes = Buffer.concat([pathBytes, suffixBytes])
     return { pathBytes, bytes }
   })
 
@@ -62,6 +70,10 @@ export function hashTree(entries: readonly TreeEntry[]): string {
  * @see spec §4.2
  */
 export function commitPreimage(commit: CommitHashInput): Buffer {
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(commit.ts)) {
+    throw new InvalidCommitTimestampError(commit.ts)
+  }
+
   let serialized = `tree\0${commit.treeSha}\n`
   for (const parent of commit.parents) {
     serialized += `parent\0${parent}\n`
