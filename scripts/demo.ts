@@ -1,6 +1,6 @@
 import { Pool } from 'pg'
 
-import { createAgentFs } from '../src/index.js'
+import { createAgentFs, createDirectAdapter } from '../src/index.js'
 
 const connectionString = process.env.AGENT_FS_DATABASE_URL ?? process.env.DATABASE_URL
 if (!connectionString) throw new Error('AGENT_FS_DATABASE_URL or DATABASE_URL is required')
@@ -8,34 +8,45 @@ if (!connectionString) throw new Error('AGENT_FS_DATABASE_URL or DATABASE_URL is
 const pool = new Pool({ connectionString })
 const tenant = `demo-${Date.now()}`
 const mount = 'project:demo'
-const fs = createAgentFs({ pool })
+const fs = createAgentFs({
+  pool,
+  grants: {
+    async resolve(actor, mountRef) {
+      return actor.id === 'demo-user' && actor.tenant === tenant && mountRef.key === mount
+        ? { read: true, write: 'direct' }
+        : { read: false, write: 'none' }
+    },
+  },
+})
 
 try {
   await fs.migrate()
-  const first = await fs.fork({ tenant, mount, sessionId: 'demo-session', authorUser: 'demo-user' })
-  if (!first) throw new Error('demo fork was not visible')
-  const second = await fs.fork({ tenant, mount, sessionId: 'demo-session', authorUser: 'demo-user' })
-  if (!second) throw new Error('demo re-fork was not visible')
-  const write = await fs.write({
-    tenant,
-    mount,
-    ref: first.ref,
-    path: '/hello.txt',
-    bytes: Buffer.from('hello from agent-fs'),
-    authorUser: 'demo-user',
+  const session = await fs.open({
+    actor: { id: 'demo-user', tenant },
+    sessionId: 'demo-session',
+    attribution: { agentKind: 'demo-agent', threadId: 'demo-thread', runId: 'demo-run' },
+    mounts: [{ key: mount }],
   })
-  const read = await fs.read({ tenant, mount, ref: first.ref, path: '/hello.txt' })
+  const tools = createDirectAdapter(session)
 
-  console.log(
-    JSON.stringify({
-      tenant,
-      ref: first.ref,
-      forkCommit: first.commitSha,
-      writeCommit: write.commitSha,
-      read: read.bytes.toString('utf8'),
-      reforkIdempotent: second.commitSha === first.commitSha,
-    }),
-  )
+  // A tiny in-process agent loop: each turn only receives the session tools.
+  await tools.write_file({ path: `${mount}:/notes/plan.md`, content: '# Plan\n' })
+  const stat = await tools.stat_file({ path: `${mount}:/notes/plan.md` })
+  await tools.edit_file({
+    path: `${mount}:/notes/plan.md`,
+    edits: [{ start: 7, end: 7, text: 'Write through the governed session.\n' }],
+    ifSha: stat.sha256,
+  })
+  const text = await tools.read_file({ path: `${mount}:/notes/plan.md` })
+  const files = await tools.glob_files({ pattern: `${mount}:/**/*.md` })
+  let confined = false
+  try {
+    await tools.read_file({ path: 'project:outside:/secret.txt' })
+  } catch {
+    confined = true
+  }
+
+  console.log(JSON.stringify({ tenant, mount, text, files: files.map(file => file.path), confined }))
 } finally {
   await pool.end()
 }

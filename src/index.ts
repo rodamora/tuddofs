@@ -10,6 +10,10 @@ export {
 export { migrate, agentFsDdl } from './migration.js'
 export type { AgentFsPool } from './migration.js'
 export { createAgentFs } from './kernel.js'
+export { createDirectAdapter } from './direct.js'
+export type { DirectAdapter } from './direct.js'
+export { GrantController } from './grants.js'
+export type { Grant, GrantControllerOptions } from './grants.js'
 export type {
   Actor,
   AgentFsKernel,
@@ -18,10 +22,13 @@ export type {
   BlobObject,
   BlobStore,
   CommitEvent,
+  DeleteInput,
+  DeleteResult,
   ForkInput,
   ForkResult,
   GcOptions,
   GcReport,
+  GrantResolutionOptions,
   GrantResolver,
   ReadInput,
   ReadResult,
@@ -32,6 +39,22 @@ export type {
   WriteMode,
   WriteResult,
 } from './kernel.js'
+export type {
+  DiffRecord,
+  EditOptions,
+  HistoryRecord,
+  MountSpec,
+  OpenInput,
+  SessionEntry,
+  SessionFileSystem,
+  SessionStat,
+  TextEdit,
+  TimelineFilter,
+  TimelineRecord,
+  VirtualEntry,
+  VirtualMountHandler,
+  MergeResult,
+} from './session.js'
 export {
   AgentFsError,
   BranchSettledError,

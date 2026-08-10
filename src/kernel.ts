@@ -16,6 +16,9 @@ import {
 import { InvalidCommitTimestampError } from './validation.js'
 import { migrate, type AgentFsPool } from './migration.js'
 import { validateMountKey, validatePath } from './validation.js'
+import { GrantController, type Grant } from './grants.js'
+import { createSessionApi } from './session.js'
+import type { OpenInput, SessionFileSystem } from './session.js'
 export interface BlobObject {
   readonly key: string
   readonly lastModified: Date | string
@@ -133,6 +136,10 @@ export interface GrantResolver {
   resolve(actor: Actor, mount: { key: string }): Promise<{ read: boolean; write: WriteMode }>
 }
 
+export interface GrantResolutionOptions {
+  readonly bypassCache?: boolean
+}
+
 /** Receives post-commit hook failures without affecting write durability. @see spec §10b */
 export interface AgentFsLogger {
   error(error: unknown, context?: object): void
@@ -168,6 +175,7 @@ export interface ReadInput {
   readonly mount?: string
   readonly ref: string
   readonly path: string
+  readonly authorUser?: string
 }
 
 export interface ForkResult {
@@ -183,6 +191,24 @@ export interface WriteResult {
   readonly path: string
   readonly sha256: string
   readonly sizeBytes: bigint
+  readonly commitSha: string
+}
+export interface DeleteInput {
+  readonly tenant: string
+  readonly mount: string
+  readonly ref: string
+  readonly path: string
+  readonly ifSha?: string | null
+  readonly authorUser: string
+  readonly agentKind?: string | null
+  readonly threadId?: string | null
+  readonly runId?: string | null
+  readonly op?: string
+  readonly message?: string | null
+}
+
+export interface DeleteResult {
+  readonly path: string
   readonly commitSha: string
 }
 
@@ -210,6 +236,8 @@ export interface AgentFsOptions {
   readonly logger?: AgentFsLogger
   readonly inlineMaxBytes?: number
   readonly maxCasRetries?: number
+  readonly grantCacheTtlMs?: number
+  readonly grantTimeoutMs?: number
   readonly now?: () => Date
   readonly onCommit?: (event: CommitEvent) => void | Promise<void>
 }
@@ -221,6 +249,10 @@ export interface AgentFsKernel {
   fork(input: ForkInput): Promise<ForkResult | null>
   write(input: WriteInput): Promise<WriteResult>
   read(input: ReadInput): Promise<ReadResult>
+  delete(input: DeleteInput): Promise<DeleteResult>
+  resolveGrant(actor: Actor, mount: { key: string }, options?: GrantResolutionOptions): Promise<Grant>
+  invalidate(actorId: string, mountKey?: string): void
+  open(input: OpenInput): Promise<SessionFileSystem>
 }
 
 type QueryResult<Row extends Record<string, unknown> = Record<string, unknown>> = {
@@ -285,23 +317,18 @@ async function readAll(readable: Readable): Promise<Buffer> {
 }
 
 async function grant(
-  resolver: GrantResolver | undefined,
+  controller: GrantController,
   action: 'read' | 'write',
   input: { tenant: string; mount?: string; path?: string; ref?: string; authorUser?: string },
+  options: GrantResolutionOptions = {},
 ): Promise<boolean> {
-  if (!resolver) return true
-  const context = contextFor(input)
-  try {
-    const result = await resolver.resolve(
-      { id: input.authorUser ?? '', tenant: input.tenant },
-      { key: input.mount ?? '' },
-    )
-    if (action === 'read') return result.read
-    return result.write !== 'none'
-  } catch (error) {
-    if (error instanceof AgentFsError) throw error
-    throw new GrantResolverError(error instanceof Error ? error.message : 'Grant resolver failed', context)
-  }
+  const result = await controller.resolve(
+    { id: input.authorUser ?? '', tenant: input.tenant },
+    { key: input.mount ?? '' },
+    options,
+  )
+  if (action === 'read') return result.read
+  return result.write !== 'none'
 }
 function timestamp(now: () => Date, context: ErrorContext): { date: Date; iso: string } {
   const date = now()
@@ -828,6 +855,14 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
   const inlineMaxBytes = options.inlineMaxBytes ?? DEFAULT_INLINE_MAX_BYTES
   const maxCasRetries = options.maxCasRetries ?? DEFAULT_CAS_RETRIES
   const now = options.now ?? (() => new Date())
+  const grants = options.grants
+    ? new GrantController({
+        resolve: options.grants.resolve.bind(options.grants),
+        ttlMs: options.grantCacheTtlMs,
+        timeoutMs: options.grantTimeoutMs,
+        now: () => now().getTime(),
+      })
+    : new GrantController({ resolve: async () => ({ read: true, write: 'direct' }), now: () => now().getTime() })
 
   async function gc(input: GcOptions = {}): Promise<GcReport> {
     const graceMs = input.graceMs ?? DEFAULT_GRACE_MS
@@ -1205,7 +1240,7 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
     const ref = refForFork(input)
     const context = contextFor({ tenant: input.tenant, mount: input.mount, ref })
     validateMountKey(input.mount, context)
-    if (!(await grant(options.grants, 'read', { ...input, ref }))) return null
+    if (!(await grant(grants, 'read', { ...input, ref }, { bypassCache: true }))) return null
 
     const client = await options.pool.connect()
     try {
@@ -1294,8 +1329,7 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
     validateMountKey(input.mount, initialContext)
     const path = validatePath(input.path, initialContext)
     const context = contextFor({ tenant: input.tenant, mount: input.mount, path, ref: input.ref })
-    if (!(await grant(options.grants, 'write', input)))
-      throw new PermissionDeniedError('Write permission denied', context)
+    if (!(await grant(grants, 'write', input))) throw new PermissionDeniedError('Write permission denied', context)
     const bytes = bytesFor(input.bytes)
     const sha256 = hashSha256(bytes)
 
@@ -1426,8 +1460,7 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
     if (input.mount !== undefined) validateMountKey(input.mount, initialContext)
     const path = validatePath(input.path, initialContext)
     const context = contextFor({ ...input, path })
-    if (!(await grant(options.grants, 'read', input)))
-      throw new PermissionDeniedError('Read permission denied', context)
+    if (!(await grant(grants, 'read', input))) throw new PermissionDeniedError('Read permission denied', context)
     const client = await options.pool.connect()
     try {
       const result = await client.query<
@@ -1471,5 +1504,89 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
     }
   }
 
-  return { migrate: () => migrate(options.pool), gc, verify, fork, write, read }
+  async function remove(input: DeleteInput): Promise<DeleteResult> {
+    const initialContext = contextFor({ tenant: input.tenant, mount: input.mount, ref: input.ref })
+    validateMountKey(input.mount, initialContext)
+    const path = validatePath(input.path, initialContext)
+    const context = contextFor({ tenant: input.tenant, mount: input.mount, path, ref: input.ref })
+    if (!(await grant(grants, 'write', input))) throw new PermissionDeniedError('Write permission denied', context)
+    const client = await options.pool.connect()
+    try {
+      await client.query('BEGIN')
+      const ref = await loadRef(client, input.tenant, input.ref, context)
+      if (ref.kind === 'branch' && ref.state !== 'open') throw new BranchSettledError(ref.state, context)
+      const heads = await loadHeads(
+        client,
+        input.tenant,
+        input.ref,
+        asBigInt(ref.commit_id, 'afs_refs.commit_id', context),
+        context,
+      )
+      const current = heads.get(path)
+      if (!current) throw new NotFoundError(`Path not found: ${input.path}`, context)
+      if (input.ifSha !== undefined && input.ifSha !== (current.sha256 ?? null))
+        throw new PreconditionFailedError(input.ifSha, current.sha256, context)
+      heads.delete(path)
+      const tree = await insertTree(client, input.tenant, heads, context)
+      const createdAt = timestamp(now, context)
+      const commit = await insertCommit(client, {
+        tenant: input.tenant,
+        treeId: tree.id,
+        treeSha: tree.sha,
+        parentIds: [asBigInt(ref.commit_id, 'afs_refs.commit_id', context)],
+        parentShas: [ref.commit_sha],
+        authorUser: input.authorUser,
+        agentKind: input.agentKind ?? null,
+        threadId: input.threadId ?? null,
+        runId: input.runId ?? null,
+        op: input.op ?? 'delete',
+        message: input.message ?? null,
+        createdAt: createdAt.date,
+        context,
+      })
+      const updated = await client.query(
+        'UPDATE afs_refs SET commit_id = $3::bigint WHERE tenant = $1 AND name = $2 AND commit_id = $4::bigint',
+        [input.tenant, input.ref, commit.id.toString(), ref.commit_id],
+      )
+      if ((updated.rowCount ?? 0) === 0) throw new RefConflictError(context, 1)
+      await client.query('DELETE FROM afs_heads WHERE tenant = $1 AND ref_name = $2 AND path = $3', [
+        input.tenant,
+        input.ref,
+        path,
+      ])
+      await client.query('COMMIT')
+      return { path, commitSha: commit.sha }
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => undefined)
+      throw error
+    } finally {
+      client.release()
+    }
+  }
+
+  const session = createSessionApi(
+    {
+      migrate: () => migrate(options.pool),
+      gc,
+      verify,
+      fork,
+      write,
+      read,
+      delete: remove,
+      resolveGrant: (actor, mount, resolutionOptions) => grants.resolve(actor, mount, resolutionOptions),
+      invalidate: (actorId, mountKey) => grants.invalidate(actorId, mountKey),
+    },
+    options,
+  )
+  return {
+    migrate: () => migrate(options.pool),
+    gc,
+    verify,
+    fork,
+    write,
+    read,
+    delete: remove,
+    resolveGrant: (actor, mount, resolutionOptions) => grants.resolve(actor, mount, resolutionOptions),
+    ...session,
+  }
 }
