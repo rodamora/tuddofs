@@ -674,7 +674,7 @@ async function collectTenant(
            JOIN afs_commits c ON c.id = p.id AND c.tenant = $1
            CROSS JOIN LATERAL unnest(c.parents) AS parents(parent_id)
          ),
-         doomed AS (
+         doomed AS MATERIALIZED (
            SELECT c.id
            FROM afs_commits c
            WHERE c.tenant = $1 AND c.created_at <= $2
@@ -683,18 +683,29 @@ async function collectTenant(
                SELECT 1 FROM afs_refs r
                WHERE r.tenant = c.tenant AND (r.commit_id = c.id OR r.base_commit = c.id)
              )
-             AND NOT EXISTS (
-               SELECT 1
-               FROM afs_commits child
-               CROSS JOIN LATERAL unnest(child.parents) AS parents(parent_id)
-               WHERE child.tenant = $1 AND parents.parent_id = c.id
-             )
-           ORDER BY c.id
+         ),
+         doomed_descendants(ancestor_id, id, depth, path) AS (
+           SELECT d.id, d.id, 0, ARRAY[d.id]::bigint[]
+           FROM doomed d
+           UNION ALL
+           SELECT dd.ancestor_id, child.id, dd.depth + 1, dd.path || child.id
+           FROM doomed_descendants dd
+           JOIN afs_commits child ON child.tenant = $1
+           JOIN doomed child_doomed ON child_doomed.id = child.id
+           CROSS JOIN LATERAL unnest(child.parents) AS parents(parent_id)
+           WHERE parents.parent_id = dd.id
+             AND child.id <> ALL(dd.path)
+         ),
+         doomed_batch AS (
+           SELECT ancestor_id AS id
+           FROM doomed_descendants
+           GROUP BY ancestor_id
+           ORDER BY max(depth) ASC, ancestor_id
            LIMIT $3
          )
          DELETE FROM afs_commits c
-         USING doomed
-         WHERE c.id = doomed.id
+         USING doomed_batch
+         WHERE c.id = doomed_batch.id
          RETURNING c.id`,
         [tenant, cutoff, MAINTENANCE_BATCH_SIZE],
       )
@@ -1199,7 +1210,6 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
     const client = await options.pool.connect()
     try {
       await client.query('BEGIN')
-      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`afs:gc:${input.tenant}`])
       await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`${input.tenant}:mount/${input.mount}`])
       let mountRef = await client.query<RefRow>(
         `SELECT r.commit_id::text, r.base_commit::text, c.commit_sha, r.kind, r.state
@@ -1302,7 +1312,7 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
           // through its orphan sweep, so no package write can upload and commit
           // a reference in the sweep's delete window.
           lockState = 'acquiring'
-          await client.query('SELECT pg_advisory_lock(hashtext($1))', [`afs:gc:${input.tenant}`])
+          await client.query('SELECT pg_advisory_lock_shared(hashtext($1))', [`afs:gc:${input.tenant}`])
           lockState = 'held'
         }
         const objectKey = await ensureStorage(options.storage, input.tenant, bytes, sha256, inlineMaxBytes, context)
@@ -1367,7 +1377,7 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
         }
         if (lockState === 'held') {
           lockState = 'uncertain'
-          await client.query('SELECT pg_advisory_unlock(hashtext($1))', [`afs:gc:${input.tenant}`])
+          await client.query('SELECT pg_advisory_unlock_shared(hashtext($1))', [`afs:gc:${input.tenant}`])
           lockState = 'none'
         }
         if (options.onCommit) {
@@ -1393,7 +1403,7 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
         if (lockState === 'held') {
           lockState = 'uncertain'
           try {
-            await client.query('SELECT pg_advisory_unlock(hashtext($1))', [`afs:gc:${input.tenant}`])
+            await client.query('SELECT pg_advisory_unlock_shared(hashtext($1))', [`afs:gc:${input.tenant}`])
             lockState = 'none'
           } catch (error) {
             failure ??= error

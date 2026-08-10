@@ -12,6 +12,13 @@ const tenant2 = 'gc-verify-tenant-two'
 const mount = 'project:gc'
 const actor = 'gc-user'
 const now = new Date('2026-08-10T12:00:00.000Z')
+function deferred<T = void>() {
+  let resolve!: (value?: T | PromiseLike<T>) => void
+  const promise = new Promise<T>(resolvePromise => {
+    resolve = value => resolvePromise(value as T)
+  })
+  return { promise, resolve }
+}
 
 class MemoryStore implements BlobStore {
   readonly objects = new Map<string, { bytes: Buffer; lastModified: Date }>()
@@ -252,8 +259,156 @@ test('gc protects ancestors of grace-protected commits and collects both after g
   )
 })
 
-test('gc deletes unreachable commit children before parents across maintenance batches', async () => {
-  const fs = createAgentFs({ pool, now: () => now })
+test('shared advisory locks require shared unlock and block GC exclusive acquisition', async () => {
+  const key = `afs:gc:${tenant}`
+  const holder = await pool.connect()
+  const probe = await pool.connect()
+  let probeLocked = false
+  try {
+    await holder.query('SELECT pg_advisory_lock_shared(hashtext($1))', [key])
+    const wrongMode = await holder.query<{ unlocked: boolean }>('SELECT pg_advisory_unlock(hashtext($1)) AS unlocked', [
+      key,
+    ])
+    assert.equal(wrongMode.rows[0]?.unlocked, false)
+    const blocked = await probe.query<{ locked: boolean }>('SELECT pg_try_advisory_lock(hashtext($1)) AS locked', [key])
+    assert.equal(blocked.rows[0]?.locked, false)
+    const released = await holder.query<{ unlocked: boolean }>(
+      'SELECT pg_advisory_unlock_shared(hashtext($1)) AS unlocked',
+      [key],
+    )
+    assert.equal(released.rows[0]?.unlocked, true)
+    const acquired = await probe.query<{ locked: boolean }>('SELECT pg_try_advisory_lock(hashtext($1)) AS locked', [
+      key,
+    ])
+    probeLocked = acquired.rows[0]?.locked === true
+    assert.equal(probeLocked, true)
+  } finally {
+    if (probeLocked) await probe.query('SELECT pg_advisory_unlock(hashtext($1))', [key]).catch(() => undefined)
+    await holder.query('SELECT pg_advisory_unlock_shared(hashtext($1))', [key]).catch(() => undefined)
+    probe.release()
+    holder.release()
+  }
+})
+
+test('storage-backed writes hold a shared tenant lock while GC exclusive acquisition fails', async () => {
+  const entered = deferred()
+  const releaseStorage = deferred()
+  let enteredOnce = false
+  const storage: BlobStore = {
+    async put() {},
+    async head() {
+      if (!enteredOnce) {
+        enteredOnce = true
+        entered.resolve()
+      }
+      await releaseStorage.promise
+      return null
+    },
+    async get() {
+      return Readable.from([])
+    },
+    async delete() {},
+  }
+  const fs = createAgentFs({ pool, storage, inlineMaxBytes: 1, now: () => now })
+  const branch = await fs.fork({ tenant, mount, sessionId: 'shared-write-lock', authorUser: actor })
+  assert.ok(branch)
+  const write = fs.write({
+    tenant,
+    mount,
+    ref: branch.ref,
+    path: '/shared-lock.bin',
+    bytes: 'large',
+    authorUser: actor,
+  })
+  await entered.promise
+  const probe = await pool.connect()
+  try {
+    const lock = await probe.query<{ locked: boolean }>('SELECT pg_try_advisory_lock(hashtext($1)) AS locked', [
+      `afs:gc:${tenant}`,
+    ])
+    assert.equal(lock.rows[0]?.locked, false)
+  } finally {
+    probe.release()
+    releaseStorage.resolve()
+  }
+  await write
+})
+
+test('storage-backed writes to different refs share the tenant lock and overlap', async () => {
+  const firstHead = deferred()
+  const releaseStorage = deferred()
+  let headCalls = 0
+  const storage: BlobStore = {
+    async put() {},
+    async head() {
+      headCalls += 1
+      if (headCalls === 2) firstHead.resolve()
+      await releaseStorage.promise
+      return null
+    },
+    async get() {
+      return Readable.from([])
+    },
+    async delete() {},
+  }
+  const fs = createAgentFs({ pool, storage, inlineMaxBytes: 1, now: () => now })
+  const first = await fs.fork({ tenant, mount, sessionId: 'shared-overlap-one', authorUser: actor })
+  const second = await fs.fork({ tenant, mount, sessionId: 'shared-overlap-two', authorUser: actor })
+  assert.ok(first)
+  assert.ok(second)
+  const firstWrite = fs.write({
+    tenant,
+    mount,
+    ref: first.ref,
+    path: '/first.bin',
+    bytes: 'first-large',
+    authorUser: actor,
+  })
+  const secondWrite = fs.write({
+    tenant,
+    mount,
+    ref: second.ref,
+    path: '/second.bin',
+    bytes: 'second-large',
+    authorUser: actor,
+  })
+  try {
+    await firstHead.promise
+  } finally {
+    releaseStorage.resolve()
+  }
+  await Promise.all([firstWrite, secondWrite])
+})
+test('gc deletes an unreachable deep linear chain child-first in bounded maintenance transactions', async () => {
+  let commitSweepTransactions = 0
+  const countingPool = {
+    async connect() {
+      const client = await pool.connect()
+      return {
+        query: async <Row extends Record<string, unknown>>(text: string, values?: readonly unknown[]) => {
+          if (text.includes('WITH RECURSIVE reachable')) commitSweepTransactions += 1
+          const result = await client.query<Row>(text, values as unknown[])
+          if (text === 'COMMIT') {
+            const dangling = await pool.query(
+              `SELECT 1
+               FROM afs_commits child
+               CROSS JOIN LATERAL unnest(child.parents) AS parent_ids(parent_id)
+               WHERE child.tenant = $1
+                 AND NOT EXISTS (
+                   SELECT 1 FROM afs_commits parent
+                   WHERE parent.tenant = $1 AND parent.id = parent_ids.parent_id
+                 )`,
+              [tenant],
+            )
+            assert.equal(dangling.rowCount, 0, 'every committed maintenance boundary must preserve parent integrity')
+          }
+          return result
+        },
+        release: (error?: Error) => client.release(error),
+      }
+    },
+  }
+  const fs = createAgentFs({ pool: countingPool, now: () => now })
   const branch = await fs.fork({ tenant, mount, sessionId: 'batch-chain', authorUser: actor })
   assert.ok(branch)
   await pool.query('DELETE FROM afs_refs WHERE tenant = $1', [tenant])
@@ -267,7 +422,7 @@ test('gc deletes unreachable commit children before parents across maintenance b
        UPDATE afs_commits
        SET created_at = TIMESTAMPTZ '${old.toISOString()}'
        WHERE tenant = '${tenant}' AND id = parent_id;
-       FOR idx IN 0..519 LOOP
+       FOR idx IN 0..599 LOOP
          INSERT INTO afs_commits
            (tenant, commit_sha, tree_id, parents, author_user, op, created_at)
          SELECT '${tenant}', repeat(md5(idx::text), 2), tree_id, ARRAY[parent_id],
@@ -291,6 +446,10 @@ test('gc deletes unreachable commit children before parents across maintenance b
       )
     ).rowCount,
     0,
+  )
+  assert.ok(
+    commitSweepTransactions <= Math.ceil(601 / 500) + 2,
+    `commit sweep used ${commitSweepTransactions} transactions`,
   )
 })
 test('gc race keeps a blob readable when an identical write lands during orphan deletion', async () => {

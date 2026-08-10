@@ -99,6 +99,20 @@ test('concurrent first touches adopt one genesis commit', async () => {
   assert.equal(commits.rows[0]?.count, '1')
 })
 
+test('fork does not wait for the tenant GC lock', async () => {
+  const fs = createAgentFs({ pool })
+  const holder = await pool.connect()
+  const lockKey = `afs:gc:${tenant}`
+  await holder.query('SELECT pg_advisory_lock(hashtext($1))', [lockKey])
+  try {
+    const result = await fs.fork({ tenant, mount, sessionId: 'fork-with-gc-busy', authorUser: actor })
+    assert.ok(result)
+  } finally {
+    await holder.query('SELECT pg_advisory_unlock(hashtext($1))', [lockKey])
+    holder.release()
+  }
+})
+
 test('fork seeds existing mount heads idempotently', async () => {
   const fs = createAgentFs({ pool })
   await fs.fork({ tenant, mount, sessionId: 'seed-source', authorUser: actor })
