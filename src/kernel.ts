@@ -16,13 +16,101 @@ import {
 import { InvalidCommitTimestampError } from './validation.js'
 import { migrate, type AgentFsPool } from './migration.js'
 import { validateMountKey, validatePath } from './validation.js'
+export interface BlobObject {
+  readonly key: string
+  readonly lastModified: Date | string
+}
+
 export interface BlobStore {
   put(key: string, bytes: Buffer): Promise<void>
   head(key: string): Promise<{ sizeBytes: number } | null>
   get(key: string): Promise<Readable>
   delete(key: string): Promise<void>
+  list?(prefix: string): Promise<readonly BlobObject[]>
   presignPut?(key: string, opts: { ttlSeconds: number; checksumSha256: string }): Promise<string>
   presignGet?(key: string, opts: { ttlSeconds: number }): Promise<string>
+}
+
+/** Reachability-GC windows and optional tenant scope. @see spec §4.8 */
+export interface GcOptions {
+  readonly tenant?: string
+  readonly graceMs?: number
+  readonly settledBranchRetentionMs?: number
+}
+/** Counts returned by a GC cycle; `skipped` is true when its advisory lock was busy. @see spec §4.8 */
+export interface GcReport {
+  readonly skipped: boolean
+  readonly tenant?: string
+  readonly deletedCommits: number
+  readonly deletedTrees: number
+  readonly deletedBlobs: number
+  readonly deletedObjects: number
+  readonly settledBranches: number
+}
+/** Typed fsck findings; corruption is reported as data instead of aborting the scan. @see spec §4.9 */
+export type VerifyFinding =
+  | {
+      readonly kind: 'tree-hash-drift'
+      readonly treeId: string
+      readonly expectedSha: string
+      readonly actualSha: string
+    }
+  | {
+      readonly kind: 'commit-hash-drift'
+      readonly commitId: string
+      readonly expectedSha: string
+      readonly actualSha: string
+    }
+  | {
+      readonly kind: 'heads-drift'
+      readonly ref: string
+      readonly path: string
+      readonly issue: 'missing' | 'unexpected' | 'mismatch'
+      readonly expected?: { blobId: string; sha256: string; sizeBytes: string }
+      readonly actual?: { blobId: string; sha256: string; sizeBytes: string }
+    }
+  | {
+      readonly kind: 'storage-missing' | 'storage-size-mismatch' | 'storage-error'
+      readonly blobId: string
+      readonly objectKey: string
+      readonly expectedSizeBytes: string
+      readonly actualSizeBytes?: number
+      readonly message?: string
+    }
+  | {
+      readonly kind: 'dangling-parent'
+      readonly commitId: string
+      readonly parentId: string
+    }
+  | {
+      readonly kind: 'orphaned-head'
+      readonly ref: string
+      readonly path: string
+    }
+  | {
+      readonly kind: 'tree-entry-missing-blob'
+      readonly treeId: string
+      readonly path: string
+      readonly blobId: string
+    }
+/** Limits fsck scope to one tenant and an optional deterministic row sample. @see spec §4.9 */
+export interface VerifyOptions {
+  readonly tenant?: string
+  readonly sample?: number
+}
+
+/** Result of an integrity scan; findings are data, not thrown scan errors. @see spec §4.9 */
+export interface VerifyReport {
+  readonly tenant?: string
+  readonly ok: boolean
+  readonly findings: readonly VerifyFinding[]
+  readonly checked: {
+    readonly trees: number
+    readonly commits: number
+    readonly refs: number
+    readonly blobs: number
+    readonly parents: number
+  }
 }
 
 export interface Actor {
@@ -125,6 +213,8 @@ export interface AgentFsOptions {
 
 export interface AgentFsKernel {
   migrate(): Promise<void>
+  gc(input?: GcOptions): Promise<GcReport>
+  verify(input?: VerifyOptions): Promise<VerifyReport>
   fork(input: ForkInput): Promise<ForkResult | null>
   write(input: WriteInput): Promise<WriteResult>
   read(input: ReadInput): Promise<ReadResult>
@@ -452,11 +542,550 @@ async function updateHead(client: Queryable, tenant: string, ref: string, path: 
   )
 }
 
+const DEFAULT_GRACE_MS = 24 * 60 * 60 * 1000
+const DEFAULT_SETTLED_BRANCH_RETENTION_MS = 7 * 24 * 60 * 60 * 1000
+const MAINTENANCE_BATCH_SIZE = 500
+
+type GcCounts = {
+  deletedCommits: number
+  deletedTrees: number
+  deletedBlobs: number
+  deletedObjects: number
+  settledBranches: number
+}
+
+function emptyGcCounts(): GcCounts {
+  return { deletedCommits: 0, deletedTrees: 0, deletedBlobs: 0, deletedObjects: 0, settledBranches: 0 }
+}
+
+function sampleLimit(sample: number | undefined): number | null {
+  if (sample === undefined || !Number.isFinite(sample) || sample <= 0) return null
+  return Math.max(1, Math.floor(sample))
+}
+
+function dateFromPostgres(value: unknown): Date | null {
+  if (value instanceof Date) return Number.isNaN(value.getTime()) ? null : value
+  if (typeof value === 'string') {
+    const parsed = new Date(value)
+    return Number.isNaN(parsed.getTime()) ? null : parsed
+  }
+  return null
+}
+
+function stringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return []
+  return value.map(item => (typeof item === 'bigint' ? item.toString() : String(item)))
+}
+
+async function deleteMaintenanceBatch(
+  client: Queryable,
+  text: string,
+  values: readonly unknown[],
+): Promise<{ rows: Array<Record<string, unknown>>; rowCount: number | null }> {
+  await client.query('SAVEPOINT afs_gc_batch')
+  try {
+    const result = await client.query(text, values)
+    await client.query('RELEASE SAVEPOINT afs_gc_batch')
+    return result
+  } catch (error) {
+    await client.query('ROLLBACK TO SAVEPOINT afs_gc_batch').catch(() => undefined)
+    await client.query('RELEASE SAVEPOINT afs_gc_batch').catch(() => undefined)
+    if (error !== null && typeof error === 'object' && 'code' in error && error.code === '23503')
+      return { rows: [], rowCount: 0 }
+    throw error
+  }
+}
+
+async function collectTenant(
+  client: Queryable,
+  tenant: string,
+  cutoff: Date,
+  settledCutoff: Date,
+): Promise<{ counts: GcCounts; objectKeys: string[] }> {
+  const counts = emptyGcCounts()
+  const objectKeys: string[] = []
+  await client.query('BEGIN')
+  try {
+    for (;;) {
+      const settled = await client.query<{ name: string }>(
+        `SELECT name
+         FROM afs_refs
+         WHERE tenant = $1 AND kind = 'branch' AND state <> 'open'
+           AND settled_at IS NOT NULL AND settled_at < $2
+         ORDER BY name
+         LIMIT $3`,
+        [tenant, settledCutoff, MAINTENANCE_BATCH_SIZE],
+      )
+      if (settled.rows.length === 0) break
+      const names = settled.rows.map(row => row.name)
+      await client.query('DELETE FROM afs_heads WHERE tenant = $1 AND ref_name = ANY($2::text[])', [tenant, names])
+      const deleted = await client.query<{ name: string }>(
+        `DELETE FROM afs_refs
+         WHERE tenant = $1 AND name = ANY($2::text[])
+         RETURNING name`,
+        [tenant, names],
+      )
+      counts.settledBranches += deleted.rowCount ?? deleted.rows.length
+    }
+
+    for (;;) {
+      const deleted = await deleteMaintenanceBatch(
+        client,
+        `WITH RECURSIVE reachable(id) AS (
+           SELECT commit_id FROM afs_refs WHERE tenant = $1
+           UNION
+           SELECT parent_id
+           FROM reachable r
+           JOIN afs_commits c ON c.id = r.id AND c.tenant = $1
+           CROSS JOIN LATERAL unnest(c.parents) AS parents(parent_id)
+         ),
+         protected_ids(id) AS (
+           SELECT id FROM reachable
+           UNION
+           SELECT id FROM afs_commits WHERE tenant = $1 AND created_at > $2
+         ),
+         doomed AS (
+           SELECT c.id
+           FROM afs_commits c
+           WHERE c.tenant = $1 AND c.created_at <= $2
+             AND NOT EXISTS (SELECT 1 FROM protected_ids p WHERE p.id = c.id)
+             AND NOT EXISTS (
+               SELECT 1 FROM afs_refs r
+               WHERE r.tenant = c.tenant AND (r.commit_id = c.id OR r.base_commit = c.id)
+             )
+           ORDER BY c.id
+           LIMIT $3
+         )
+         DELETE FROM afs_commits c
+         USING doomed
+         WHERE c.id = doomed.id
+         RETURNING c.id`,
+        [tenant, cutoff, MAINTENANCE_BATCH_SIZE],
+      )
+      if ((deleted.rowCount ?? deleted.rows.length) === 0) break
+      counts.deletedCommits += deleted.rowCount ?? deleted.rows.length
+    }
+
+    for (;;) {
+      const deleted = await deleteMaintenanceBatch(
+        client,
+        `WITH doomed AS (
+           SELECT t.id
+           FROM afs_trees t
+           WHERE t.tenant = $1 AND t.created_at <= $2
+             AND NOT EXISTS (SELECT 1 FROM afs_commits c WHERE c.tree_id = t.id)
+           ORDER BY t.id
+           LIMIT $3
+         )
+         DELETE FROM afs_trees t
+         USING doomed
+         WHERE t.id = doomed.id
+         RETURNING t.id`,
+        [tenant, cutoff, MAINTENANCE_BATCH_SIZE],
+      )
+      if ((deleted.rowCount ?? deleted.rows.length) === 0) break
+      counts.deletedTrees += deleted.rowCount ?? deleted.rows.length
+    }
+
+    for (;;) {
+      const deleted = await deleteMaintenanceBatch(
+        client,
+        `WITH doomed AS (
+           SELECT b.id
+           FROM afs_blobs b
+           WHERE b.tenant = $1 AND b.created_at <= $2
+             AND NOT EXISTS (SELECT 1 FROM afs_tree_entries e WHERE e.blob_id = b.id)
+           ORDER BY b.id
+           LIMIT $3
+         )
+         DELETE FROM afs_blobs b
+         USING doomed
+         WHERE b.id = doomed.id
+         RETURNING b.object_key`,
+        [tenant, cutoff, MAINTENANCE_BATCH_SIZE],
+      )
+      const rowCount = deleted.rowCount ?? deleted.rows.length
+      if (rowCount === 0) break
+      counts.deletedBlobs += rowCount
+      for (const row of deleted.rows) {
+        if (typeof row.object_key === 'string' && row.object_key.startsWith('afs/')) objectKeys.push(row.object_key)
+      }
+    }
+
+    await client.query('COMMIT')
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined)
+    throw error
+  }
+  return { counts, objectKeys }
+}
+
+async function discoverTenants(client: Queryable): Promise<string[]> {
+  const result = await client.query<{ tenant: string }>(
+    `SELECT tenant FROM afs_refs
+     UNION
+     SELECT tenant FROM afs_blobs
+     UNION
+     SELECT tenant FROM afs_trees
+     UNION
+     SELECT tenant FROM afs_commits
+     ORDER BY tenant`,
+  )
+  return result.rows.map(row => row.tenant)
+}
+type VerifyTreeRow = {
+  id: string
+  tree_sha: string
+  path: string | null
+  mode: number | null
+  blob_id: string | null
+  blob_sha: string | null
+  blob_size: string | null
+}
+
+type VerifyCommitRow = {
+  id: string
+  commit_sha: string
+  tree_sha: string | null
+  parents: unknown
+  author_user: string
+  agent_kind: string | null
+  thread_id: string | null
+  run_id: string | null
+  op: string
+  created_at: unknown
+}
+
+type VerifyRefRow = {
+  name: string
+  commit_id: string
+  tree_id: string
+}
+
+type VerifyHeadRow = {
+  ref_name: string
+  path: string
+  blob_id: string
+  sha256: string
+  size_bytes: string
+}
+
+type VerifyBlobRow = {
+  id: string
+  object_key: string
+  size_bytes: string
+}
+
 export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
   const inlineMaxBytes = options.inlineMaxBytes ?? DEFAULT_INLINE_MAX_BYTES
   const maxCasRetries = options.maxCasRetries ?? DEFAULT_CAS_RETRIES
   const now = options.now ?? (() => new Date())
 
+  async function gc(input: GcOptions = {}): Promise<GcReport> {
+    const graceMs = input.graceMs ?? DEFAULT_GRACE_MS
+    const retentionMs = input.settledBranchRetentionMs ?? DEFAULT_SETTLED_BRANCH_RETENTION_MS
+    if (!Number.isFinite(graceMs) || graceMs < 0 || !Number.isFinite(retentionMs) || retentionMs < 0)
+      throw new RangeError('GC grace and retention windows must be finite non-negative milliseconds')
+    const discoveryClient = await options.pool.connect()
+    let tenants: string[]
+    try {
+      tenants = input.tenant ? [input.tenant] : await discoverTenants(discoveryClient)
+    } finally {
+      discoveryClient.release()
+    }
+
+    const total = emptyGcCounts()
+    let skipped = false
+    const cutoff = new Date(now().getTime() - graceMs)
+    const settledCutoff = new Date(now().getTime() - retentionMs)
+    for (const tenant of tenants) {
+      const client = await options.pool.connect()
+      let locked = false
+      const deletedObjectKeys = new Set<string>()
+      try {
+        const lock = await client.query<{ locked: boolean }>(`SELECT pg_try_advisory_lock(hashtext($1)) AS locked`, [
+          `afs:gc:${tenant}`,
+        ])
+        locked = lock.rows[0]?.locked === true
+        if (!locked) {
+          skipped = true
+          continue
+        }
+        const collected = await collectTenant(client, tenant, cutoff, settledCutoff)
+        total.deletedCommits += collected.counts.deletedCommits
+        total.deletedTrees += collected.counts.deletedTrees
+        total.deletedBlobs += collected.counts.deletedBlobs
+        total.settledBranches += collected.counts.settledBranches
+        for (const key of collected.objectKeys) deletedObjectKeys.add(key)
+
+        if (options.storage) {
+          for (const key of deletedObjectKeys) {
+            try {
+              await options.storage.delete(key)
+              total.deletedObjects += 1
+            } catch (error) {
+              options.logger?.error(error, { tenant, objectKey: key, operation: 'gc' })
+            }
+          }
+          if (options.storage.list) {
+            try {
+              const prefix = `afs/${tenant}/`
+              const listed = await options.storage.list(prefix)
+              const candidates = listed.filter(object => object.key.startsWith('afs/'))
+              if (candidates.length > 0) {
+                const known = await client.query<{ object_key: string }>(
+                  `SELECT object_key
+                   FROM afs_blobs
+                   WHERE tenant = $1 AND object_key = ANY($2::text[])`,
+                  [tenant, candidates.map(object => object.key)],
+                )
+                const knownKeys = new Set(known.rows.map(row => row.object_key))
+                const nowMs = now().getTime()
+                for (const object of candidates) {
+                  const modified = dateFromPostgres(object.lastModified)
+                  if (
+                    !modified ||
+                    !object.key.startsWith(prefix) ||
+                    knownKeys.has(object.key) ||
+                    nowMs - modified.getTime() <= graceMs ||
+                    deletedObjectKeys.has(object.key)
+                  )
+                    continue
+                  try {
+                    await options.storage.delete(object.key)
+                    total.deletedObjects += 1
+                  } catch (error) {
+                    options.logger?.error(error, { tenant, objectKey: object.key, operation: 'gc' })
+                  }
+                }
+              }
+            } catch (error) {
+              options.logger?.error(error, { tenant, operation: 'gc-orphan-list' })
+            }
+          }
+        }
+      } finally {
+        if (locked)
+          await client.query('SELECT pg_advisory_unlock(hashtext($1))', [`afs:gc:${tenant}`]).catch(() => undefined)
+        client.release()
+      }
+    }
+    return { skipped, ...(input.tenant === undefined ? {} : { tenant: input.tenant }), ...total }
+  }
+
+  async function verify(input: VerifyOptions = {}): Promise<VerifyReport> {
+    const client = await options.pool.connect()
+    const findings: VerifyFinding[] = []
+    const limit = sampleLimit(input.sample)
+    const params = input.tenant === undefined ? [] : [input.tenant]
+    const commitWhere = input.tenant === undefined ? '' : ' WHERE c.tenant = $1'
+    const refWhere = input.tenant === undefined ? '' : ' WHERE r.tenant = $1'
+    const headWhere = input.tenant === undefined ? '' : ' WHERE h.tenant = $1'
+    const blobWhere =
+      input.tenant === undefined ? ' WHERE object_key IS NOT NULL' : ' WHERE tenant = $1 AND object_key IS NOT NULL'
+    const qualifiedTenantWhere = input.tenant === undefined ? '' : ' WHERE t.tenant = $1'
+    try {
+      const treesResult = await client.query<VerifyTreeRow>(
+        `SELECT t.id::text, t.tree_sha, e.path, e.mode, e.blob_id::text, b.sha256 AS blob_sha,
+                b.size_bytes::text AS blob_size
+         FROM afs_trees t
+         LEFT JOIN afs_tree_entries e ON e.tree_id = t.id
+         LEFT JOIN afs_blobs b ON b.id = e.blob_id${qualifiedTenantWhere}
+         ORDER BY t.id, e.path`,
+        params,
+      )
+      const treeRows = treesResult.rows
+      const trees = new Map<
+        string,
+        {
+          storedSha: string
+          entries: TreeEntry[]
+          expected: Map<string, { blobId: string; sha256: string; sizeBytes: string }>
+        }
+      >()
+      for (const row of treeRows) {
+        let tree = trees.get(row.id)
+        if (!tree) {
+          tree = { storedSha: row.tree_sha, entries: [], expected: new Map() }
+          trees.set(row.id, tree)
+        }
+        if (row.path === null) continue
+        if (row.blob_id === null || row.blob_sha === null || row.blob_size === null || row.mode === null) {
+          findings.push({ kind: 'tree-entry-missing-blob', treeId: row.id, path: row.path, blobId: row.blob_id ?? '' })
+          continue
+        }
+        tree.entries.push({ path: row.path, mode: row.mode, blobSha: row.blob_sha })
+        tree.expected.set(row.path, { blobId: row.blob_id, sha256: row.blob_sha, sizeBytes: row.blob_size })
+      }
+      const sampledTrees = [...trees].slice(0, limit ?? trees.size)
+      for (const [treeId, tree] of sampledTrees) {
+        let computed: string
+        try {
+          computed = hashTree(tree.entries)
+        } catch {
+          computed = ''
+        }
+        if (computed !== tree.storedSha)
+          findings.push({ kind: 'tree-hash-drift', treeId, expectedSha: computed, actualSha: tree.storedSha })
+      }
+
+      const commitsResult = await client.query<VerifyCommitRow>(
+        `SELECT c.id::text, c.commit_sha, t.tree_sha, c.parents, c.author_user, c.agent_kind,
+                c.thread_id, c.run_id, c.op, c.created_at
+         FROM afs_commits c
+         LEFT JOIN afs_trees t ON t.id = c.tree_id${commitWhere}
+         ORDER BY c.id`,
+        params,
+      )
+      const commits = new Map(commitsResult.rows.map(row => [row.id, row]))
+      const sampledCommits = commitsResult.rows.slice(0, limit ?? commitsResult.rows.length)
+      let parentCount = 0
+      for (const row of commitsResult.rows) {
+        const parentIds = stringArray(row.parents)
+        parentCount += parentIds.length
+        const parentShas: string[] = []
+        for (const parentId of parentIds) {
+          const parent = commits.get(parentId)
+          if (!parent) {
+            findings.push({ kind: 'dangling-parent', commitId: row.id, parentId })
+            parentShas.push('')
+          } else {
+            parentShas.push(parent.commit_sha)
+          }
+        }
+        if (!sampledCommits.includes(row)) continue
+        let computed = ''
+        const created = dateFromPostgres(row.created_at)
+        if (row.tree_sha && created) {
+          try {
+            computed = hashCommit({
+              treeSha: row.tree_sha,
+              parents: parentShas,
+              authorUser: row.author_user,
+              agentKind: row.agent_kind,
+              threadId: row.thread_id,
+              runId: row.run_id,
+              ts: created.toISOString(),
+              op: row.op,
+            })
+          } catch {
+            computed = ''
+          }
+        }
+        if (computed !== row.commit_sha)
+          findings.push({
+            kind: 'commit-hash-drift',
+            commitId: row.id,
+            expectedSha: computed,
+            actualSha: row.commit_sha,
+          })
+      }
+
+      const refsResult = await client.query<VerifyRefRow>(
+        `SELECT r.name, r.commit_id::text, c.tree_id::text
+         FROM afs_refs r JOIN afs_commits c ON c.id = r.commit_id${refWhere}
+         ORDER BY r.name`,
+        params,
+      )
+      const headsResult = await client.query<VerifyHeadRow>(
+        `SELECT h.ref_name, h.path, h.blob_id::text, h.sha256, h.size_bytes::text
+         FROM afs_heads h${headWhere}
+         ORDER BY h.ref_name, h.path`,
+        params,
+      )
+      const headsByRef = new Map<string, Map<string, VerifyHeadRow>>()
+      for (const row of headsResult.rows) {
+        const byPath = headsByRef.get(row.ref_name) ?? new Map<string, VerifyHeadRow>()
+        byPath.set(row.path, row)
+        headsByRef.set(row.ref_name, byPath)
+      }
+      const refs = new Set(refsResult.rows.map(row => row.name))
+      const treesById = new Map(trees)
+      for (const ref of refsResult.rows) {
+        const expected = treesById.get(ref.tree_id)?.expected ?? new Map()
+        const actual = headsByRef.get(ref.name) ?? new Map<string, VerifyHeadRow>()
+        for (const [path, entry] of expected) {
+          const head = actual.get(path)
+          if (!head) {
+            findings.push({ kind: 'heads-drift', ref: ref.name, path, issue: 'missing', expected: entry })
+          } else if (
+            head.blob_id !== entry.blobId ||
+            head.sha256 !== entry.sha256 ||
+            head.size_bytes !== entry.sizeBytes
+          ) {
+            findings.push({
+              kind: 'heads-drift',
+              ref: ref.name,
+              path,
+              issue: 'mismatch',
+              expected: entry,
+              actual: { blobId: head.blob_id, sha256: head.sha256, sizeBytes: head.size_bytes },
+            })
+          }
+        }
+        for (const path of actual.keys()) {
+          if (!expected.has(path))
+            findings.push({ kind: 'heads-drift', ref: ref.name, path, issue: 'unexpected', actual: undefined })
+        }
+      }
+      for (const row of headsResult.rows) {
+        if (!refs.has(row.ref_name)) findings.push({ kind: 'orphaned-head', ref: row.ref_name, path: row.path })
+      }
+
+      const blobsResult = await client.query<VerifyBlobRow>(
+        `SELECT id::text, object_key, size_bytes::text
+         FROM afs_blobs${blobWhere}
+         ORDER BY id`,
+        params,
+      )
+      const blobs = blobsResult.rows.slice(0, limit ?? blobsResult.rows.length)
+      if (options.storage) {
+        for (const blob of blobs) {
+          try {
+            const object = await options.storage.head(blob.object_key)
+            if (!object) {
+              findings.push({
+                kind: 'storage-missing',
+                blobId: blob.id,
+                objectKey: blob.object_key,
+                expectedSizeBytes: blob.size_bytes,
+              })
+            } else if (object.sizeBytes !== Number(blob.size_bytes)) {
+              findings.push({
+                kind: 'storage-size-mismatch',
+                blobId: blob.id,
+                objectKey: blob.object_key,
+                expectedSizeBytes: blob.size_bytes,
+                actualSizeBytes: object.sizeBytes,
+              })
+            }
+          } catch (error) {
+            findings.push({
+              kind: 'storage-error',
+              blobId: blob.id,
+              objectKey: blob.object_key,
+              expectedSizeBytes: blob.size_bytes,
+              message: error instanceof Error ? error.message : String(error),
+            })
+          }
+        }
+      }
+      return {
+        ...(input.tenant === undefined ? {} : { tenant: input.tenant }),
+        ok: findings.length === 0,
+        findings,
+        checked: {
+          trees: sampledTrees.length,
+          commits: sampledCommits.length,
+          refs: refsResult.rows.length,
+          blobs: blobs.length,
+          parents: parentCount,
+        },
+      }
+    } finally {
+      client.release()
+    }
+  }
   async function fork(input: ForkInput): Promise<ForkResult | null> {
     const ref = refForFork(input)
     const context = contextFor({ tenant: input.tenant, mount: input.mount, ref })
@@ -693,5 +1322,5 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
     }
   }
 
-  return { migrate: () => migrate(options.pool), fork, write, read }
+  return { migrate: () => migrate(options.pool), gc, verify, fork, write, read }
 }

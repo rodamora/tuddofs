@@ -284,7 +284,7 @@ await fs.merge({ approver: { id: admin.id, tenant: org.id } }) // approver's LIV
 
 ## Storage backends
 
-The package ships **no storage SDK**. You inject a 5-verb `BlobStore` (§10b.3):
+The package ships no storage SDK. You inject the `BlobStore` SPI (§10b.3):
 
 ```ts
 interface BlobStore {
@@ -292,6 +292,7 @@ interface BlobStore {
   head(key: string): Promise<{ sizeBytes: number } | null>
   get(key: string): Promise<Readable>
   delete(key: string): Promise<void> // best-effort (GC)
+  list?(prefix: string): Promise<readonly { key: string; lastModified: Date | string }[]> // orphan sweep
   presignPut(key: string, opts: { ttlSeconds: number; checksumSha256: string }): Promise<string>
   presignGet(key: string, opts: { ttlSeconds: number }): Promise<string>
 }
@@ -379,4 +380,8 @@ All errors are typed, exported, and carry `{ tenant, mount?, path?, ref? }` cont
 - Tests: golden-value tests pin the hash byte formats forever; property tests cover the DAG; the §8 decision table and §9 taxonomy get one test per row/error; integration tests run against real Postgres (and MinIO) containers.
 - Iterate with the package suite only: `pnpm --filter @cowork/agent-fs test`.
 - The hermetic `test` script never connects to Postgres. For integration checks, start a disposable database (`docker run --rm --name agent-fs-it -e POSTGRES_USER=agentfs -e POSTGRES_PASSWORD=agentfs -e POSTGRES_DB=agentfs_it -p 55434:5432 postgres:16-alpine`), then run `AGENT_FS_DATABASE_URL=postgresql://agentfs:agentfs@127.0.0.1:55434/agentfs_it pnpm test:integration` from this package. Do not point it at Cowork development or production databases.
+- Run the focused GC/verify integration tests against a disposable database:
+  `AGENT_FS_DATABASE_URL=postgresql://agentfs:agentfs@127.0.0.1:55434/agentfs_it pnpm test:integration -- --test-concurrency=1`.
+- `gc({ tenant })` acquires a non-blocking per-tenant advisory lock; a concurrent invocation returns `{ skipped: true }`.
+- `verify({ tenant, sample })` returns typed findings as data and does not abort when one record is corrupt.
 - Run the real-database smoke demo with `AGENT_FS_DATABASE_URL=postgresql://agentfs:agentfs@127.0.0.1:55434/agentfs_it pnpm demo`.
