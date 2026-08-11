@@ -4,7 +4,8 @@ import { Readable } from 'node:stream'
 import { setTimeout as delay } from 'node:timers/promises'
 import test, { after, before, beforeEach } from 'node:test'
 import { Pool } from 'pg'
-import { createTuddoFs, InvalidPathError, migrate, sha256, StorageError, type BlobStore } from '../index.js'
+import { createTuddoFs, InvalidPathError, StorageError, type BlobStore } from '../index.js'
+import { migrate, sha256 } from '../internal.js'
 
 const pool = new Pool({ connectionString: process.env.TUDDOFS_DATABASE_URL })
 const tenant = 'session-streaming'
@@ -128,11 +129,11 @@ test('writeStream hashes and promotes without buffering the read path', async ()
   })
   const session = await fs.open({ actor, sessionId: 'stream-roundtrip', mounts: [{ key: 'project:media' }] })
   const bytes = Buffer.from('streamed media')
-  const result = await session.writeStream('project:media:/clip.bin', Readable.from([bytes]))
+  const result = await session.mount('project:media').writeStream('/clip.bin', Readable.from([bytes]))
 
   assert.equal(result.sha256, sha256(bytes))
   assert.deepEqual([...storage.objects.keys()], [`tuddo/${tenant}/${result.sha256}`])
-  const stream = await session.readStream('project:media:/clip.bin')
+  const stream = await session.mount('project:media').readStream('/clip.bin')
   assert.deepEqual(
     Buffer.concat(
       await (async () => {
@@ -155,10 +156,10 @@ test('presign returns the signed checksum header and serves CAS reads', async ()
   })
   const session = await fs.open({ actor, sessionId: 'stream-presign', mounts: [{ key: 'project:media' }] })
   const bytes = Buffer.from('presigned media')
-  const result = await session.writeStream('project:media:/clip.bin', Readable.from([bytes]))
+  const result = await session.mount('project:media').writeStream('/clip.bin', Readable.from([bytes]))
   const checksumHeader = Buffer.from(result.sha256, 'hex').toString('base64')
 
-  const put = await session.presign('project:media:/clip.bin', {
+  const put = await session.mount('project:media').presign('/clip.bin', {
     method: 'PUT',
     sha256: result.sha256,
     ttlSeconds: 30,
@@ -169,7 +170,7 @@ test('presign returns the signed checksum header and serves CAS reads', async ()
     headers: { 'x-amz-checksum-sha256': checksumHeader },
   })
 
-  const getUrl = await session.presign('project:media:/clip.bin', { method: 'GET', ttlSeconds: 31 })
+  const getUrl = await session.mount('project:media').presign('/clip.bin', { method: 'GET', ttlSeconds: 31 })
   assert.equal(getUrl, `get://tuddo/${tenant}/${result.sha256}?ttl=31`)
   const downloaded: Buffer[] = []
   for await (const chunk of await storage.getPresigned(getUrl)) downloaded.push(Buffer.from(chunk as Uint8Array))
@@ -185,7 +186,7 @@ test('PUT presign fails loudly when the store cannot enforce checksums', async (
   const session = await fs.open({ actor, sessionId: 'stream-no-enforcement', mounts: [{ key: 'project:media' }] })
 
   await assert.rejects(
-    session.presign('project:media:/clip.bin', { method: 'PUT', sha256: sha256('expected') }),
+    session.mount('project:media').presign('/clip.bin', { method: 'PUT', sha256: sha256('expected') }),
     (error: unknown) => error instanceof StorageError && /does not enforce/i.test(error.message),
   )
 })
@@ -200,7 +201,7 @@ test('PUT presign rejects malformed CAS hashes before calling storage', async ()
   const session = await fs.open({ actor, sessionId: 'stream-invalid-sha', mounts: [{ key: 'project:media' }] })
 
   await assert.rejects(
-    session.presign('project:media:/clip.bin', { method: 'PUT', sha256: '../../not-a-cas-hash' }),
+    session.mount('project:media').presign('/clip.bin', { method: 'PUT', sha256: '../../not-a-cas-hash' }),
     StorageError,
   )
   assert.deepEqual(storage.presigns, [])
@@ -224,10 +225,13 @@ test('writeStream propagates source errors instead of hanging', async () => {
       queueMicrotask(() => this.destroy(sourceError))
     },
   })
-  const settled = session.writeStream('project:media:/clip.bin', source).then(
-    () => ({ status: 'fulfilled' as const }),
-    (error: unknown) => ({ status: 'rejected' as const, error }),
-  )
+  const settled = session
+    .mount('project:media')
+    .writeStream('/clip.bin', source)
+    .then(
+      () => ({ status: 'fulfilled' as const }),
+      (error: unknown) => ({ status: 'rejected' as const, error }),
+    )
 
   // Intentional real timeout: the regression is a promise that never settles, which fake time cannot expose.
   const first = await Promise.race([settled, delay(200).then(() => ({ status: 'timeout' as const }))])
@@ -253,7 +257,7 @@ test('writeStream holds the tenant GC lease through promotion and commit', async
   })
   const session = await fs.open({ actor, sessionId: 'stream-gc-race', mounts: [{ key: 'project:media' }] })
   const bytes = Buffer.from('large streamed media')
-  const write = session.writeStream('project:media:/clip.bin', Readable.from([bytes]))
+  const write = session.mount('project:media').writeStream('/clip.bin', Readable.from([bytes]))
 
   await storage.promoted
   const gc = await fs.gc({ tenant, graceMs: 0 })
@@ -276,7 +280,7 @@ test('stream capabilities fail with typed storage errors', async () => {
   const session = await fs.open({ actor, sessionId: 'stream-capabilities', mounts: [{ key: 'project:media' }] })
 
   await assert.rejects(
-    session.writeStream('project:media:/clip.bin', Readable.from([Buffer.from('large media')])),
+    session.mount('project:media').writeStream('/clip.bin', Readable.from([Buffer.from('large media')])),
     StorageError,
   )
 })
@@ -292,10 +296,10 @@ test('small stream writes retain inline storage semantics', async () => {
   })
   const session = await fs.open({ actor, sessionId: 'stream-inline', mounts: [{ key: 'project:media' }] })
 
-  const result = await session.writeStream('project:media:/tiny.txt', Readable.from([Buffer.from('tiny')]))
+  const result = await session.mount('project:media').writeStream('/tiny.txt', Readable.from([Buffer.from('tiny')]))
   assert.equal(result.sizeBytes, 4n)
   assert.deepEqual([...storage.objects.keys()], [])
-  assert.equal(await session.read('project:media:/tiny.txt'), 'tiny')
+  assert.equal(await session.mount('project:media').read('/tiny.txt'), 'tiny')
 })
 
 test('writeStream rejects file-directory path collisions', async () => {
@@ -307,10 +311,10 @@ test('writeStream rejects file-directory path collisions', async () => {
     grants: { resolve: async () => ({ read: true, write: 'direct' }) },
   })
   const session = await fs.open({ actor, sessionId: 'stream-coherence', mounts: [{ key: 'project:media' }] })
-  await session.write('project:media:/file', 'base')
+  await session.mount('project:media').write('/file', 'base')
 
   await assert.rejects(
-    session.writeStream('project:media:/file/child', Readable.from([Buffer.from('streamed child')])),
+    session.mount('project:media').writeStream('/file/child', Readable.from([Buffer.from('streamed child')])),
     (error: unknown) =>
       error instanceof InvalidPathError &&
       error.path === '/file/child' &&

@@ -9,14 +9,8 @@ import { Client } from 'minio'
 import { Pool } from 'pg'
 import { GenericContainer, Wait, type StartedTestContainer } from 'testcontainers'
 
-import {
-  createTuddoFs,
-  migrate,
-  sha256,
-  type BlobObject,
-  type BlobStore,
-  type BlobStorePresignedPut,
-} from '../src/index.js'
+import { createTuddoFs, type BlobObject, type BlobStore, type BlobStorePresignedPut } from '../src/index.js'
+import { migrate, sha256 } from '../src/internal.js'
 
 const databaseUrl = process.env.TUDDOFS_DATABASE_URL
 if (!databaseUrl) throw new Error('TUDDOFS_DATABASE_URL is required; the MinIO suite never skips silently')
@@ -193,10 +187,10 @@ void test('configured MinIO round-trip keeps server RSS below the fixed ceiling'
   const sampler = setInterval(sampleRss, 10)
   sampler.unref()
   try {
-    const written = await session.writeStream('project:media:/configured-size.bin', source)
+    const written = await session.mount('project:media').writeStream('/configured-size.bin', source)
     const downloaded = createHash('sha256')
     let received = 0
-    const stream = await session.readStream('project:media:/configured-size.bin')
+    const stream = await session.mount('project:media').readStream('/configured-size.bin')
     for await (const chunk of stream) {
       const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array)
       downloaded.update(bytes)
@@ -227,7 +221,7 @@ void test('MinIO rejects wrong bytes for the signed checksum header and serves p
   })
   const session = await fs.open({ actor, sessionId: 'minio-presign', mounts: [{ key: 'project:media' }] })
   const expected = Buffer.from('checksum-bound bytes')
-  const put = await session.presign('project:media:/checksum.bin', {
+  const put = await session.mount('project:media').presign('/checksum.bin', {
     method: 'PUT',
     sha256: sha256(expected),
     ttlSeconds: 300,
@@ -249,8 +243,8 @@ void test('MinIO rejects wrong bytes for the signed checksum header and serves p
   await rightResponse.arrayBuffer()
   assert.equal(rightStatus, 200)
 
-  await session.writeStream('project:media:/checksum.bin', Readable.from([expected]))
-  const get = await session.presign('project:media:/checksum.bin', { method: 'GET', ttlSeconds: 300 })
+  await session.mount('project:media').writeStream('/checksum.bin', Readable.from([expected]))
+  const get = await session.mount('project:media').presign('/checksum.bin', { method: 'GET', ttlSeconds: 300 })
   assert.equal(typeof get, 'string')
   if (typeof get !== 'string') return
   const getResponse = await fetch(get)

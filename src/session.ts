@@ -167,7 +167,13 @@ type MergeAttemptResult =
 export interface MountFileSystem {
   read(path: string): Promise<string>
   readBytes(path: string): Promise<Buffer>
+  /** Stream a blob without buffering CAS bytes (architecture §8.1). */
+  readStream(path: string): Promise<Readable>
   write(path: string, bytes: Buffer | Uint8Array | string, options?: WriteOptions): Promise<WriteResult>
+  /** Hash, quarantine, promote, and durably commit a byte stream under §8.1 and §4.5. */
+  writeStream(path: string, source: Readable): Promise<WriteResult>
+  /** Issue a GET URL or checksum-enforced PUT request under architecture §8.1. */
+  presign(path: string, options?: PresignOptions): Promise<string | ChecksumEnforcedPresignedPut>
   edit(path: string, edits: readonly TextEdit[], options?: EditOptions): Promise<WriteResult>
   list(dir: string): Promise<readonly SessionEntry[]>
   glob(pattern: string): Promise<readonly SessionEntry[]>
@@ -183,20 +189,10 @@ export interface SessionFileSystem {
   mount(key: string): MountFileSystem
   timeline(filter?: TimelineFilter): Promise<readonly TimelineRecord[]>
   diff(a: string, b: string): Promise<readonly DiffRecord[]>
-  /** Stream a blob without buffering CAS bytes (architecture §8.1). */
-  readStream(mountKey: string, path: string): Promise<Readable>
   merge(options?: {
     mounts?: readonly string[]
     approver?: Actor
   }): Promise<Readonly<Partial<Record<string, MergeResult>>>>
-  /** Hash, quarantine, promote, and durably commit a byte stream under §8.1 and §4.5. */
-  writeStream(mountKey: string, path: string, source: Readable): Promise<WriteResult>
-  /** Issue a GET URL or checksum-enforced PUT request under architecture §8.1. */
-  presign(
-    mountKey: string,
-    path: string,
-    options?: PresignOptions,
-  ): Promise<string | ChecksumEnforcedPresignedPut>
   restore(mountKey: string, at: string): Promise<RestoreResult>
   tag(mountKey: string, label: string): Promise<string>
   discard(): Promise<void>
@@ -1076,12 +1072,19 @@ export function createSessionApi(kernel: SessionKernel, options: TuddoFsOptions)
       type SessionOperations = SessionFileSystem & {
         read(mountKey: string, path: string): Promise<string>
         readBytes(mountKey: string, path: string): Promise<Buffer>
+        readStream(mountKey: string, path: string): Promise<Readable>
         write(
           mountKey: string,
           path: string,
           value: Buffer | Uint8Array | string,
           options?: WriteOptions,
         ): Promise<WriteResult>
+        writeStream(mountKey: string, path: string, source: Readable): Promise<WriteResult>
+        presign(
+          mountKey: string,
+          path: string,
+          options?: PresignOptions,
+        ): Promise<string | ChecksumEnforcedPresignedPut>
         edit(mountKey: string, path: string, edits: readonly TextEdit[], options?: EditOptions): Promise<WriteResult>
         list(mountKey: string, dir: string): Promise<readonly SessionEntry[]>
         glob(mountKey: string, pattern: string): Promise<readonly SessionEntry[]>
@@ -1102,7 +1105,10 @@ export function createSessionApi(kernel: SessionKernel, options: TuddoFsOptions)
           return {
             read: (path: string) => sessionOps.read(key, path),
             readBytes: (path: string) => sessionOps.readBytes(key, path),
+            readStream: (path: string) => sessionOps.readStream(key, path),
             write: (path, value, writeOptions) => sessionOps.write(key, path, value, writeOptions),
+            writeStream: (path: string, source: Readable) => sessionOps.writeStream(key, path, source),
+            presign: (path: string, options?: PresignOptions) => sessionOps.presign(key, path, options),
             edit: (path, edits, editOptions) => sessionOps.edit(key, path, edits, editOptions),
             list: (path: string) => sessionOps.list(key, path),
             glob: (pattern: string) => sessionOps.glob(key, pattern),

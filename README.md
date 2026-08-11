@@ -11,7 +11,7 @@ The following are intentionally not promised features of this release:
 - a sync engine for external workspaces;
 - multipart object-storage upload.
 
-The session streaming methods require a `BlobStore` with stream-capable `put`, server-side `copy`, and the relevant presign method. `readStream` returns a Node `Readable`; `writeStream` hashes into a quarantine key while holding the same tenant GC lease as kernel writes, promotes to `tuddo/<tenant>/<sha256>`, then commits. `presign(address, { method: 'GET' })` returns a read URL. PUT requires a lowercase hexadecimal `{ method: 'PUT', sha256 }` and returns `{ url, headers, checksumEnforced: true }`; clients must send the returned `x-amz-checksum-sha256` header. Core converts the CAS hash to S3's base64 checksum format and rejects adapters whose result does not sign that header or whose store cannot enforce uploaded-byte checksums. Missing or non-enforcing storage capabilities fail with `StorageError`.
+The mount-handle streaming methods require a `BlobStore` with stream-capable `put`, server-side `copy`, and the relevant presign method. `session.mount(key).readStream(path)` returns a Node `Readable`; `writeStream(path, source)` hashes into a quarantine key while holding the same tenant GC lease as kernel writes, promotes to `tuddo/<tenant>/<sha256>`, then commits. `presign(path, { method: 'GET' })` returns a read URL. PUT requires a lowercase hexadecimal `{ method: 'PUT', sha256 }` and returns `{ url, headers, checksumEnforced: true }`; clients must send the returned `x-amz-checksum-sha256` header. Core converts the CAS hash to S3's base64 checksum format and rejects adapters whose result does not sign that header or whose store cannot enforce uploaded-byte checksums. Missing or non-enforcing storage capabilities fail with `StorageError`.
 
 These boundaries are reflected in the exported API; do not build a production workflow around capabilities that are not listed there.
 
@@ -166,7 +166,7 @@ The main `tuddofs` entry point exports only the Tier-1 consumer surface:
 - Public option, session, mount-handle, result, grant, storage, and maintenance types.
 - The typed error taxonomy: `InvalidPathError`, `InvalidMountKeyError`, `InvalidCommitTimestampError`, `PermissionDeniedError`, `PreconditionFailedError`, `RefConflictError`, `NotFoundError`, `BranchSettledError`, `MergePendingApprovalError`, `GrantResolverError`, `SchemaDriftError`, `StorageError`, `InvariantError`, and `EditMatchError`.
 
-Low-level ref operations, deterministic hashing helpers, `GrantController`, migrations, and validation functions live under the explicit `tuddofs/internal` subpath. Session `edit()` uses `{ oldText, newText, replaceAll? }`; `merge({ mounts?, approver? })` returns a discriminated status for each selected ref-backed mount.
+Low-level ref operations, deterministic hashing helpers, `GrantController`, migrations, and validation functions live under the explicit `tuddofs/internal` subpath. `session.mount(key)` owns plain-path file operations, including `readStream`, `writeStream`, and `presign`. Session `edit()` uses `{ oldText, newText, replaceAll? }`; `merge({ mounts?, approver? })` returns a discriminated status for each selected ref-backed mount.
 
 The TypeScript declarations in `dist/index.d.ts` are the authoritative details for option and result shapes.
 
