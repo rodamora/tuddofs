@@ -95,6 +95,17 @@ test('session merge skips virtual mounts and is idempotent after completion', as
   const second = await session.merge()
   assert.deepEqual(second, first)
 })
+test('ref mount listings use UTF-16 code-unit ordering', async () => {
+  const fs = createAgentFs({ pool, grants: { resolve: async () => ({ read: true, write: 'direct' }) } })
+  const session = await fs.open({ actor, sessionId: 'session-ref-list-order', mounts: [{ key: 'project:docs' }] })
+  await session.write('project:docs:/😀', 'astral')
+  await session.write('project:docs:/z', 'letter')
+
+  assert.deepEqual(
+    (await session.list('project:docs:/')).map(entry => entry.path),
+    ['/z', '/😀'],
+  )
+})
 
 test('merge with no branch changes does not create an empty commit', async () => {
   const fs = createAgentFs({ pool, grants: { resolve: async () => ({ read: true, write: 'direct' }) } })

@@ -28,6 +28,13 @@ after(async () => pool.end())
 function fsWith(grant: (mount: string) => { read: boolean; write: 'direct' | 'staged' | 'none' }) {
   return createAgentFs({ pool, grants: { resolve: async (_actor, mount) => grant(mount.key) } })
 }
+function deferred<T>(): { promise: Promise<T>; resolve: (value?: T | PromiseLike<T>) => void } {
+  let resolve!: (value?: T | PromiseLike<T>) => void
+  const promise = new Promise<T>(resolvePromise => {
+    resolve = value => resolvePromise(value as T)
+  })
+  return { promise, resolve }
+}
 
 async function seedMount(key: string, path: string, value: string): Promise<string> {
   const fs = fsWith(() => ({ read: true, write: 'direct' }))
@@ -35,6 +42,12 @@ async function seedMount(key: string, path: string, value: string): Promise<stri
   const result = await session.write(`${key}:${path}`, value)
   await session.resolveMerge(key)
   return result.commitSha
+}
+async function waitForMergeGrantFreshnessWindow(): Promise<void> {
+  // A real delay is intentional: this reproduces wall-clock pool wait aging against disposable Postgres.
+  const { promise, resolve } = deferred<void>()
+  setTimeout(resolve, 150)
+  await promise
 }
 
 test('pinnedRef rejects a commit or ref outside the pinned mount lineage', async () => {
@@ -176,6 +189,58 @@ test('merge records unauthorized when the live writer grant is revoked', async (
   ])
   assert.equal(branch.rows[0]?.state, 'unauthorized')
 })
+test('commit resolution ignores a revoked unrelated mount until lineage matches', async () => {
+  const read = new Map([
+    ['locked', true],
+    ['okmount', true],
+  ])
+  const fs = createAgentFs({
+    pool,
+    grants: {
+      resolve: async (_actor, mount) => ({ read: read.get(mount.key) ?? false, write: 'direct' as const }),
+    },
+  })
+  const session = await fs.open({
+    actor,
+    sessionId: 'resolve-mount-order',
+    mounts: [{ key: 'locked' }, { key: 'okmount' }],
+  })
+  const first = await session.write('okmount:/a.txt', 'a')
+  const second = await session.write('okmount:/a.txt', 'b')
+  read.set('locked', false)
+
+  assert.equal(await session.read('okmount:/a.txt'), 'b')
+  assert.deepEqual(await session.diff(first.commitSha, second.commitSha), [
+    {
+      path: '/a.txt',
+      beforeSha: first.sha256,
+      afterSha: second.sha256,
+      beforeMode: 420,
+      afterMode: 420,
+    },
+  ])
+})
+
+test('staged merge returns merged for an already merged branch', async () => {
+  let write: 'direct' | 'staged' = 'staged'
+  const fs = fsWith(() => ({ read: true, write }))
+  const session = await fs.open({ actor, sessionId: 'staged-merged-idempotency', mounts: [{ key: 'scratch' }] })
+  await session.write('scratch:/staged.txt', 'staged')
+
+  write = 'direct'
+  assert.equal(await session.resolveMerge('scratch'), 'merged')
+  write = 'staged'
+  assert.equal(await session.resolveMerge('scratch'), 'merged')
+})
+
+test('staged merge raises BranchSettledError for an abandoned branch', async () => {
+  const fs = fsWith(() => ({ read: true, write: 'staged' }))
+  const session = await fs.open({ actor, sessionId: 'staged-abandoned', mounts: [{ key: 'scratch' }] })
+  await session.write('scratch:/staged.txt', 'staged')
+  await session.discard()
+
+  await assert.rejects(session.resolveMerge('scratch'), BranchSettledError)
+})
 
 test('kernel delete retries a compare-and-swap conflict before failing', async () => {
   const normal = fsWith(() => ({ read: true, write: 'direct' }))
@@ -303,10 +368,123 @@ test('merge does not hold its transaction connection across a pool-backed grant 
     await resolverPool.end()
   }
 })
+test('merge refreshes a grant that aged while waiting for a saturated pool', async () => {
+  const saturatedPool = new Pool({ connectionString: process.env.AGENT_FS_DATABASE_URL, max: 1 })
+  let write: 'direct' | 'none' = 'direct'
+  let grantCalls = 0
+  let mergeStarted = false
+  let observed = false
+  const { promise: grantRelease, resolve: releaseGrant } = deferred<void>()
+  const { promise: grantSeen, resolve: grantObserved } = deferred<void>()
+  let held: { release(): void } | undefined
+  try {
+    const fs = createAgentFs({
+      pool: saturatedPool,
+      grants: {
+        resolve: async () => {
+          grantCalls += 1
+          const grant = { read: true, write }
+          if (mergeStarted && !observed) {
+            observed = true
+            grantObserved()
+            await grantRelease
+          }
+          return grant
+        },
+      },
+    })
+    const session = await fs.open({
+      actor,
+      sessionId: 'merge-grant-revoked-while-waiting',
+      mounts: [{ key: 'scratch' }],
+    })
+    await session.write('scratch:/staged.txt', 'staged')
+    held = await saturatedPool.connect()
+    mergeStarted = true
+    const mergePromise = session.resolveMerge('scratch')
+
+    await grantSeen
+    write = 'none'
+    releaseGrant()
+    await waitForMergeGrantFreshnessWindow()
+    held.release()
+    held = undefined
+
+    const result = await mergePromise
+    assert.ok(grantCalls >= 5)
+    assert.equal(result, 'unauthorized')
+    const branch = await pool.query<{ state: string }>('SELECT state FROM afs_refs WHERE tenant = $1 AND name = $2', [
+      tenant,
+      'agent/merge-grant-revoked-while-waiting/scratch',
+    ])
+    assert.equal(branch.rows[0]?.state, 'unauthorized')
+  } finally {
+    held?.release()
+    await saturatedPool.end()
+  }
+})
+
+test('merge refreshes a stale denied grant after it is restored while waiting', async () => {
+  const saturatedPool = new Pool({ connectionString: process.env.AGENT_FS_DATABASE_URL, max: 1 })
+  let grantCalls = 0
+  let write: 'direct' | 'none' = 'direct'
+  let mergeStarted = false
+  let observed = false
+  const { promise: grantSeen, resolve: grantObserved } = deferred<void>()
+  const { promise: grantRelease, resolve: releaseGrant } = deferred<void>()
+  let held: { release(): void } | undefined
+  try {
+    const fs = createAgentFs({
+      pool: saturatedPool,
+      grants: {
+        resolve: async () => {
+          grantCalls += 1
+          const grant = { read: true, write }
+          if (mergeStarted && !observed) {
+            observed = true
+            grantObserved()
+            await grantRelease
+          }
+          return grant
+        },
+      },
+    })
+    const session = await fs.open({
+      actor,
+      sessionId: 'merge-grant-restored-while-waiting',
+      mounts: [{ key: 'scratch' }],
+    })
+    await session.write('scratch:/staged.txt', 'staged')
+    held = await saturatedPool.connect()
+    write = 'none'
+    mergeStarted = true
+    const mergePromise = session.resolveMerge('scratch')
+
+    await grantSeen
+    write = 'direct'
+    releaseGrant()
+    await waitForMergeGrantFreshnessWindow()
+    held.release()
+    held = undefined
+    const result = await mergePromise
+    assert.ok(grantCalls >= 5)
+    assert.equal(result, 'merged')
+    const branch = await pool.query<{ state: string }>('SELECT state FROM afs_refs WHERE tenant = $1 AND name = $2', [
+      tenant,
+      'agent/merge-grant-restored-while-waiting/scratch',
+    ])
+    assert.equal(branch.rows[0]?.state, 'merged')
+  } finally {
+    held?.release()
+    await saturatedPool.end()
+  }
+})
+
 test('merge records the other mount when a settled mount throws', async () => {
   let pWrite: 'direct' | 'none' = 'direct'
   const fs = createAgentFs({
     pool,
+
     grants: {
       resolve: async (_actor, mount) => ({
         read: true,
@@ -323,6 +501,19 @@ test('merge records the other mount when a settled mount throws', async () => {
 
   assert.deepEqual(await session.merge(), { p: 'unauthorized', q: 'merged' })
   assert.equal((await session.read('q:/q.txt')).toString(), 'q')
+})
+test('merge reports a settled mount alongside other per-mount outcomes', async () => {
+  const fs = fsWith(() => ({ read: true, write: 'direct' }))
+  const session = await fs.open({ actor, sessionId: 'merge-settled-result', mounts: [{ key: 'p' }, { key: 'q' }] })
+  await session.write('p:/p.txt', 'p')
+  await session.write('q:/q.txt', 'q')
+  await pool.query(
+    `UPDATE afs_refs SET state = 'abandoned', settled_at = now()
+     WHERE tenant = $1 AND name = $2`,
+    [tenant, 'agent/merge-settled-result/p'],
+  )
+
+  assert.deepEqual(await session.merge(), { p: { settled: 'abandoned' }, q: 'merged' })
 })
 
 test('timeline orders writes globally across mounts', async () => {

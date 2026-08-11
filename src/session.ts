@@ -136,6 +136,7 @@ export type MergeResult =
   | 'unauthorized'
   | 'pendingApproval'
   | { readonly conflicts: readonly { path: string; baseSha?: string; oursSha?: string; theirsSha?: string }[] }
+  | { readonly settled: string }
 
 /** File and history operations exposed by an opened session. @see spec §6 */
 export interface SessionFileSystem {
@@ -219,6 +220,8 @@ function globRegex(pattern: string): RegExp {
 function escapeLike(value: string): string {
   return value.replace(/[\\%_]/gu, character => `\\${character}`)
 }
+/** Merge grants are refreshed after 100ms of pool wait to bound authorization staleness. */
+const MERGE_GRANT_FRESHNESS_MS = 100
 
 function changedPaths(before: Map<string, Head>, after: Map<string, Head>): string[] {
   const paths = new Set([...before.keys(), ...after.keys()])
@@ -508,7 +511,7 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
               mode: row.mode,
             })
           }
-          return [...direct.values()].sort((a, b) => a.path.localeCompare(b.path))
+          return [...direct.values()].sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))
         } finally {
           client.release()
         }
@@ -638,8 +641,8 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
         const candidates = [...mounts.values()].filter((mount): mount is RefMount => !('virtual' in mount))
         for (const mount of candidates) {
           if (preferredMountKey !== undefined && preferredMountKey !== mount.key) continue
-          if (optionsForResolution.checkRead !== false) await ensureRead(mount, { bypassCache: true })
           const client = await options.pool.connect()
+          let confined: LineageCommit
           try {
             let candidateSha = value
             if (preferredMountKey !== undefined && !/^[0-9a-f]{64}$/u.test(value)) {
@@ -652,17 +655,17 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
               )
               if (tag.rows[0]) candidateSha = tag.rows[0].commit_sha
             }
-            let confined: LineageCommit
             try {
               confined = await assertCommitInMountLineage(client, mount.key, candidateSha)
             } catch (error) {
               if (error instanceof NotFoundError) continue
               throw error
             }
-            return { id: confined.id, sha: confined.commit_sha, mountKey: mount.key }
           } finally {
             client.release()
           }
+          if (optionsForResolution.checkRead !== false) await ensureRead(mount, { bypassCache: true })
+          return { id: confined.id, sha: confined.commit_sha, mountKey: mount.key }
         }
         throw new NotFoundError(`Commit not found in granted mount lineage: ${value}`, {
           tenant: input.actor.tenant,
@@ -1054,20 +1057,18 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
         },
         async merge(mergeOptions = {}) {
           const results: Partial<Record<string, MergeResult>> = {}
-          let firstSettled: BranchSettledError | undefined
           for (const mount of mounts.values()) {
             if ('virtual' in mount || mount.mode !== 'follow') continue
             try {
               results[mount.key] = await this.resolveMerge(mount.key, mergeOptions)
             } catch (error) {
               if (error instanceof BranchSettledError) {
-                firstSettled ??= error
+                results[mount.key] = { settled: error.state }
                 continue
               }
               throw error
             }
           }
-          if (firstSettled && Object.keys(results).length === 0) throw firstSettled
           return results
         },
         async resolveMerge(mountKey: string, mergeOptions = {}) {
@@ -1215,17 +1216,31 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
         // grants before opening the merge transaction so a saturated pool cannot
         // deadlock; the transaction immediately re-checks branch state and locks
         // the refs before applying any merge writes.
-        const actorGrant = await kernel.resolveGrant(input.actor, { key: mount.key }, { bypassCache: true })
-        if (actorGrant.write === 'staged') {
-          if (!mergeOptions.approver) return 'pendingApproval'
-          const approverGrant = await kernel.resolveGrant(
-            mergeOptions.approver,
-            { key: mount.key },
-            { bypassCache: true },
-          )
-          if (approverGrant.write !== 'direct') return 'unauthorized'
+        const resolveGrant = async (actorForGrant: Actor) => ({
+          grant: await kernel.resolveGrant(actorForGrant, { key: mount.key }, { bypassCache: true }),
+          resolvedAt: Date.now(),
+        })
+        const resolveMergeGrants = async () => {
+          const actor = await resolveGrant(input.actor)
+          const approver =
+            actor.grant.write === 'staged' && mergeOptions.approver
+              ? await resolveGrant(mergeOptions.approver)
+              : undefined
+          return { actor, approver }
         }
-        const client = await options.pool.connect()
+        let resolutions = await resolveMergeGrants()
+        let client = await options.pool.connect()
+        while (
+          Date.now() -
+            Math.min(resolutions.actor.resolvedAt, resolutions.approver?.resolvedAt ?? Number.POSITIVE_INFINITY) >
+          MERGE_GRANT_FRESHNESS_MS
+        ) {
+          client.release()
+          resolutions = await resolveMergeGrants()
+          client = await options.pool.connect()
+        }
+        const actorGrant = resolutions.actor.grant
+        const approverGrant = resolutions.approver?.grant
         try {
           await client.query('BEGIN')
           await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`${input.actor.tenant}:mount/${mount.key}`])
@@ -1249,15 +1264,19 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
             await client.query('ROLLBACK')
             return 'unauthorized'
           }
-          if (actorGrant.write === 'none') {
-            if (branch.state !== 'open') {
+          if (branch.state !== 'open')
+            throw new BranchSettledError(branch.state, { tenant: input.actor.tenant, mount: mount.key, ref: mount.ref })
+          if (actorGrant.write === 'staged') {
+            if (!mergeOptions.approver) {
               await client.query('ROLLBACK')
-              throw new BranchSettledError(branch.state, {
-                tenant: input.actor.tenant,
-                mount: mount.key,
-                ref: mount.ref,
-              })
+              return 'pendingApproval'
             }
+            if (approverGrant?.write !== 'direct') {
+              await client.query('ROLLBACK')
+              return 'unauthorized'
+            }
+          }
+          if (actorGrant.write === 'none') {
             await client.query(
               `UPDATE afs_refs SET state = 'unauthorized', settled_at = now()
                WHERE tenant = $1 AND name = $2`,
@@ -1266,8 +1285,6 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
             await client.query('COMMIT')
             return 'unauthorized'
           }
-          if (branch.state !== 'open')
-            throw new BranchSettledError(branch.state, { tenant: input.actor.tenant, mount: mount.key, ref: mount.ref })
 
           const mountResult = await client.query<{ commit_id: string; commit_sha: string }>(
             'SELECT r.commit_id::text, c.commit_sha FROM afs_refs r JOIN afs_commits c ON c.id = r.commit_id WHERE r.tenant = $1 AND r.name = $2 FOR UPDATE',

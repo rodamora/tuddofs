@@ -139,7 +139,7 @@ Your agent worked on private branches; land them per mount:
 
 ```ts
 const results = await fs.merge()
-// per mount: 'merged' | 'unauthorized' | 'pendingApproval' | { conflicts: Conflict[] }
+// per mount: 'merged' | 'unauthorized' | 'pendingApproval' | { conflicts: Conflict[] } | { settled: state }
 
 for (const [mountKey, r] of Object.entries(results)) {
   if (r === 'merged') continue
@@ -151,6 +151,7 @@ for (const [mountKey, r] of Object.entries(results)) {
 
 - Merges are **per mount, all-or-nothing per mount**; a conflict in mount P never blocks mount Q (§4.7).
 - Session-wide `merge()` skips virtual and pinned mounts because neither has a writable branch. Addressing a virtual mount with `resolveMerge()` throws `NotFoundError`; addressing a pinned mount throws `PermissionDeniedError` (§6.1).
+- A branch that is already settled is reported as `{ settled: state }` in the session-wide result; direct `resolveMerge()` still throws `BranchSettledError` (§9).
 - Conflict resolution: an authorized actor writes the resolved content to the mount, then `fs.resolveMerge(mountKey)` — which literally re-runs the merge; converged rows classify clean (§4.7).
 - Merge is idempotent: re-running a completed merge produces no new commit.
 - `fs.discard()` abandons all of the session's branches — nothing touches the mounts, GC reclaims later.
@@ -191,7 +192,7 @@ The contract (§5, each rule is a test in the package):
 
 1. **Fail closed.** Resolver throws or times out (5s) → treated as no access, surfaced as `GrantResolverError`. Never fail open.
 2. **Live resolution.** Cached ≤30s per `(tenant, actorId, mountKey)`; call `agentFs.invalidate(actorId, mountKey?, tenant?)` on permission changes. Merge and fork always bypass the cache.
-3. **Permission never travels through time.** Fork checks read at fork time; writes check write at write time; merge re-resolves _inside_ the merge transaction — mid-run revocation takes effect immediately.
+3. **Permission never travels through time.** Fork checks read at fork time; writes check write at write time; merge resolves grants before acquiring its transaction connection and refreshes any grant older than 100ms after acquisition, before branch writes. Host callbacks never run while a pooled client is held.
 4. **`staged` never escalates.** A staged writer's merge returns `'pendingApproval'`; landing it requires an approver whose live grant is `'direct'`.
 5. **Multi-worker:** `invalidate()` is per-process. Unless you transport invalidation (pub/sub), correctness rests on the 30s TTL — never lengthen it to reduce resolver load.
 
