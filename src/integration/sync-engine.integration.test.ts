@@ -670,6 +670,37 @@ test('a resumed engine weighs divergence against the whole durable lineage, not 
   assert.equal(await session.mount('project:docs').read('/a.md'), 'from the shell')
 })
 
+test('the first exec after a resume owns the mirror, whatever the lineage says', async () => {
+  const { session, engine, root, target } = await setup('engine-resume-exec-revert')
+  await session.mount('project:docs').write('/a.md', 'v0')
+  await session.mount('project:docs').write('/a.md', 'v1')
+  await engine.materialize()
+  assert.equal(await readFile(join(docsDir(root), 'a.md'), 'utf8'), 'v1')
+
+  const resumed = createSyncEngine({
+    session: await openSession('engine-resume-exec-revert'),
+    target,
+    root,
+    events: { onCapture: event => captures.push(event), onCaptureFailed: event => failures.push(event) },
+  })
+  await resumed.materialize()
+
+  // The history-backed guard is armed and v0 is squarely inside the lineage,
+  // so on content alone this is indistinguishable from the stale mirror a
+  // crash leaves behind. The exec is the signal that says otherwise, and
+  // re-materializing v1 over it would discard the agent's revert.
+  await resumed.exec("printf v0 > 'project%3Adocs/a.md'")
+  await resumed.settle()
+
+  assert.equal(await session.mount('project:docs').read('/a.md'), 'v0')
+  assert.equal(await readFile(join(docsDir(root), 'a.md'), 'utf8'), 'v0')
+  assert.deepEqual(failures, [])
+
+  await resumed.reconcile()
+  assert.equal(await session.mount('project:docs').read('/a.md'), 'v0')
+  assert.equal(await readFile(join(docsDir(root), 'a.md'), 'utf8'), 'v0')
+})
+
 test('a throwing host handler neither aborts a capture nor kills the process', async () => {
   // Nothing awaits what trigger() starts. Before the fix a throwing handler
   // rejected the capture chain, which Node reports as an unhandled rejection
