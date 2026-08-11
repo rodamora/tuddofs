@@ -248,8 +248,11 @@ test('first fork seeds heads from the captured tip tree, not live mount heads', 
 test('large writes use the injected object store before the transaction', async () => {
   const objects = new Map<string, Buffer>()
   const storage = {
-    async put(key: string, bytes: Buffer) {
-      objects.set(key, Buffer.from(bytes))
+    async put(key: string, source: Buffer | Readable) {
+      const chunks: Buffer[] = []
+      if (Buffer.isBuffer(source)) chunks.push(source)
+      else for await (const chunk of source) chunks.push(Buffer.from(chunk as Uint8Array))
+      objects.set(key, Buffer.concat(chunks))
     },
     async head(key: string) {
       const bytes = objects.get(key)

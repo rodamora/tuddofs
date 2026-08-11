@@ -1,3 +1,7 @@
+import { createHash, randomUUID } from 'node:crypto'
+import { Readable, Transform } from 'node:stream'
+import { pipeline } from 'node:stream/promises'
+
 import { hashCommit, hashTree, sha256, type TreeEntry } from './hashing.js'
 import {
   TuddoFsError,
@@ -11,6 +15,7 @@ import {
 import { InvalidPathError, findTreeCoherenceCollisions, validateMountKey, validatePath } from './validation.js'
 import type {
   Actor,
+  ChecksumEnforcedPresignedPut,
   TuddoFsKernel,
   TuddoFsOptions,
   DeleteResult,
@@ -85,10 +90,16 @@ export interface TextEdit {
 export interface WriteOptions {
   readonly ifSha?: string | null
 }
-
 /** Optimistic precondition options for `edit`. */
 export interface EditOptions {
   readonly ifSha?: string | null
+}
+
+/** Presign method and checksum options for object-backed session blobs; behavior and endpoint reachability acceptance are defined by architecture §8.1 and §8.3. */
+export interface PresignOptions {
+  readonly method?: 'GET' | 'PUT'
+  readonly ttlSeconds?: number
+  readonly sha256?: string
 }
 
 /** Optional provenance filters for timeline queries. */
@@ -156,7 +167,13 @@ type MergeAttemptResult =
 export interface MountFileSystem {
   read(path: string): Promise<string>
   readBytes(path: string): Promise<Buffer>
+  /** Stream a blob without buffering CAS bytes (architecture §8.1); the 2 GiB round-trip and flat-RSS acceptance is defined by §8.3. */
+  readStream(path: string): Promise<Readable>
   write(path: string, bytes: Buffer | Uint8Array | string, options?: WriteOptions): Promise<WriteResult>
+  /** Hash, quarantine, promote, and durably commit a byte stream under §8.1 and §4.5; the 2 GiB round-trip and flat-RSS acceptance is defined by §8.3. */
+  writeStream(path: string, source: Readable): Promise<WriteResult>
+  /** Issue a GET URL or checksum-enforced PUT request under architecture §8.1; SigV4 endpoint-host reachability and acceptance are defined by §8.3. */
+  presign(path: string, options?: PresignOptions): Promise<string | ChecksumEnforcedPresignedPut>
   edit(path: string, edits: readonly TextEdit[], options?: EditOptions): Promise<WriteResult>
   list(dir: string): Promise<readonly SessionEntry[]>
   glob(pattern: string): Promise<readonly SessionEntry[]>
@@ -222,6 +239,23 @@ function bytesFor(value: Buffer | Uint8Array | string): Buffer {
   return Buffer.isBuffer(value) ? value : Buffer.from(value)
 }
 
+const CAS_SHA256 = /^[a-f0-9]{64}$/u
+
+function checksumHeaderForCasSha(value: string, context: ErrorContext): string {
+  if (!CAS_SHA256.test(value)) throw new StorageError('PUT presigns require a lowercase hexadecimal sha256', context)
+  return Buffer.from(value, 'hex').toString('base64')
+}
+
+function signsChecksumHeader(url: string): boolean {
+  try {
+    const signedHeaders = [...new URL(url).searchParams.entries()].find(
+      ([name]) => name.toLowerCase() === 'x-amz-signedheaders',
+    )?.[1]
+    return signedHeaders?.toLowerCase().split(';').includes('x-amz-checksum-sha256') === true
+  } catch {
+    return false
+  }
+}
 function globRegex(pattern: string): RegExp {
   let source = '^'
   for (let index = 0; index < pattern.length; index += 1) {
@@ -262,7 +296,25 @@ function sameHead(left: Head | undefined, right: Head | undefined): boolean {
   return left.sha256 === right.sha256 && left.mode === right.mode
 }
 
-type SessionKernel = Omit<TuddoFsKernel, 'open'>
+type SessionStoredWriteInput = {
+  readonly tenant: string
+  readonly mount: string
+  readonly ref: string
+  readonly path: string
+  readonly sha256: string
+  readonly sizeBytes: bigint
+  readonly objectKey: string
+  readonly authorUser: string
+  readonly agentKind?: string | null
+  readonly threadId?: string | null
+  readonly runId?: string | null
+}
+type SessionKernel = Omit<TuddoFsKernel, 'open'> & {
+  withBlobWriteLock<T>(
+    tenant: string,
+    work: (commit: (input: SessionStoredWriteInput) => Promise<WriteResult>) => Promise<T>,
+  ): Promise<T>
+}
 /** Build the session API over a kernel and its host options. */
 export function createSessionApi(kernel: SessionKernel, options: TuddoFsOptions) {
   return {
@@ -497,6 +549,62 @@ export function createSessionApi(kernel: SessionKernel, options: TuddoFsOptions)
         }
       }
 
+      const readStream = async (mountKey: string, rawPath: string): Promise<Readable> => {
+        const { mount, path } = mountFor(mountKey, rawPath)
+        if ('virtual' in mount) return Readable.from([await readVirtual(mount, path)])
+        await ensureRead(mount)
+        const commitId = mount.mode === 'follow' ? undefined : (await pinnedRef(mount)).commitId
+        const client = await options.pool.connect()
+        try {
+          const result = await client.query<{
+            path: string
+            sha256: string
+            size_bytes: string
+            mode: number
+            inline: Buffer | null
+            object_key: string | null
+          }>(
+            `SELECT e.path, b.sha256, b.size_bytes::text, e.mode, b.inline, b.object_key
+             FROM tuddo_commits c
+             JOIN tuddo_tree_entries e ON e.tree_id = c.tree_id
+             JOIN tuddo_blobs b ON b.id = e.blob_id
+             WHERE c.tenant = $1
+               AND c.id = COALESCE(
+                 $2::bigint,
+                 (SELECT commit_id FROM tuddo_refs WHERE tenant = $1 AND name = $3)
+               )
+               AND e.path = $4`,
+            [input.actor.tenant, commitId ?? null, mount.mode === 'follow' ? refFor(mount) : null, path],
+          )
+          const row = result.rows[0]
+          if (!row)
+            throw new NotFoundError(`Path not found: ${path}`, {
+              tenant: input.actor.tenant,
+              mount: mount.key,
+              path,
+            })
+          if (row.inline) return Readable.from([Buffer.from(row.inline)])
+          if (!row.object_key || !options.storage)
+            throw new StorageError('Blob has no readable storage backend', {
+              tenant: input.actor.tenant,
+              mount: mount.key,
+              path,
+            })
+          try {
+            return await options.storage.get(row.object_key)
+          } catch (error) {
+            if (error instanceof StorageError) throw error
+            throw new StorageError(error instanceof Error ? error.message : 'Object storage failed', {
+              tenant: input.actor.tenant,
+              mount: mount.key,
+              path,
+            })
+          }
+        } finally {
+          client.release()
+        }
+      }
+
       const readBytes = async (mountKey: string, rawPath: string): Promise<Buffer> => {
         const { mount, path } = mountFor(mountKey, rawPath)
         if ('virtual' in mount) return readVirtual(mount, path)
@@ -511,6 +619,207 @@ export function createSessionApi(kernel: SessionKernel, options: TuddoFsOptions)
               })
             : await readPinned(mount, path)
         return result.bytes
+      }
+      const writeStream = async (mountKey: string, rawPath: string, source: Readable): Promise<WriteResult> => {
+        const { mount, path } = mountFor(mountKey, rawPath)
+        if ('virtual' in mount) {
+          if (!mount.virtual.write)
+            throw new PermissionDeniedError('Virtual mount is read-only', {
+              tenant: input.actor.tenant,
+              mount: mount.key,
+              path,
+            })
+          const chunks: Buffer[] = []
+          for await (const chunk of source)
+            chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array))
+          const bytes = Buffer.concat(chunks)
+          await mount.virtual.write(path, bytes, input.actor)
+          return { path, sha256: sha256(bytes), sizeBytes: BigInt(bytes.length), commitSha: '' }
+        }
+        if (mount.mode !== 'follow')
+          throw new PermissionDeniedError('Pinned mount is read-only', {
+            tenant: input.actor.tenant,
+            mount: mount.key,
+            path,
+          })
+        const grant = await kernel.resolveGrant(input.actor, { key: mount.key })
+        if (grant.write === 'none')
+          throw new PermissionDeniedError('Write permission denied', {
+            tenant: input.actor.tenant,
+            mount: mount.key,
+            path,
+          })
+        const storage = options.storage
+        if (!storage)
+          throw new StorageError('Streaming writes require an object storage backend', {
+            tenant: input.actor.tenant,
+            mount: mount.key,
+            path,
+          })
+        const quarantineKey = `tuddo/${input.actor.tenant}/quarantine/${randomUUID()}`
+        const digest = createHash('sha256')
+        let sizeBytes = 0n
+        const hashing = new Transform({
+          transform(chunk: Buffer | Uint8Array, _encoding, callback) {
+            const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+            digest.update(bytes)
+            sizeBytes += BigInt(bytes.length)
+            callback(null, bytes)
+          },
+        })
+        const prepared = await kernel.withBlobWriteLock(input.actor.tenant, async commit => {
+          try {
+            const upload = storage.put(quarantineKey, hashing)
+            const pump = pipeline(source, hashing)
+            try {
+              await Promise.all([upload, pump])
+            } catch (error) {
+              const streamError = error instanceof Error ? error : new Error('Object storage failed')
+              source.destroy(streamError)
+              hashing.destroy(streamError)
+              await Promise.allSettled([upload, pump])
+              throw error
+            }
+            const contentSha = digest.digest('hex')
+            if (sizeBytes <= BigInt(options.inlineMaxBytes ?? 131_072)) {
+              const chunks: Buffer[] = []
+              for await (const chunk of await storage.get(quarantineKey))
+                chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array))
+              return { kind: 'inline' as const, bytes: Buffer.concat(chunks) }
+            }
+            if (!storage.copy)
+              throw new StorageError('Streaming writes require server-side object copy support', {
+                tenant: input.actor.tenant,
+                mount: mount.key,
+                path,
+              })
+            const objectKey = `tuddo/${input.actor.tenant}/${contentSha}`
+            await storage.copy(quarantineKey, objectKey)
+            return {
+              kind: 'stored' as const,
+              result: await commit({
+                tenant: input.actor.tenant,
+                mount: mount.key,
+                ref: refFor(mount),
+                path,
+                sha256: contentSha,
+                sizeBytes,
+                objectKey,
+                authorUser: input.actor.id,
+                agentKind: input.attribution?.agentKind,
+                threadId: input.attribution?.threadId,
+                runId: input.attribution?.runId,
+              }),
+            }
+          } catch (error) {
+            if (error instanceof TuddoFsError) throw error
+            throw new StorageError(error instanceof Error ? error.message : 'Object storage failed', {
+              tenant: input.actor.tenant,
+              mount: mount.key,
+              path,
+            })
+          } finally {
+            try {
+              await storage.delete(quarantineKey)
+            } catch (error) {
+              const cleanup = {
+                tenant: input.actor.tenant,
+                mount: mount.key,
+                path,
+                objectKey: quarantineKey,
+                operation: 'quarantine-cleanup',
+              }
+              if (options.logger) options.logger.error(error, cleanup)
+              else console.error('TuddoFs quarantine cleanup failed', error, cleanup)
+            }
+          }
+        })
+        if (prepared.kind === 'stored') return prepared.result
+        return kernel.write({
+          tenant: input.actor.tenant,
+          mount: mount.key,
+          ref: refFor(mount),
+          path,
+          bytes: prepared.bytes,
+          authorUser: input.actor.id,
+          agentKind: input.attribution?.agentKind,
+          threadId: input.attribution?.threadId,
+          runId: input.attribution?.runId,
+        })
+      }
+
+      const presign = async (
+        mountKey: string,
+        rawPath: string,
+        presignOptions: PresignOptions = {},
+      ): Promise<string | ChecksumEnforcedPresignedPut> => {
+        const { mount, path } = mountFor(mountKey, rawPath)
+        const method = presignOptions.method ?? 'GET'
+        const ttlSeconds = presignOptions.ttlSeconds ?? 900
+        const context = { tenant: input.actor.tenant, mount: mount.key, path }
+        if (!Number.isInteger(ttlSeconds) || ttlSeconds <= 0)
+          throw new StorageError('Presign TTL must be a positive integer', context)
+        if ('virtual' in mount) throw new StorageError('Virtual mounts have no object-storage presign', context)
+        const storage = options.storage
+        if (!storage) throw new StorageError('Presigning requires an object storage backend', context)
+        if (method === 'PUT') {
+          const grant = await kernel.resolveGrant(input.actor, { key: mount.key })
+          if (grant.write === 'none') throw new PermissionDeniedError('Write permission denied', context)
+          if (mount.mode !== 'follow') throw new PermissionDeniedError('Pinned mount is read-only', context)
+          const checksum = presignOptions.sha256
+          if (!checksum) throw new StorageError('PUT presigns require a sha256 checksum', context)
+          const checksumHeader = checksumHeaderForCasSha(checksum, context)
+          if (!storage.presignPut) throw new StorageError('Object storage does not support PUT presigning', context)
+          const objectKey = `tuddo/${input.actor.tenant}/${checksum}`
+          try {
+            const result = await storage.presignPut(objectKey, {
+              ttlSeconds,
+              checksumSha256: checksumHeader,
+            })
+            if (!result.checksumEnforced)
+              throw new StorageError(
+                `Object storage does not enforce PUT checksums${result.reason ? `: ${result.reason}` : ''}`,
+                context,
+              )
+            if (result.headers['x-amz-checksum-sha256'] !== checksumHeader || !signsChecksumHeader(result.url))
+              throw new StorageError('Object storage did not sign the required x-amz-checksum-sha256 header', context)
+            return result
+          } catch (error) {
+            if (error instanceof StorageError) throw error
+            throw new StorageError(error instanceof Error ? error.message : 'Object storage failed', context)
+          }
+        }
+        // `method` is a closed union; GET is the only remaining branch.
+        await ensureRead(mount)
+        const commitId = mount.mode === 'follow' ? undefined : (await pinnedRef(mount)).commitId
+        const client = await options.pool.connect()
+        try {
+          const result = await client.query<{ object_key: string | null; inline: Buffer | null }>(
+            `SELECT b.object_key, b.inline
+             FROM tuddo_commits c
+             JOIN tuddo_tree_entries e ON e.tree_id = c.tree_id
+             JOIN tuddo_blobs b ON b.id = e.blob_id
+             WHERE c.tenant = $1
+               AND c.id = COALESCE(
+                 $2::bigint,
+                 (SELECT commit_id FROM tuddo_refs WHERE tenant = $1 AND name = $3)
+               )
+               AND e.path = $4`,
+            [input.actor.tenant, commitId ?? null, mount.mode === 'follow' ? refFor(mount) : null, path],
+          )
+          const row = result.rows[0]
+          if (!row) throw new NotFoundError(`Path not found: ${path}`, context)
+          if (row.inline || !row.object_key) throw new StorageError('Inline blobs do not have presigned URLs', context)
+          if (!storage.presignGet) throw new StorageError('Object storage does not support GET presigning', context)
+          try {
+            return await storage.presignGet(row.object_key, { ttlSeconds })
+          } catch (error) {
+            if (error instanceof StorageError) throw error
+            throw new StorageError(error instanceof Error ? error.message : 'Object storage failed', context)
+          }
+        } finally {
+          client.release()
+        }
       }
 
       const listRef = async (mount: RefMount, dir: string): Promise<SessionEntry[]> => {
@@ -763,12 +1072,19 @@ export function createSessionApi(kernel: SessionKernel, options: TuddoFsOptions)
       type SessionOperations = SessionFileSystem & {
         read(mountKey: string, path: string): Promise<string>
         readBytes(mountKey: string, path: string): Promise<Buffer>
+        readStream(mountKey: string, path: string): Promise<Readable>
         write(
           mountKey: string,
           path: string,
           value: Buffer | Uint8Array | string,
           options?: WriteOptions,
         ): Promise<WriteResult>
+        writeStream(mountKey: string, path: string, source: Readable): Promise<WriteResult>
+        presign(
+          mountKey: string,
+          path: string,
+          options?: PresignOptions,
+        ): Promise<string | ChecksumEnforcedPresignedPut>
         edit(mountKey: string, path: string, edits: readonly TextEdit[], options?: EditOptions): Promise<WriteResult>
         list(mountKey: string, dir: string): Promise<readonly SessionEntry[]>
         glob(mountKey: string, pattern: string): Promise<readonly SessionEntry[]>
@@ -789,7 +1105,10 @@ export function createSessionApi(kernel: SessionKernel, options: TuddoFsOptions)
           return {
             read: (path: string) => sessionOps.read(key, path),
             readBytes: (path: string) => sessionOps.readBytes(key, path),
+            readStream: (path: string) => sessionOps.readStream(key, path),
             write: (path, value, writeOptions) => sessionOps.write(key, path, value, writeOptions),
+            writeStream: (path: string, source: Readable) => sessionOps.writeStream(key, path, source),
+            presign: (path: string, options?: PresignOptions) => sessionOps.presign(key, path, options),
             edit: (path, edits, editOptions) => sessionOps.edit(key, path, edits, editOptions),
             list: (path: string) => sessionOps.list(key, path),
             glob: (pattern: string) => sessionOps.glob(key, pattern),
@@ -802,6 +1121,9 @@ export function createSessionApi(kernel: SessionKernel, options: TuddoFsOptions)
           return (await sessionOps.readBytes(mountKey, path)).toString('utf8')
         },
         readBytes: (mountKey: string, path: string) => readBytes(mountKey, path),
+        readStream: (mountKey: string, path: string) => readStream(mountKey, path),
+        writeStream: (mountKey: string, path: string, source: Readable) => writeStream(mountKey, path, source),
+        presign: (mountKey: string, path: string, options?: PresignOptions) => presign(mountKey, path, options),
         async write(
           mountKey: string,
           rawPath: string,

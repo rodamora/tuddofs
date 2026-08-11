@@ -27,9 +27,12 @@ class MemoryStore implements BlobStore {
   listStarted: (() => void) | undefined
   listGate: Promise<void> | undefined
 
-  async put(key: string, bytes: Buffer): Promise<void> {
+  async put(key: string, source: Buffer | Readable): Promise<void> {
+    const chunks: Buffer[] = []
+    if (Buffer.isBuffer(source)) chunks.push(source)
+    else for await (const chunk of source) chunks.push(Buffer.from(chunk as Uint8Array))
     this.objects.set(key, {
-      bytes: Buffer.from(bytes),
+      bytes: Buffer.concat(chunks),
       lastModified: new Date(now),
     })
   }

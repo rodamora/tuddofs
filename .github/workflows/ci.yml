@@ -40,10 +40,11 @@ jobs:
   integration:
     name: PostgreSQL integration tests
     runs-on: ubuntu-latest
-    container: node:22-bookworm
     services:
       postgres:
         image: postgres:16-alpine
+        ports:
+          - 5432:5432
         env:
           POSTGRES_USER: tuddofs
           POSTGRES_PASSWORD: tuddofs
@@ -54,14 +55,22 @@ jobs:
           --health-timeout 5s
           --health-retries 5
     env:
-      TUDDOFS_DATABASE_URL: postgresql://tuddofs:tuddofs@postgres:5432/tuddofs_it
+      TUDDOFS_DATABASE_URL: postgresql://tuddofs:tuddofs@127.0.0.1:5432/tuddofs_it
+      TUDDOFS_MINIO_STREAM_BYTES: '268435456'
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
       - name: Install dependencies
         run: npm ci
       - name: PostgreSQL integration tests
         run: npm run test:integration
+      - name: MinIO streaming acceptance smoke test
+        run: npm run test:minio
 
   package:
     name: Packed package smoke test
