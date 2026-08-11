@@ -3,7 +3,7 @@ import test from 'node:test'
 import { CreateBucketCommand, S3Client } from '@aws-sdk/client-s3'
 
 import { S3BlobStore } from '../src/index.js'
-import { defineBlobStoreConformanceSuite } from './blob-store-conformance.js'
+import { defineBlobStoreConformanceSuite } from '../src/conformance.js'
 
 const endpoint = process.env.TUDDOFS_S3_ENDPOINT
 const bucket = process.env.TUDDOFS_S3_BUCKET ?? 'tuddofs'

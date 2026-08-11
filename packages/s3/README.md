@@ -31,19 +31,29 @@ Set `forcePathStyle: true` for MinIO and other endpoints that do not expose virt
 
 `presignPut(key, { ttlSeconds, checksumSha256 })` signs `x-amz-checksum-sha256` and requires the caller to send that header with the PUT. The store rejects a body whose SHA-256 does not match the signed checksum.
 
+## Public API
+
+- `StorageError` is thrown when an S3 operation cannot satisfy the `BlobStore` SPI. It exposes `operation`, `key`, and the original backend failure as `cause`.
+- `StorageOperation` is the union of operation names carried by `StorageError`: `put`, `head`, `get`, `delete`, `list`, `presignPut`, and `presignGet`.
+- `S3BlobStore.destroy()` releases the AWS SDK client created by the adapter. Call it when the store owns its client; it is a no-op for an injected client.
+
 ## SigV4 host reachability
 
 Presigned URLs embed the configured endpoint host. Target-direct I/O therefore requires the blob endpoint to be reachable from the target network. A LAN-only MinIO endpoint cannot be used directly by an external target; downgrade large-blob capture to the server-relay path in that case (architecture §8.3).
 
+## BlobStore conformance kit
+
+The `@tuddofs/s3/conformance` export provides `defineBlobStoreConformanceSuite` and its fixture types for any adapter implementing the same BlobStore SPI. The suite only checks SPI behavior; S3-specific SigV4 assertions remain in this package's tests.
+
 ## MinIO contract tests
 
-The conformance suite is also the SPI kit for other adapters. Start a disposable MinIO instance, then set the endpoint and run:
+The S3 adapter tests use the reusable kit. Start a disposable MinIO instance, then set the endpoint and run:
 
 ```bash
 TUDDOFS_S3_ENDPOINT=http://127.0.0.1:59000 \
 TUDDOFS_S3_ACCESS_KEY_ID=minioadmin \
 TUDDOFS_S3_SECRET_ACCESS_KEY=minioadmin \
-npm run test:contract
+npm run test:contract --workspace @tuddofs/s3
 ```
 
 The suite exercises all seven methods and verifies a presigned PUT with the right checksum succeeds while the same URL rejects mismatched bytes.

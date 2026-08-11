@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto'
 import { Readable } from 'node:stream'
 import test, { after, afterEach, before, describe } from 'node:test'
 
+/** The required BlobStore surface exercised by the reusable conformance suite. */
 export interface ConformanceBlobStore {
   put(key: string, bytes: Buffer): Promise<void>
   head(key: string): Promise<{ sizeBytes: number } | null>
@@ -13,9 +14,13 @@ export interface ConformanceBlobStore {
   presignGet(key: string, opts: { ttlSeconds: number }): Promise<string>
 }
 
+export type ConformanceRequest = (url: string, init?: RequestInit) => Promise<Response>
+
 export interface ConformanceStoreFixture {
   readonly store: ConformanceBlobStore
   readonly close?: () => void | Promise<void>
+  /** Transport used to exercise presigned URLs; defaults to the Node fetch API. */
+  readonly request?: ConformanceRequest
 }
 
 export interface BlobStoreConformanceOptions {
@@ -26,7 +31,7 @@ export interface BlobStoreConformanceOptions {
 
 /** Register the store-agnostic conformance suite for a BlobStore implementation. */
 export function defineBlobStoreConformanceSuite(options: BlobStoreConformanceOptions): void {
-  describe(options.name ?? 'BlobStore SPI conformance', () => {
+  void describe(options.name ?? 'BlobStore SPI conformance', () => {
     let fixture: ConformanceStoreFixture | undefined
 
     before(async () => {
@@ -45,7 +50,7 @@ export function defineBlobStoreConformanceSuite(options: BlobStoreConformanceOpt
       if (close) await close()
     })
 
-    test('implements put, head, get, and delete', async () => {
+    void test('implements put, head, get, and delete', async () => {
       const store = requireStore(fixture)
       const key = `${options.prefix}round-trip`
       const bytes = Buffer.from('adapter conformance')
@@ -58,7 +63,7 @@ export function defineBlobStoreConformanceSuite(options: BlobStoreConformanceOpt
       assert.equal(await store.head(key), null)
     })
 
-    test('isolates keys and filters list results by prefix', async () => {
+    void test('isolates keys and filters list results by prefix', async () => {
       const store = requireStore(fixture)
       const alphaKey = `${options.prefix}alpha/one`
       const alphaOtherKey = `${options.prefix}alpha/two`
@@ -80,7 +85,7 @@ export function defineBlobStoreConformanceSuite(options: BlobStoreConformanceOpt
       assert.deepEqual(await collect(await store.get(betaKey)), Buffer.from('beta one'))
     })
 
-    test('reports missing keys through head and get', async () => {
+    void test('reports missing keys through head and get', async () => {
       const store = requireStore(fixture)
       const key = `${options.prefix}does-not-exist`
 
@@ -88,48 +93,54 @@ export function defineBlobStoreConformanceSuite(options: BlobStoreConformanceOpt
       await assert.rejects(() => store.get(key))
     })
 
-    test('presigned PUT enforces the signed checksum', async () => {
-      const store = requireStore(fixture)
+    void test('presigned PUT rejects mismatched bytes and accepts the signed checksum', async () => {
+      const currentFixture = requireFixture(fixture)
+      const store = currentFixture.store
+      const request = currentFixture.request ?? fetch
       const key = `${options.prefix}presigned-put`
       const expected = Buffer.from('expected bytes')
       const checksum = createHash('sha256').update(expected).digest('base64')
       const url = await store.presignPut(key, { ttlSeconds: 300, checksumSha256: checksum })
 
-      assert.match(new URL(url).searchParams.get('X-Amz-SignedHeaders') ?? '', /(?:^|;)x-amz-checksum-sha256(?:;|$)/)
-
-      const wrongResponse = await fetch(url, {
+      const wrongResponse = await request(url, {
         method: 'PUT',
         headers: { 'x-amz-checksum-sha256': checksum },
         body: 'wrong bytes',
       })
-      assert.notEqual(wrongResponse.status, 200)
+      assert.equal(wrongResponse.ok, false)
 
-      const rightResponse = await fetch(url, {
+      const rightResponse = await request(url, {
         method: 'PUT',
         headers: { 'x-amz-checksum-sha256': checksum },
         body: expected,
       })
-      assert.equal(rightResponse.status, 200)
+      assert.equal(rightResponse.ok, true)
       assert.deepEqual(await collect(await store.get(key)), expected)
     })
 
-    test('presigned GET returns the stored object', async () => {
-      const store = requireStore(fixture)
+    void test('presigned GET returns the stored object', async () => {
+      const currentFixture = requireFixture(fixture)
+      const store = currentFixture.store
+      const request = currentFixture.request ?? fetch
       const key = `${options.prefix}presigned-get`
       const bytes = Buffer.from('presigned response')
 
       await store.put(key, bytes)
-      const response = await fetch(await store.presignGet(key, { ttlSeconds: 300 }))
+      const response = await request(await store.presignGet(key, { ttlSeconds: 300 }))
 
-      assert.equal(response.status, 200)
+      assert.equal(response.ok, true)
       assert.deepEqual(Buffer.from(await response.arrayBuffer()), bytes)
     })
   })
 }
 
-function requireStore(fixture: ConformanceStoreFixture | undefined): ConformanceBlobStore {
+function requireFixture(fixture: ConformanceStoreFixture | undefined): ConformanceStoreFixture {
   assert.ok(fixture, 'BlobStore fixture was not initialized')
-  return fixture.store
+  return fixture
+}
+
+function requireStore(fixture: ConformanceStoreFixture | undefined): ConformanceBlobStore {
+  return requireFixture(fixture).store
 }
 
 async function collect(stream: Readable): Promise<Buffer> {
