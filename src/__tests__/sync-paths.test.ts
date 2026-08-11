@@ -7,16 +7,20 @@ import {
   mirrorDirName,
   mountKeyForMirrorDir,
   parseScanRecords,
+  parseSizeRecords,
   probeCommand,
   quoteShellArg,
   resolveUnderRoot,
   scanCommand,
+  sizeCommand,
   stampCommand,
+  uploadCommand,
 } from '../sync/paths.js'
 import { InvalidMountKeyError, InvalidPathError } from '../internal.js'
 
 const record = (sha: string, path: string) => `${sha}  ${path}\0`
 const sha = (character: string) => character.repeat(64)
+const sizeRecord = (size: number | string, path: string) => `${size}\0${path}\0`
 
 test('mirror directory names encode the mount-key colon deterministically', () => {
   assert.equal(mirrorDirName('project:notes'), 'project%3Anotes')
@@ -84,6 +88,13 @@ test('scan and stamp commands quote every interpolated value and gate on find su
   assert.equal(stampCommand('/work', 1_700_000_000_050), "touch -d '@1699999999.050' '/work/.tuddofs-stamp'")
   assert.equal(stampCommand('/work', 1_700_000_000_000), "touch -d '@1699999999.000' '/work/.tuddofs-stamp'")
   assert.equal(probeCommand(), 'sha256sum --version && find --version')
+  // The direct-upload transport adds two binaries the capture path cannot work
+  // without, so acquire is where their absence has to surface (§7.3 phase 1
+  // step 1, §8.2).
+  assert.equal(
+    probeCommand({ directUpload: true }),
+    'sha256sum --version && find --version && stat --version && curl --version',
+  )
 })
 
 test('scan records map mirror paths back to mount keys and kernel paths', () => {
@@ -138,4 +149,77 @@ test('scan records reject malformed sha256sum output instead of reporting an emp
   assert.throws(() => parseScanRecords('not-a-record\0', dirs), InvalidPathError)
   assert.throws(() => parseScanRecords(`${'z'.repeat(64)}  notes/a.md\0`, dirs), InvalidPathError)
   assert.throws(() => parseScanRecords(`${sha('a')} notes/a.md\0`, dirs), InvalidPathError)
+})
+
+
+test('the size command reuses the scan list instead of interpolating any path', () => {
+  const command = sizeCommand('/work space')
+
+  assert.match(command, /^cd '\/work space' && /u)
+  assert.ok(command.includes("xargs -0 -r stat --printf='%s\\0%n\\0'"))
+  assert.ok(command.includes("< '.tuddofs/scan'"))
+  // Sizes come from the list `find` already wrote, so the command carries no
+  // agent-controlled filename, no ARG_MAX ceiling, and no second traversal.
+  assert.ok(!command.includes('find '))
+})
+
+test('size records map mirror paths back to mount keys and kernel paths', () => {
+  const dirs = new Map([
+    ['project%3Anotes', 'project:notes'],
+    ['refs', 'refs'],
+  ])
+  const output = [
+    sizeRecord(0, 'project%3Anotes/empty.bin'),
+    sizeRecord(2_147_483_648, 'project%3Anotes/deep/nested file.bin'),
+    sizeRecord(7, 'refs/x.md'),
+  ].join('')
+
+  assert.deepEqual(parseSizeRecords(output, dirs), [
+    { mountKey: 'project:notes', path: '/empty.bin', sizeBytes: 0 },
+    { mountKey: 'project:notes', path: '/deep/nested file.bin', sizeBytes: 2_147_483_648 },
+    { mountKey: 'refs', path: '/x.md', sizeBytes: 7 },
+  ])
+  assert.deepEqual(parseSizeRecords('', dirs), [])
+})
+
+test('size records reject malformed stat output and mount escapes instead of guessing a size', () => {
+  const dirs = new Map([['notes', 'notes']])
+
+  assert.throws(() => parseSizeRecords(sizeRecord(12, 'notes/a.bin').slice(0, -1), dirs), InvalidPathError)
+  assert.throws(() => parseSizeRecords(`${'12\0'}`, dirs), InvalidPathError)
+  assert.throws(() => parseSizeRecords(sizeRecord('12x', 'notes/a.bin'), dirs), InvalidPathError)
+  assert.throws(() => parseSizeRecords(sizeRecord('-1', 'notes/a.bin'), dirs), InvalidPathError)
+  assert.throws(() => parseSizeRecords(sizeRecord(12, '../etc/passwd'), dirs), InvalidPathError)
+  assert.throws(() => parseSizeRecords(sizeRecord(12, 'other/a.bin'), dirs), InvalidPathError)
+})
+
+test('the upload command single-quotes the presigned URL and every signed header', () => {
+  const url = 'https://blobs.example/tuddo/t/abc?X-Amz-Signature=deadbeef&X-Amz-SignedHeaders=host;x-amz-checksum-sha256'
+  const command = uploadCommand('/work', {
+    path: '/work/project%3Anotes/big.bin',
+    url,
+    headers: { 'x-amz-checksum-sha256': 'qqlAJmTxpB9A67xSyZk+tmrrNmYClY/fqig7ceZNsSM=' },
+  })
+
+  // §7.4: the URL carries `&` and `;`, both of which end the command early
+  // unquoted, and the checksum header carries `+` and `/`.
+  assert.ok(command.includes(`'${url}'`))
+  assert.ok(command.includes(`'x-amz-checksum-sha256: qqlAJmTxpB9A67xSyZk+tmrrNmYClY/fqig7ceZNsSM='`))
+  assert.ok(command.includes(`--upload-file '/work/project%3Anotes/big.bin'`))
+  assert.ok(command.startsWith('curl --silent --show-error --fail '))
+  // curl must stream the file from disk; anything that reads it into the shell
+  // defeats the whole point of not passing 2 GB through memory (§8.3).
+  assert.ok(!command.includes('--data'))
+
+  const unsigned = uploadCommand('/work', { path: '/work/notes/big.bin', url, headers: {} })
+  assert.ok(!unsigned.includes('--header'))
+})
+
+test('the upload command refuses a file that does not resolve under the workspace root', () => {
+  const url = 'https://blobs.example/o?sig=1&x=2'
+
+  // A presigned PUT of /etc/passwd is the symlink-exfiltration hazard with a
+  // network attached; the root guard runs before the exec line exists (§7.4).
+  assert.throws(() => uploadCommand('/work', { path: '/etc/passwd', url, headers: {} }), InvalidPathError)
+  assert.throws(() => uploadCommand('/work', { path: '../etc/passwd', url, headers: {} }), InvalidPathError)
 })
