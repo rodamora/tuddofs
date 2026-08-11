@@ -39,8 +39,8 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json --incremental false",
-    "test": "NODE_ENV=test node --import tsx --test 'src/**/__tests__/**/*.test.ts'",
-    "test:integration": "TUDDOFS_DATABASE_URL=${TUDDOFS_DATABASE_URL:-postgresql://tuddofs:tuddofs@127.0.0.1:55434/tuddofs_it} node --import tsx --test --test-concurrency=1 'src/integration/**/*.integration.test.ts'",
+    "test": "node scripts/run-tests.mjs unit",
+    "test:integration": "node scripts/run-tests.mjs integration",
     "demo": "node --import tsx scripts/demo.ts",
     "typecheck": "tsc --noEmit -p tsconfig.typecheck.json",
     "typecheck:tsc": "tsc --noEmit -p tsconfig.typecheck.json",
