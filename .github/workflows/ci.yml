@@ -36,6 +36,26 @@ jobs:
         run: npm run build
       - name: Unit tests
         run: npm test
+      - name: Start MinIO
+        run: docker run --detach --name tuddofs-s3-ci --env MINIO_ROOT_USER=minioadmin --env MINIO_ROOT_PASSWORD=minioadmin --publish 9000:9000 minio/minio:RELEASE.2024-12-18T13-15-44Z server /data
+      - name: Wait for MinIO
+        run: |
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:9000/minio/health/live >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "MinIO did not become ready within 30 seconds" >&2
+          exit 1
+      - name: Full S3 package tests
+        env:
+          TUDDOFS_S3_ENDPOINT: http://127.0.0.1:9000
+          TUDDOFS_S3_FORCE_PATH_STYLE: 'true'
+        run: npm run test:s3
+      - name: Stop MinIO
+        if: always()
+        run: docker rm --force tuddofs-s3-ci
 
   integration:
     name: PostgreSQL integration tests
@@ -57,6 +77,8 @@ jobs:
     env:
       TUDDOFS_DATABASE_URL: postgresql://tuddofs:tuddofs@127.0.0.1:5432/tuddofs_it
       TUDDOFS_MINIO_STREAM_BYTES: '268435456'
+      TUDDOFS_S3_ENDPOINT: http://127.0.0.1:9000
+      TUDDOFS_S3_FORCE_PATH_STYLE: 'true'
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -65,12 +87,27 @@ jobs:
         with:
           node-version: '22'
           cache: npm
+      - name: Start MinIO
+        run: docker run --detach --name tuddofs-s3-integration --env MINIO_ROOT_USER=minioadmin --env MINIO_ROOT_PASSWORD=minioadmin --publish 9000:9000 minio/minio:RELEASE.2024-12-18T13-15-44Z server /data
+      - name: Wait for MinIO
+        run: |
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:9000/minio/health/live >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "MinIO did not become ready within 30 seconds" >&2
+          exit 1
       - name: Install dependencies
         run: npm ci
       - name: PostgreSQL integration tests
         run: npm run test:integration
       - name: MinIO streaming acceptance smoke test
         run: npm run test:minio
+      - name: Stop MinIO
+        if: always()
+        run: docker rm --force tuddofs-s3-integration
 
   package:
     name: Packed package smoke test
@@ -87,13 +124,15 @@ jobs:
         run: npm ci
       - name: Build
         run: npm run build
-      - name: Pack
+      - name: S3 package publish dry run
+        run: npm publish --workspace @tuddofs/s3 --dry-run --ignore-scripts
+      - name: Pack S3 package
         id: pack
         run: |
-          filename="$(npm pack --pack-destination "$RUNNER_TEMP" --json | node -e "let s='';process.stdin.on('data', d => s += d).on('end', () => process.stdout.write(JSON.parse(s)[0].filename))")"
+          filename="$(npm pack --workspace @tuddofs/s3 --pack-destination "$RUNNER_TEMP" --json | node -e "let s='';process.stdin.on('data', d => s += d).on('end', () => process.stdout.write(JSON.parse(s)[0].filename))")"
           tarball="$RUNNER_TEMP/$filename"
           echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
-      - name: Install packed package in a scratch project
+      - name: Install packed S3 package in a scratch project
         env:
           TUDDOFS_TARBALL: ${{ steps.pack.outputs.tarball }}
         run: |
@@ -102,4 +141,4 @@ jobs:
           cd "$scratch"
           npm init --yes
           npm install "$TUDDOFS_TARBALL"
-          node --input-type=module -e "const pkg = await import('tuddofs'); if (typeof pkg.createTuddoFs !== 'function') throw new Error('createTuddoFs export missing')"
+          node --input-type=module -e "const pkg = await import('@tuddofs/s3'); if (typeof pkg.S3BlobStore !== 'function') throw new Error('S3BlobStore export missing'); const kit = await import('@tuddofs/s3/conformance'); if (typeof kit.defineBlobStoreConformanceSuite !== 'function') throw new Error('conformance export missing')"
