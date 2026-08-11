@@ -85,15 +85,18 @@ test('an exec killed mid-run reports the signal and keeps the output it produced
   assert.ok(!killed.output.includes('dead'))
 })
 
-test('an exec that exceeds its timeout is killed rather than left running', async () => {
+test('an exec that exceeds its timeout kills the whole command group', async () => {
   const root = await freshRoot()
   const target = createLocalDirectoryTarget({ root, execTimeoutMs: 50 })
 
+  const startedAt = Date.now()
   const timedOut = await target.exec('echo start; sleep 30')
   assert.equal(timedOut.exitCode, 137)
   assert.ok(timedOut.output.includes('start'))
+  // A timeout that only kills the shell leaves `sleep` holding the stdio pipes
+  // and the exec settles 30s late instead of 50ms late.
+  assert.ok(Date.now() - startedAt < 5_000, `exec settled after ${Date.now() - startedAt}ms`)
 })
-
 test('the GNU coreutils probe and the capture chain run against a real directory', async () => {
   const root = await freshRoot()
   const target = createLocalDirectoryTarget({ root })
