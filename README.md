@@ -24,6 +24,14 @@ These boundaries are reflected in the exported API; do not build a production wo
 - A PostgreSQL-compatible driver and pool supplied by the host application. The examples use `pg`, but `tuddofs` keeps it out of its runtime dependencies so hosts can use another structurally compatible pool.
 - Optional object storage implementing the exported `BlobStore` interface
 
+The reference S3-compatible implementation is published separately:
+
+```bash
+npm install @tuddofs/s3
+```
+
+It implements the structural `BlobStore` SPI for AWS S3, MinIO, and Cloudflare R2. See [`packages/s3/README.md`](./packages/s3/README.md) for endpoint configuration, checksum-bound presigned PUTs, and the SigV4 host-reachability caveat.
+
 ## Install
 
 ```bash

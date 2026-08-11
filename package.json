@@ -3,7 +3,9 @@
   "version": "0.1.0",
   "type": "module",
   "description": "A multi-tenant, permission-confined, branchable filesystem for AI agents, built on Postgres and object storage.",
-  "workspaces": ["packages/s3"],
+  "workspaces": [
+    "packages/s3"
+  ],
   "author": "Rod Amora",
   "repository": {
     "type": "git",
@@ -56,8 +58,8 @@
     "typecheck:core": "tsc --noEmit -p tsconfig.typecheck.json",
     "typecheck:s3": "npm run typecheck --workspace @tuddofs/s3",
     "typecheck:tsc": "tsc --noEmit -p tsconfig.typecheck.json",
-    "format": "prettier --write 'src/**/*.ts' 'scripts/**/*.ts' 'packages/s3/src/**/*.ts' 'packages/s3/test/**/*.ts' 'fixtures/**/*.mjs' '*.mjs' '*.json' 'packages/s3/*.json' '*.md' 'packages/s3/*.md'",
-    "format:check": "prettier --check 'src/**/*.ts' 'scripts/**/*.ts' 'packages/s3/src/**/*.ts' 'packages/s3/test/**/*.ts' 'fixtures/**/*.mjs' '*.mjs' '*.json' 'packages/s3/*.json' '*.md' 'packages/s3/*.md'",
+    "format": "prettier --write 'src/**/*.ts' 'scripts/**/*.ts' 'packages/s3/src/**/*.ts' 'packages/s3/test/**/*.ts' 'fixtures/**/*.mjs' '*.mjs' '*.json' 'packages/s3/*.json' 'README.md' 'packages/s3/README.md'",
+    "format:check": "prettier --check 'src/**/*.ts' 'scripts/**/*.ts' 'packages/s3/src/**/*.ts' 'packages/s3/test/**/*.ts' 'fixtures/**/*.mjs' '*.mjs' '*.json' 'packages/s3/*.json' 'README.md' 'packages/s3/README.md'",
     "lint": "eslint .",
     "prepublishOnly": "npm run build:core && npm test"
   },

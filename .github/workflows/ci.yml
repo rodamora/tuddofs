@@ -16,6 +16,9 @@ jobs:
       fail-fast: false
       matrix:
         node: ['20', '22']
+    env:
+      TUDDOFS_S3_ENDPOINT: http://127.0.0.1:9000
+      TUDDOFS_S3_FORCE_PATH_STYLE: 'true'
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -36,6 +39,13 @@ jobs:
         run: npm run build
       - name: Unit tests
         run: npm test
+      - name: Start MinIO
+        run: docker run --detach --name tuddofs-s3-ci --env MINIO_ROOT_USER=minioadmin --env MINIO_ROOT_PASSWORD=minioadmin --publish 9000:9000 minio/minio:latest server /data
+      - name: Wait for MinIO
+        run: |
+          until curl --fail --silent http://127.0.0.1:9000/minio/health/live >/dev/null; do sleep 1; done
+      - name: MinIO S3 conformance tests
+        run: npm run test:s3:contract
 
   integration:
     name: PostgreSQL integration tests
@@ -87,6 +97,8 @@ jobs:
         run: npm ci
       - name: Build
         run: npm run build
+      - name: S3 package publish dry run
+        run: npm publish --workspace @tuddofs/s3 --dry-run --ignore-scripts
       - name: Pack
         id: pack
         run: |
