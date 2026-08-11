@@ -51,6 +51,15 @@ async function openDocs(sessionId: string): Promise<SessionFileSystem> {
 
 const bytes = (value: string) => ({ bytes: Buffer.from(value) })
 
+/**
+ * `onCommit` is queued with `setImmediate`, so assertions have to yield the
+ * macrotask queue first. `Promise.withResolvers` is unavailable on Node 20,
+ * which this package supports, so the executor form stays.
+ */
+async function drainCommitEvents(): Promise<void> {
+  await new Promise<void>(resolve => setImmediate(resolve))
+}
+
 test('sessions enumerate their mounts with kind, pin state, and the live write mode', async () => {
   const session = await createFs().open({
     actor,
@@ -85,6 +94,7 @@ test('capture commits every changed path and deletion of one mount in a single c
   const docs = session.mount('project:docs')
   await docs.write('/keep.md', 'keep')
   await docs.write('/gone.md', 'gone')
+  await drainCommitEvents()
   commits.length = 0
 
   const captured = await docs.capture({
@@ -105,6 +115,7 @@ test('capture commits every changed path and deletion of one mount in a single c
   const history = await session.timeline({ runId: 'run-capture' })
   const capture = history.find(record => record.commitSha === captured.commitSha)
   assert.equal(capture?.op, 'capture')
+  await drainCommitEvents()
   assert.deepEqual(
     commits.map(event => event.commitSha),
     [captured.commitSha],

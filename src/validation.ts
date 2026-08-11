@@ -113,6 +113,28 @@ export function findPathCollision(path: string, paths: PathCollection): string |
 }
 
 /**
+ * Every existing path that `path` would mask under architecture §4.3, in both
+ * directions: file ancestors the path turns into directories, and descendants a
+ * file at `path` would hide.
+ *
+ * Capture (§4.3 point 2) uses this to carry those deletions in the same commit,
+ * because disk is the observed truth and a real filesystem cannot hold file `a`
+ * and directory `a/` at once. `write`/`edit` (§4.3 point 1) reject instead.
+ */
+export function findMaskedPaths(path: string, paths: PathCollection): readonly string[] {
+  const masked: string[] = []
+  for (let separator = path.indexOf('/', 1); separator !== -1; separator = path.indexOf('/', separator + 1)) {
+    const ancestor = path.slice(0, separator)
+    if (paths.has(ancestor)) masked.push(ancestor)
+  }
+  const directoryPrefix = `${path}/`
+  for (const candidate of paths.keys()) {
+    if (candidate.startsWith(directoryPrefix)) masked.push(candidate)
+  }
+  return masked
+}
+
+/**
  * Return every file-prefix pair that violates the flat-tree coherence
  * invariant in architecture §4.3.
  */
