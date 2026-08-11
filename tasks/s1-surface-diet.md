@@ -1,7 +1,7 @@
 # s1-surface-diet — cut the consumer API to the §6.2 tiers
 
 Status: done
-Evidence: `da09e9f` (red contract tests), `src/__tests__/surface.test.ts`, `src/__tests__/readme.test.ts`, and `src/integration/{readme,session}.integration.test.ts`.
+Evidence: PR #4 (`https://github.com/rodamora/tuddofs/pull/4`), tip `a3c3a6b82a7a606a395cbbbd145f43b1c100b4c6`; `npm run format:check`, `npm run lint`, `npm run typecheck`, `npm run build`, `npm test` (62 pass), disposable-Postgres `npm run test:integration` (90 pass), and packed `tuddofs/internal` import smoke.
 Stage: S1 pre-work (ships with s1-tree-coherence as one breaking release)
 Depends on: —
 Spec: `../architecture.md` §6.2 (all four items), §9 (EditMatchError), §13.7 (README same-PR rule)
