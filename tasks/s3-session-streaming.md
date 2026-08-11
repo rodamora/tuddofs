@@ -1,6 +1,6 @@
 # s3-session-streaming — streaming reads/writes + presign issuance
 
-Status: in-progress
+Status: done (evidence: e5d3baa)
 Stage: S3 (independent of the sync engine)
 Depends on: — (coordinate surface shape with s1-surface-diet if concurrent)
 Spec: `../architecture.md` §8.1, §8.3 (acceptance + SigV4 caveat), §4.5 write invariants
