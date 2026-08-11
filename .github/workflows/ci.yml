@@ -40,12 +40,22 @@ jobs:
       - name: Unit tests
         run: npm test
       - name: Start MinIO
-        run: docker run --detach --name tuddofs-s3-ci --env MINIO_ROOT_USER=minioadmin --env MINIO_ROOT_PASSWORD=minioadmin --publish 9000:9000 minio/minio:latest server /data
+        run: docker run --detach --name tuddofs-s3-ci --env MINIO_ROOT_USER=minioadmin --env MINIO_ROOT_PASSWORD=minioadmin --publish 9000:9000 minio/minio:RELEASE.2024-12-18T13-15-44Z server /data
       - name: Wait for MinIO
         run: |
-          until curl --fail --silent http://127.0.0.1:9000/minio/health/live >/dev/null; do sleep 1; done
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:9000/minio/health/live >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "MinIO did not become ready within 30 seconds" >&2
+          exit 1
       - name: MinIO S3 conformance tests
         run: npm run test:s3:contract
+      - name: Stop MinIO
+        if: always()
+        run: docker rm --force tuddofs-s3-ci
 
   integration:
     name: PostgreSQL integration tests
@@ -67,6 +77,8 @@ jobs:
     env:
       TUDDOFS_DATABASE_URL: postgresql://tuddofs:tuddofs@127.0.0.1:5432/tuddofs_it
       TUDDOFS_MINIO_STREAM_BYTES: '268435456'
+      TUDDOFS_S3_ENDPOINT: http://127.0.0.1:9000
+      TUDDOFS_S3_FORCE_PATH_STYLE: 'true'
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -75,12 +87,27 @@ jobs:
         with:
           node-version: '22'
           cache: npm
+      - name: Start MinIO
+        run: docker run --detach --name tuddofs-s3-integration --env MINIO_ROOT_USER=minioadmin --env MINIO_ROOT_PASSWORD=minioadmin --publish 9000:9000 minio/minio:RELEASE.2024-12-18T13-15-44Z server /data
+      - name: Wait for MinIO
+        run: |
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:9000/minio/health/live >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "MinIO did not become ready within 30 seconds" >&2
+          exit 1
       - name: Install dependencies
         run: npm ci
       - name: PostgreSQL integration tests
         run: npm run test:integration
       - name: MinIO streaming acceptance smoke test
         run: npm run test:minio
+      - name: Stop MinIO
+        if: always()
+        run: docker rm --force tuddofs-s3-integration
 
   package:
     name: Packed package smoke test
