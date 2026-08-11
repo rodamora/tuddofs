@@ -4,20 +4,20 @@
 
 ## Current status
 
-The kernel and session layers are implemented and covered by unit and PostgreSQL integration tests. The following are **not yet complete features** and are not promised as production-ready in this release:
+The kernel and session layers are implemented and covered by unit and PostgreSQL integration tests. This release includes governed mounts, branch and commit history, merge and merge resolution, restore, tags, pinning, garbage collection, and verification.
+
+The following are intentionally not promised features of this release:
 
 - a sync engine for external workspaces;
-- merge workflows;
-- restore, tags, and pin operations;
 - streaming large-blob reads and writes.
 
-The public API may contain experimental hooks around some of these areas while the contracts are being finished. Do not build a production workflow around them yet.
+These boundaries are reflected in the exported API; do not build a production workflow around capabilities that are not listed there.
 
 ## Requirements
 
 - Node.js 20 or newer
-- PostgreSQL 16 or newer
-- PostgreSQL's `pg` driver (installed as the package runtime dependency)
+- PostgreSQL 13 or newer
+- A PostgreSQL-compatible driver and pool supplied by the host application. The examples use `pg`, but `tuddofs` keeps it out of its runtime dependencies so hosts can use another structurally compatible pool.
 - Optional object storage implementing the exported `BlobStore` interface
 
 ## Install
@@ -30,25 +30,67 @@ npm install tuddofs pg
 
 ## Quickstart
 
-The repository includes a small demo that creates a tenant, opens a governed session, writes and edits a file, reads it back, and demonstrates mount confinement. Run it against a disposable PostgreSQL container:
+Run this from an empty directory. It installs the published package and its example PostgreSQL driver; no repository checkout or build step is required:
 
 ```bash
-npm install
-npm run build
+set -eu
+PORT="${TUDDOFS_QUICKSTART_PORT:-55771}"
+CONTAINER="tuddofs-quickstart-$$"
+WORKDIR="$(mktemp -d)"
+trap 'docker rm --force "$CONTAINER" >/dev/null 2>&1 || true; rm -rf "$WORKDIR"' EXIT
 
-docker run --rm --detach --name tuddofs-quickstart \
+cd "$WORKDIR"
+npm init --yes
+npm install tuddofs pg
+
+cat > demo.mjs <<'EOF'
+import { Pool } from 'pg'
+import { createDirectAdapter, createTuddoFs } from 'tuddofs'
+
+const pool = new Pool({ connectionString: process.env.TUDDOFS_DATABASE_URL })
+const tenant = 'quickstart'
+const mount = 'project:notes'
+const fs = createTuddoFs({
+  pool,
+  grants: {
+    resolve(actor, requestedMount) {
+      return Promise.resolve(
+        actor.tenant === tenant && requestedMount.key === mount
+          ? { read: true, write: 'direct' }
+          : { read: false, write: 'none' },
+      )
+    },
+  },
+})
+
+try {
+  await fs.migrate()
+  const session = await fs.open({
+    actor: { id: 'quickstart-agent', tenant },
+    sessionId: 'quickstart-run',
+    mounts: [{ key: mount }],
+  })
+  const tools = createDirectAdapter(session)
+  await tools.write_file({ path: `${mount}:/notes/today.md`, content: 'Ship safely.\n' })
+  console.log(await tools.read_file({ path: `${mount}:/notes/today.md` }))
+} finally {
+  await pool.end()
+}
+EOF
+
+docker run --rm --detach --name "$CONTAINER" \
   --env POSTGRES_USER=tuddofs \
   --env POSTGRES_PASSWORD=tuddofs \
   --env POSTGRES_DB=tuddofs_it \
-  --publish 55434:5432 \
+  --publish "$PORT:5432" \
   postgres:16-alpine
-
-until docker exec tuddofs-quickstart pg_isready -U tuddofs -d tuddofs_it >/dev/null 2>&1; do sleep 1; done
-TUDDOFS_DATABASE_URL=postgresql://tuddofs:tuddofs@127.0.0.1:55434/tuddofs_it npm run demo
-docker rm --force tuddofs-quickstart
+until docker exec "$CONTAINER" pg_isready -U tuddofs -d tuddofs_it >/dev/null 2>&1; do sleep 1; done
+TUDDOFS_DATABASE_URL="postgresql://tuddofs:tuddofs@127.0.0.1:${PORT}/tuddofs_it" node demo.mjs
 ```
 
-The final command prints JSON containing the edited file, its listing, and `confined: true`. For an application, import from the package entry point after building or installing it:
+The final command prints the file read through the governed session. The `grants` resolver in this example is the host application's policy boundary; see [Security model](#security-model).
+
+For an application, the same setup can be embedded in your service code:
 
 ```ts
 import { Pool } from 'pg'
@@ -104,15 +146,21 @@ Writes create immutable content-addressed blobs, trees, and commits. Tree and co
 
 `fork` creates or reuses a tenant-and-mount branch for an agent session. The branch records provenance such as agent kind, thread ID, run ID, and author. An opened session gives the executing agent only the mounts and paths granted to its actor; it does not expose the host application's other data.
 
+## Security model
+
+The host-supplied grant resolver is the policy authority and a trust boundary: `tuddofs` does not infer permissions from a caller's mount list or actor claims. It is consulted at the filesystem boundary for each protected operation. A resolver result is cached only within the process, for at most 30 seconds by default, so a revocation can have a bounded 30-second enforcement window. Call `fs.invalidate(actorId, mountKey, tenant)` when a host revokes access to clear the matching cache entries immediately.
+
+Authorization fails closed. Resolver exceptions, timeouts, malformed results, and omitted permissions become denial rather than ambient access. Keep the resolver close to the host authorization system, and treat its inputs and outputs as security-sensitive. The migration also requires permission to create and inspect the package-owned `tuddo_*` tables in the configured schema; it claims that namespace for the package and should not be shared with unrelated tables.
+
 ## API surface
 
 The package entry point exports:
 
-- `createTuddoFs(options)` — construct the kernel with a `pg` pool, grants, optional blob storage, and lifecycle hooks.
+- `createTuddoFs(options)` — construct the kernel with a PostgreSQL-compatible pool, required grants, optional blob storage, and lifecycle hooks.
 - `migrate()` and `tuddoFsDdl` — create or inspect the package-owned `tuddo_*` schema.
 - Kernel operations — `fork`, `read`, `write`, `delete`, `gc`, and `verify`.
 - `open(input)` — create a session with an actor, session ID, and mount list.
-- Session file operations — `read`, `readBytes`, `write`, `edit`, `list`, `glob`, `stat`, `delete`, `history`, `timeline`, and `diff`.
+- Session file operations — `read`, `readBytes`, `write`, `edit`, `list`, `glob`, `stat`, `delete`, `history`, `timeline`, `diff`, `merge`, `resolveMerge`, `restore`, `tag`, and `discard`.
 - `createDirectAdapter(session)` — expose the session's basic file operations as direct tool-shaped functions for an agent loop.
 - `BlobStore` and related types — integrate object storage for blobs that do not fit the inline threshold.
 - Deterministic hashing helpers — `sha256`, `treePreimage`, `hashTree`, `commitPreimage`, and `hashCommit`.
@@ -128,7 +176,7 @@ Unit tests are hermetic and do not require PostgreSQL:
 npm test
 ```
 
-Integration tests require a disposable PostgreSQL 16 container. They use `TUDDOFS_DATABASE_URL` and verify that migrations create exactly these public tables:
+Integration tests require a disposable PostgreSQL 13 or newer container. They use `TUDDOFS_DATABASE_URL` and, with the default schema, verify that migrations create exactly these `tuddo_*` tables:
 
 ```text
 tuddo_blobs
@@ -147,10 +195,10 @@ docker run --rm --detach --name tuddofs-it \
   --env POSTGRES_USER=tuddofs \
   --env POSTGRES_PASSWORD=tuddofs \
   --env POSTGRES_DB=tuddofs_it \
-  --publish 55434:5432 \
+  --publish "${TUDDOFS_IT_PORT:-55771}:5432" \
   postgres:16-alpine
 until docker exec tuddofs-it pg_isready -U tuddofs -d tuddofs_it >/dev/null 2>&1; do sleep 1; done
-TUDDOFS_DATABASE_URL=postgresql://tuddofs:tuddofs@127.0.0.1:55434/tuddofs_it npm run test:integration
+TUDDOFS_DATABASE_URL="postgresql://tuddofs:tuddofs@127.0.0.1:${TUDDOFS_IT_PORT:-55771}/tuddofs_it" npm run test:integration
 docker rm --force tuddofs-it
 ```
 

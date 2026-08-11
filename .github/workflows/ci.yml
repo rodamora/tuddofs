@@ -32,6 +32,8 @@ jobs:
         run: npm run lint
       - name: Typecheck
         run: npm run typecheck
+      - name: Build
+        run: npm run build
       - name: Unit tests
         run: npm test
 
@@ -60,3 +62,35 @@ jobs:
         run: npm ci
       - name: PostgreSQL integration tests
         run: npm run test:integration
+
+  package:
+    name: Packed package smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Build
+        run: npm run build
+      - name: Pack
+        id: pack
+        run: |
+          filename="$(npm pack --pack-destination "$RUNNER_TEMP" --json | node -e "let s='';process.stdin.on('data', d => s += d).on('end', () => process.stdout.write(JSON.parse(s)[0].filename))")"
+          tarball="$RUNNER_TEMP/$filename"
+          echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
+      - name: Install packed package in a scratch project
+        env:
+          TUDDOFS_TARBALL: ${{ steps.pack.outputs.tarball }}
+        run: |
+          set -eu
+          scratch="$(mktemp -d)"
+          cd "$scratch"
+          npm init --yes
+          npm install "$TUDDOFS_TARBALL"
+          node --input-type=module -e "const pkg = await import('tuddofs'); if (typeof pkg.createTuddoFs !== 'function') throw new Error('createTuddoFs export missing')"

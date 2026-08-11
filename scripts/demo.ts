@@ -11,10 +11,12 @@ const mount = 'project:demo'
 const fs = createTuddoFs({
   pool,
   grants: {
-    async resolve(actor, mountRef) {
-      return actor.id === 'demo-user' && actor.tenant === tenant && mountRef.key === mount
-        ? { read: true, write: 'direct' }
-        : { read: false, write: 'none' }
+    resolve(actor, mountRef) {
+      return Promise.resolve(
+        actor.id === 'demo-user' && actor.tenant === tenant && mountRef.key === mount
+          ? { read: true, write: 'direct' as const }
+          : { read: false, write: 'none' as const },
+      )
     },
   },
 })
