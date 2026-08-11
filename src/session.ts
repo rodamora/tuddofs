@@ -46,7 +46,7 @@ export type MountSpec =
     }
   | { readonly key: string; readonly virtual: VirtualMountHandler }
 
-/** Inputs used to open an executing actor's multi-mount session. */
+/** Inputs for a governed multi-mount session; mount-string shorthand is defined by architecture §6.2. */
 export interface OpenInput {
   readonly actor: Actor
   readonly sessionId: string
@@ -152,7 +152,7 @@ type MergeAttemptResult =
   | 'pendingApproval'
   | { readonly conflicts: Extract<MergeResult, { status: 'conflicts' }>['conflicts'] }
 
-/** File operations bound to one mount and accepting plain absolute paths (§6.2). */
+/** File and history operations bound to a mount; the handle/plain-path split is required by architecture §6.2. */
 export interface MountFileSystem {
   read(path: string): Promise<string>
   readBytes(path: string): Promise<Buffer>
@@ -165,7 +165,7 @@ export interface MountFileSystem {
   history(path: string): Promise<readonly HistoryRecord[]>
 }
 
-/** File and history operations exposed by an opened session. */
+/** Open-session metadata and history controls defined by architecture §6.2. */
 export interface SessionFileSystem {
   readonly actor: Actor
   readonly sessionId: string
@@ -220,15 +220,6 @@ function asParentArray(value: unknown): string[] {
 
 function bytesFor(value: Buffer | Uint8Array | string): Buffer {
   return Buffer.isBuffer(value) ? value : Buffer.from(value)
-}
-
-function pathForAddress(address: string, context?: Partial<ErrorContext>): { mountKey: string; path: string } {
-  const separator = address.indexOf(':/')
-  if (separator <= 0) throw new InvalidPathError(address, 'must be addressed as mount:/path', context)
-  return {
-    mountKey: address.slice(0, separator),
-    path: address.slice(separator + 1),
-  }
 }
 
 function globRegex(pattern: string): RegExp {
@@ -325,20 +316,19 @@ export function createSessionApi(kernel: SessionKernel, options: TuddoFsOptions)
         mounts.set(key, { key, mode, ref: fork.ref, fork })
       }
 
-      const mountFor = (address: string, allowRoot = false): { mount: Mount; path: string } => {
-        const parsed = pathForAddress(address, { tenant: input.actor.tenant })
-        const mount = mounts.get(parsed.mountKey)
+      const mountFor = (mountKey: string, rawPath: string, allowRoot = false): { mount: Mount; path: string } => {
+        const mount = mounts.get(mountKey)
         if (!mount)
-          throw new NotFoundError(`Mount not found: ${parsed.mountKey}`, {
+          throw new NotFoundError(`Mount not found: ${mountKey}`, {
             tenant: input.actor.tenant,
-            mount: parsed.mountKey,
+            mount: mountKey,
           })
         const path =
-          allowRoot && parsed.path === '/'
+          allowRoot && rawPath === '/'
             ? '/'
-            : validatePath(parsed.path, {
+            : validatePath(rawPath, {
                 tenant: input.actor.tenant,
-                mount: parsed.mountKey,
+                mount: mountKey,
               })
         return { mount, path }
       }
@@ -507,8 +497,8 @@ export function createSessionApi(kernel: SessionKernel, options: TuddoFsOptions)
         }
       }
 
-      const readBytes = async (address: string): Promise<Buffer> => {
-        const { mount, path } = mountFor(address)
+      const readBytes = async (mountKey: string, rawPath: string): Promise<Buffer> => {
+        const { mount, path } = mountFor(mountKey, rawPath)
         if ('virtual' in mount) return readVirtual(mount, path)
         const result =
           mount.mode === 'follow'
@@ -664,77 +654,6 @@ export function createSessionApi(kernel: SessionKernel, options: TuddoFsOptions)
         preferredMountKey?: string,
         optionsForResolution: { checkRead?: boolean } = {},
       ): Promise<{ id: string; sha: string; mountKey: string }> => {
-        const parsed = value.includes(':/') ? pathForAddress(value, { tenant: input.actor.tenant }) : null
-        if (parsed) {
-          if (preferredMountKey !== undefined && preferredMountKey !== parsed.mountKey)
-            throw new NotFoundError(`Commit not found in mount lineage: ${value}`, {
-              tenant: input.actor.tenant,
-              mount: preferredMountKey,
-              path: parsed.path,
-            })
-          const mount = mounts.get(parsed.mountKey)
-          if (!mount)
-            throw new NotFoundError(`Mount not found: ${parsed.mountKey}`, {
-              tenant: input.actor.tenant,
-              mount: parsed.mountKey,
-              path: parsed.path,
-            })
-          if ('virtual' in mount)
-            throw new NotFoundError('Virtual mount has no commits', {
-              tenant: input.actor.tenant,
-              mount: parsed.mountKey,
-              path: parsed.path,
-            })
-          if (optionsForResolution.checkRead !== false) await ensureRead(mount, { bypassCache: true })
-          if (mount.mode !== 'follow') {
-            const pinned = await pinnedRef(mount)
-            const client = await options.pool.connect()
-            try {
-              const result = await client.query<{ commit_sha: string }>(
-                'SELECT commit_sha FROM tuddo_commits WHERE tenant = $1 AND id = $2::bigint',
-                [input.actor.tenant, pinned.commitId],
-              )
-              const row = result.rows[0]
-              if (!row)
-                throw new NotFoundError(`Commit not found: ${value}`, {
-                  tenant: input.actor.tenant,
-                  mount: parsed.mountKey,
-                  path: parsed.path,
-                })
-              return {
-                id: pinned.commitId,
-                sha: row.commit_sha,
-                mountKey: mount.key,
-              }
-            } finally {
-              client.release()
-            }
-          }
-          const client = await options.pool.connect()
-          try {
-            const result = await client.query<{ commit_sha: string }>(
-              `SELECT c.commit_sha
-               FROM tuddo_refs r JOIN tuddo_commits c ON c.id = r.commit_id
-               WHERE r.tenant = $1 AND r.name = $2`,
-              [input.actor.tenant, refFor(mount)],
-            )
-            const row = result.rows[0]
-            if (!row)
-              throw new NotFoundError(`Commit not found: ${value}`, {
-                tenant: input.actor.tenant,
-                mount: parsed.mountKey,
-                path: parsed.path,
-              })
-            const confined = await assertCommitInMountLineage(client, mount.key, row.commit_sha)
-            return {
-              id: confined.id,
-              sha: confined.commit_sha,
-              mountKey: mount.key,
-            }
-          } finally {
-            client.release()
-          }
-        }
         const candidates = [...mounts.values()].filter((mount): mount is RefMount => !('virtual' in mount))
         for (const mount of candidates) {
           if (preferredMountKey !== undefined && preferredMountKey !== mount.key) continue
@@ -841,7 +760,23 @@ export function createSessionApi(kernel: SessionKernel, options: TuddoFsOptions)
           ...(path === undefined ? {} : { path }),
         })
       }
-      const compoundSession: SessionFileSystem & MountFileSystem = {
+      type SessionOperations = SessionFileSystem & {
+        read(mountKey: string, path: string): Promise<string>
+        readBytes(mountKey: string, path: string): Promise<Buffer>
+        write(
+          mountKey: string,
+          path: string,
+          value: Buffer | Uint8Array | string,
+          options?: WriteOptions,
+        ): Promise<WriteResult>
+        edit(mountKey: string, path: string, edits: readonly TextEdit[], options?: EditOptions): Promise<WriteResult>
+        list(mountKey: string, dir: string): Promise<readonly SessionEntry[]>
+        glob(mountKey: string, pattern: string): Promise<readonly SessionEntry[]>
+        stat(mountKey: string, path: string): Promise<SessionStat>
+        delete(mountKey: string, path: string, options?: { ifSha?: string | null }): Promise<DeleteResult>
+        history(mountKey: string, path: string): Promise<readonly HistoryRecord[]>
+      }
+      const sessionOps: SessionOperations = {
         actor: input.actor,
         sessionId: input.sessionId,
         mount(key: string) {
@@ -851,25 +786,29 @@ export function createSessionApi(kernel: SessionKernel, options: TuddoFsOptions)
               tenant: input.actor.tenant,
               mount: key,
             })
-          const prefix = (path: string) => `${key}:${path}`
           return {
-            read: (path: string) => compoundSession.read(prefix(path)),
-            readBytes: (path: string) => compoundSession.readBytes(prefix(path)),
-            write: (path, value, writeOptions) => compoundSession.write(prefix(path), value, writeOptions),
-            edit: (path, edits, editOptions) => compoundSession.edit(prefix(path), edits, editOptions),
-            list: (path: string) => compoundSession.list(prefix(path)),
-            glob: (pattern: string) => compoundSession.glob(prefix(pattern)),
-            stat: (path: string) => compoundSession.stat(prefix(path)),
-            delete: (path, deleteOptions) => compoundSession.delete(prefix(path), deleteOptions),
-            history: (path: string) => compoundSession.history(prefix(path)),
+            read: (path: string) => sessionOps.read(key, path),
+            readBytes: (path: string) => sessionOps.readBytes(key, path),
+            write: (path, value, writeOptions) => sessionOps.write(key, path, value, writeOptions),
+            edit: (path, edits, editOptions) => sessionOps.edit(key, path, edits, editOptions),
+            list: (path: string) => sessionOps.list(key, path),
+            glob: (pattern: string) => sessionOps.glob(key, pattern),
+            stat: (path: string) => sessionOps.stat(key, path),
+            delete: (path, deleteOptions) => sessionOps.delete(key, path, deleteOptions),
+            history: (path: string) => sessionOps.history(key, path),
           }
         },
-        async read(address: string) {
-          return (await readBytes(address)).toString('utf8')
+        async read(mountKey: string, path: string) {
+          return (await sessionOps.readBytes(mountKey, path)).toString('utf8')
         },
-        readBytes,
-        async write(address: string, value: Buffer | Uint8Array | string, writeOptions: WriteOptions = {}) {
-          const { mount, path } = mountFor(address)
+        readBytes: (mountKey: string, path: string) => readBytes(mountKey, path),
+        async write(
+          mountKey: string,
+          rawPath: string,
+          value: Buffer | Uint8Array | string,
+          writeOptions: WriteOptions = {},
+        ) {
+          const { mount, path } = mountFor(mountKey, rawPath)
           const bytes = bytesFor(value)
           if ('virtual' in mount) {
             if (!mount.virtual.write)
@@ -914,9 +853,9 @@ export function createSessionApi(kernel: SessionKernel, options: TuddoFsOptions)
             runId: input.attribution?.runId,
           })
         },
-        async edit(address: string, edits: readonly TextEdit[], editOptions = {}) {
-          const { mount, path } = mountFor(address)
-          const old = await readBytes(address)
+        async edit(mountKey: string, rawPath: string, edits: readonly TextEdit[], editOptions: EditOptions = {}) {
+          const { mount, path } = mountFor(mountKey, rawPath)
+          const old = await readBytes(mountKey, rawPath)
           const currentSha = sha256(old)
           if (editOptions.ifSha !== undefined && editOptions.ifSha !== currentSha)
             throw new PreconditionFailedError(editOptions.ifSha, currentSha, {
@@ -926,38 +865,40 @@ export function createSessionApi(kernel: SessionKernel, options: TuddoFsOptions)
             })
           let text = old.toString('utf8')
           for (const edit of edits) {
-            const count = edit.oldText.length === 0 ? text.length + 1 : text.split(edit.oldText).length - 1
+            let count = 0
+            if (edit.oldText.length === 0) count = text.length + 1
+            else {
+              let offset = 0
+              while (true) {
+                const match = text.indexOf(edit.oldText, offset)
+                if (match === -1) break
+                count += 1
+                offset = match + edit.oldText.length
+              }
+            }
             if (!edit.replaceAll && count !== 1)
               throw new EditMatchError(count, { tenant: input.actor.tenant, mount: mount.key, path })
             text = edit.replaceAll
               ? text.replaceAll(edit.oldText, edit.newText)
               : text.replace(edit.oldText, edit.newText)
           }
-          return compoundSession.write(address, text, { ifSha: currentSha })
+          return sessionOps.write(mountKey, rawPath, text, { ifSha: currentSha })
         },
-        async list(address: string) {
-          const { mount, path } = mountFor(address, true)
+        async list(mountKey: string, rawPath: string) {
+          const { mount, path } = mountFor(mountKey, rawPath, true)
           if ('virtual' in mount) return mount.virtual.list(path, input.actor)
           await ensureRead(mount)
           return listRef(mount, path)
         },
-        async glob(address: string) {
-          const { mountKey, path } = pathForAddress(address, {
-            tenant: input.actor.tenant,
-          })
-          const mount = mounts.get(mountKey)
-          if (!mount)
-            throw new NotFoundError(`Mount not found: ${mountKey}`, {
-              tenant: input.actor.tenant,
-              mount: mountKey,
-            })
+        async glob(mountKey: string, pattern: string) {
+          const { mount, path } = mountFor(mountKey, pattern)
           if (!('virtual' in mount)) await ensureRead(mount)
           const matcher = globRegex(path)
           const entries = 'virtual' in mount ? await allVirtualEntries(mount) : await allRefEntries(mount)
           return entries.filter(entry => matcher.test(entry.path))
         },
-        async stat(address: string) {
-          const { mount, path } = mountFor(address)
+        async stat(mountKey: string, rawPath: string) {
+          const { mount, path } = mountFor(mountKey, rawPath)
           if ('virtual' in mount) {
             const bytes = await readVirtual(mount, path)
             return {
@@ -984,8 +925,8 @@ export function createSessionApi(kernel: SessionKernel, options: TuddoFsOptions)
             mode: result.mode,
           }
         },
-        async delete(address: string, deleteOptions = {}) {
-          const { mount, path } = mountFor(address)
+        async delete(mountKey: string, rawPath: string, deleteOptions: { ifSha?: string | null } = {}) {
+          const { mount, path } = mountFor(mountKey, rawPath)
           if ('virtual' in mount) {
             throw new PermissionDeniedError('Virtual mount does not support delete', {
               tenant: input.actor.tenant,
@@ -1011,8 +952,8 @@ export function createSessionApi(kernel: SessionKernel, options: TuddoFsOptions)
             runId: input.attribution?.runId,
           })
         },
-        async history(address: string) {
-          const { mount, path } = mountFor(address)
+        async history(mountKey: string, rawPath: string) {
+          const { mount, path } = mountFor(mountKey, rawPath)
           if ('virtual' in mount) return unsupportedVirtual(mount.key, path)
           await ensureRead(mount, { bypassCache: true })
           const client = await options.pool.connect()
@@ -1352,15 +1293,15 @@ export function createSessionApi(kernel: SessionKernel, options: TuddoFsOptions)
         },
       }
       const session: SessionFileSystem = {
-        actor: compoundSession.actor,
-        sessionId: compoundSession.sessionId,
-        mount: key => compoundSession.mount(key),
-        timeline: filter => compoundSession.timeline(filter),
-        diff: (a, b) => compoundSession.diff(a, b),
-        merge: mergeOptions => compoundSession.merge(mergeOptions),
-        restore: (mountKey, at) => compoundSession.restore(mountKey, at),
-        tag: (mountKey, label) => compoundSession.tag(mountKey, label),
-        discard: () => compoundSession.discard(),
+        actor: sessionOps.actor,
+        sessionId: sessionOps.sessionId,
+        mount: key => sessionOps.mount(key),
+        timeline: filter => sessionOps.timeline(filter),
+        diff: (a, b) => sessionOps.diff(a, b),
+        merge: mergeOptions => sessionOps.merge(mergeOptions),
+        restore: (mountKey, at) => sessionOps.restore(mountKey, at),
+        tag: (mountKey, label) => sessionOps.tag(mountKey, label),
+        discard: () => sessionOps.discard(),
       }
       return session
       async function mergeRef(mount: RefMount, mergeOptions: { approver?: Actor } = {}): Promise<MergeAttemptResult> {

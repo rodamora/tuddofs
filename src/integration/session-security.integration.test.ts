@@ -586,6 +586,20 @@ test('merge refreshes a stale denied grant after it is restored while waiting', 
   }
 })
 
+test('unified merge reports pending approval for a staged mount without an approver', async () => {
+  const fs = fsWith(() => ({ read: true, write: 'staged' }))
+  const session = await fs.open({
+    actor,
+    sessionId: 'merge-pending-approval',
+    mounts: [{ key: 'scratch' }],
+  })
+  await session.mount('scratch').write('/staged.txt', 'staged')
+
+  assert.deepEqual(await session.merge({ mounts: ['scratch'] }), {
+    scratch: { status: 'pendingApproval' },
+  })
+})
+
 test('merge records the other mount when a settled mount throws', async () => {
   let pWrite: 'direct' | 'none' = 'direct'
   const fs = createTuddoFs({

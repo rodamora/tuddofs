@@ -2,6 +2,7 @@ import type { DeleteResult, WriteResult } from './kernel.js'
 import type { MountFileSystem, SessionEntry, SessionFileSystem, SessionStat, TextEdit } from './session.js'
 import { InvalidPathError } from './validation.js'
 
+/** Compound-address file tools retained at the adapter boundary by architecture §6.2. */
 export interface DirectAdapter {
   read_file(input: { path: string }): Promise<string>
   read_bytes(input: { path: string }): Promise<Buffer>

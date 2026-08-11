@@ -111,6 +111,17 @@ test('mount handles use plain absolute paths without repairing relative paths', 
   assert.deepEqual(paths, ['/note.txt'])
   await assert.rejects(mount.read('note.txt'), InvalidPathError)
 })
+test('mount handles reject compound addresses as plain paths', async () => {
+  const { session } = await openVirtualSession('hello')
+
+  await assert.rejects(
+    session.mount('live:data').read('live:data:/note.txt'),
+    (error: unknown) =>
+      error instanceof InvalidPathError &&
+      error.message.includes('must start with /') &&
+      !error.message.includes('must be addressed as mount:/path'),
+  )
+})
 
 test('opened sessions do not expose compound-address file methods', async () => {
   const { session } = await openVirtualSession('hello')
