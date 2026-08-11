@@ -82,6 +82,11 @@ export interface TextEdit {
   readonly end: number
   readonly text: string
 }
+/** Optional metadata carried by host adapters alongside a write. */
+export interface WriteOptions {
+  readonly ifSha?: string | null
+  readonly mimeType?: string
+}
 
 /** Optimistic precondition options for `edit`. @see spec §6 */
 export interface EditOptions {
@@ -130,7 +135,7 @@ export interface DiffRecord {
   readonly afterMode?: number
 }
 
-/** Per-mount merge outcome; conflicts are data, not thrown errors. @see spec §4.7 */
+/** Per-mount merge outcome; conflicts are data, not thrown exceptions. @see spec §4.7 */
 export type MergeResult =
   | 'merged'
   | 'unauthorized'
@@ -144,7 +149,7 @@ export interface SessionFileSystem {
   readonly sessionId: string
   read(path: string): Promise<string>
   readBytes(path: string): Promise<Buffer>
-  write(path: string, bytes: Buffer | Uint8Array | string, options?: { ifSha?: string | null }): Promise<WriteResult>
+  write(path: string, bytes: Buffer | Uint8Array | string, options?: WriteOptions): Promise<WriteResult>
   edit(path: string, edits: readonly TextEdit[], options?: EditOptions): Promise<WriteResult>
   list(dir: string): Promise<readonly SessionEntry[]>
   glob(pattern: string): Promise<readonly SessionEntry[]>
@@ -747,7 +752,7 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
           return (await readBytes(address)).toString('utf8')
         },
         readBytes,
-        async write(address: string, value: Buffer | Uint8Array | string, writeOptions = {}) {
+        async write(address: string, value: Buffer | Uint8Array | string, writeOptions: WriteOptions = {}) {
           const { mount, path } = mountFor(address)
           const bytes = bytesFor(value)
           if ('virtual' in mount) {

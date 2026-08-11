@@ -14,7 +14,8 @@
     "node": ">=20"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json --incremental false",
+    "prepare": "tsc -p tsconfig.json --incremental false",
     "test": "NODE_ENV=test node --import tsx --test 'src/**/__tests__/**/*.test.ts'",
     "test:integration": "AGENT_FS_DATABASE_URL=${AGENT_FS_DATABASE_URL:-postgresql://agentfs:agentfs@127.0.0.1:55434/agentfs_it} node --import tsx --test --test-concurrency=1 'src/integration/**/*.integration.test.ts'",
     "demo": "node --import tsx scripts/demo.ts",

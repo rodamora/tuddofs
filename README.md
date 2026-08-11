@@ -61,6 +61,15 @@ Inside this monorepo: `"@cowork/agent-fs": "workspace:*"`.
 
 ## Host setup
 
+### Cowork THREAD pilot mount
+
+Cowork's opt-in THREAD pilot exposes its session-backed provider at `/agent-fs`.
+This namespace is intentionally distinct from the live sandbox at `/sandbox`;
+the pilot does not shadow sandbox exec, Office, or `OutputSync` paths. The
+`AGENT_FS_THREAD_PILOT_ENABLED=true` flag only enables the provider and its
+post-commit hooks; sandbox synchronization remains a later `SyncTarget`
+milestone.
+
 Wire it once at boot. The package owns its tables (`afs_*`) via its own migrations — they never enter your ORM schema (§10b.2).
 
 ```ts

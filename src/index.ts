@@ -45,6 +45,7 @@ export type {
   DiffRecord,
   EditOptions,
   HistoryRecord,
+  MergeResult,
   MountSpec,
   OpenInput,
   SessionEntry,
@@ -55,7 +56,7 @@ export type {
   TimelineRecord,
   VirtualEntry,
   VirtualMountHandler,
-  MergeResult,
+  WriteOptions,
 } from './session.js'
 export {
   AgentFsError,
