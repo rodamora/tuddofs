@@ -4,7 +4,8 @@ import test, { after, before, beforeEach } from 'node:test'
 
 import { Pool } from 'pg'
 
-import { createTuddoFs, migrate, type BlobStore } from '../index.js'
+import type { BlobStore } from '../index.js'
+import { createTuddoFs, migrate } from '../internal.js'
 
 const pool = new Pool({ connectionString: process.env.TUDDOFS_DATABASE_URL })
 const tenant = 'gc-verify-tenant'

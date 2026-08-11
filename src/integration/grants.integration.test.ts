@@ -2,7 +2,8 @@ import assert from 'node:assert/strict'
 import test, { after, before, beforeEach } from 'node:test'
 
 import { Pool } from 'pg'
-import { GrantResolverError, PermissionDeniedError, createTuddoFs, migrate } from '../index.js'
+import { GrantResolverError, PermissionDeniedError, createTuddoFs } from '../index.js'
+import { migrate } from '../internal.js'
 
 const pool = new Pool({ connectionString: process.env.TUDDOFS_DATABASE_URL })
 const tenant = 'grants-integration'
@@ -68,11 +69,11 @@ test('fork and merge bypass the grant cache, and invalidation is actor+mount sco
   })
   assert.ok(calls >= 2)
   const beforeMerge = calls
-  assert.deepEqual(await session.merge(), { 'project:grant': 'merged' })
+  assert.deepEqual(await session.merge(), { 'project:grant': { status: 'merged' } })
   assert.ok(calls > beforeMerge)
   mode = 'none'
-  await assert.rejects(session.write('project:grant:/denied', 'x'), PermissionDeniedError)
-  assert.deepEqual(await session.merge(), { 'project:grant': 'merged' })
+  await assert.rejects(session.mount('project:grant').write('/denied', 'x'), PermissionDeniedError)
+  assert.deepEqual(await session.merge(), { 'project:grant': { status: 'merged' } })
 })
 
 test('permission revocation is enforced at write time and system actor cannot open a session', async () => {
@@ -88,7 +89,7 @@ test('permission revocation is enforced at write time and system actor cannot op
     mounts: [{ key: 'project:grant' }],
   })
   mode = 'none'
-  await assert.rejects(session.write('project:grant:/revoked', 'x'), PermissionDeniedError)
+  await assert.rejects(session.mount('project:grant').write('/revoked', 'x'), PermissionDeniedError)
   await assert.rejects(
     fs.open({
       actor: { id: 'system', tenant },

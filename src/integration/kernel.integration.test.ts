@@ -4,14 +4,8 @@ import test, { after, before, beforeEach } from 'node:test'
 
 import { Pool } from 'pg'
 
-import {
-  BranchSettledError,
-  NotFoundError,
-  PreconditionFailedError,
-  RefConflictError,
-  createTuddoFs,
-  migrate,
-} from '../index.js'
+import { BranchSettledError, NotFoundError, PreconditionFailedError, RefConflictError } from '../index.js'
+import { createTuddoFs, migrate } from '../internal.js'
 
 const pool = new Pool({ connectionString: process.env.TUDDOFS_DATABASE_URL })
 const tenant = 'integration-tenant'

@@ -1,51 +1,57 @@
-export { commitPreimage, hashCommit, hashTree, sha256, treePreimage } from './hashing.js'
-export type { CommitHashInput, TreeEntry } from './hashing.js'
-export {
-  InvalidCommitTimestampError,
-  InvalidMountKeyError,
-  InvalidPathError,
-  validateMountKey,
-  validatePath,
-} from './validation.js'
-export { migrate, tuddoFsDdl } from './migration.js'
-export type { TuddoFsClient, TuddoFsMigrationOptions, TuddoFsPool } from './migration.js'
-export { createTuddoFs } from './kernel.js'
+import { createTuddoFs as createKernel, type TuddoFs, type TuddoFsOptions } from './kernel.js'
+
+/** Construct the Tier-1 host API defined by architecture §6.2. */
+export function createTuddoFs(options: TuddoFsOptions): TuddoFs {
+  const kernel = createKernel(options)
+  return {
+    migrate: kernel.migrate,
+    open: kernel.open,
+    gc: kernel.gc,
+    verify: kernel.verify,
+    invalidate: kernel.invalidate,
+  }
+}
 export { createDirectAdapter } from './direct.js'
 export type { DirectAdapter } from './direct.js'
-export { GrantController } from './grants.js'
-export type { Grant, GrantControllerOptions } from './grants.js'
+export {
+  BranchSettledError,
+  EditMatchError,
+  GrantResolverError,
+  InvariantError,
+  MergePendingApprovalError,
+  NotFoundError,
+  PermissionDeniedError,
+  PreconditionFailedError,
+  RefConflictError,
+  SchemaDriftError,
+  StorageError,
+} from './errors.js'
+export { InvalidCommitTimestampError, InvalidMountKeyError, InvalidPathError } from './validation.js'
+export type { ErrorContext, KernelError } from './errors.js'
 export type {
   Actor,
-  TuddoFsKernel,
-  TuddoFsLogger,
-  TuddoFsOptions,
   BlobObject,
   BlobStore,
   CommitEvent,
-  DeleteInput,
-  DeleteResult,
-  ForkInput,
-  ForkResult,
-  RestoreInput,
-  RestoreResult,
   GcOptions,
   GcReport,
-  GrantResolutionOptions,
   GrantResolver,
-  ReadInput,
-  ReadResult,
+  DeleteResult,
+  RestoreResult,
+  TuddoFs,
+  TuddoFsLogger,
+  TuddoFsOptions,
+  WriteResult,
   VerifyFinding,
   VerifyOptions,
   VerifyReport,
-  WriteInput,
-  WriteMode,
-  WriteResult,
 } from './kernel.js'
 export type {
   DiffRecord,
   EditOptions,
   HistoryRecord,
   MergeResult,
+  MountFileSystem,
   MountSpec,
   OpenInput,
   SessionEntry,
@@ -58,17 +64,4 @@ export type {
   VirtualMountHandler,
   WriteOptions,
 } from './session.js'
-export {
-  TuddoFsError,
-  BranchSettledError,
-  GrantResolverError,
-  InvariantError,
-  MergePendingApprovalError,
-  NotFoundError,
-  PermissionDeniedError,
-  PreconditionFailedError,
-  RefConflictError,
-  SchemaDriftError,
-  StorageError,
-} from './errors.js'
-export type { ErrorContext, KernelError } from './errors.js'
+export type { TuddoFsClient, TuddoFsMigrationOptions, TuddoFsPool } from './migration.js'

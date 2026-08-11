@@ -269,18 +269,23 @@ export interface TuddoFsOptions {
   readonly onCommit?: (event: CommitEvent) => void | Promise<void>
 }
 
-export interface TuddoFsKernel {
-  migrate(): Promise<void>
-  gc(input?: GcOptions): Promise<GcReport>
-  verify(input?: VerifyOptions): Promise<VerifyReport>
+/** Tier-1 host operations exposed by `createTuddoFs` (§6.2). */
+export interface TuddoFs {
+  readonly migrate: () => Promise<void>
+  readonly gc: (input?: GcOptions) => Promise<GcReport>
+  readonly verify: (input?: VerifyOptions) => Promise<VerifyReport>
+  readonly invalidate: (actorId: string, mountKey?: string, tenant?: string) => void
+  readonly open: (input: OpenInput) => Promise<SessionFileSystem>
+}
+
+/** Tier-2 raw ref operations exposed only through `tuddofs/internal` (§6.2). */
+export interface TuddoFsKernel extends TuddoFs {
   fork(input: ForkInput): Promise<ForkResult | null>
   write(input: WriteInput): Promise<WriteResult>
   read(input: ReadInput): Promise<ReadResult>
   delete(input: DeleteInput): Promise<DeleteResult>
   restore(input: RestoreInput): Promise<RestoreResult>
   resolveGrant(actor: Actor, mount: { key: string }, options?: GrantResolutionOptions): Promise<Grant>
-  invalidate(actorId: string, mountKey?: string, tenant?: string): void
-  open(input: OpenInput): Promise<SessionFileSystem>
 }
 
 type QueryResult<Row extends Record<string, unknown> = Record<string, unknown>> = {

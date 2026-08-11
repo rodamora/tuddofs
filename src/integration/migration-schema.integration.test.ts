@@ -3,7 +3,7 @@ import test, { after, before } from 'node:test'
 
 import { Pool } from 'pg'
 
-import { createTuddoFs, migrate } from '../index.js'
+import { createTuddoFs, migrate } from '../internal.js'
 
 const connectionString = process.env.TUDDOFS_DATABASE_URL
 const schema = 'tuddo_schema_path_test'
