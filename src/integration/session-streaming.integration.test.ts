@@ -4,7 +4,7 @@ import { Readable } from 'node:stream'
 import { setTimeout as delay } from 'node:timers/promises'
 import test, { after, before, beforeEach } from 'node:test'
 import { Pool } from 'pg'
-import { createTuddoFs, migrate, sha256, StorageError, type BlobStore } from '../index.js'
+import { createTuddoFs, InvalidPathError, migrate, sha256, StorageError, type BlobStore } from '../index.js'
 
 const pool = new Pool({ connectionString: process.env.TUDDOFS_DATABASE_URL })
 const tenant = 'session-streaming'
@@ -296,4 +296,24 @@ test('small stream writes retain inline storage semantics', async () => {
   assert.equal(result.sizeBytes, 4n)
   assert.deepEqual([...storage.objects.keys()], [])
   assert.equal(await session.read('project:media:/tiny.txt'), 'tiny')
+})
+
+test('writeStream rejects file-directory path collisions', async () => {
+  const storage = new StreamingStore()
+  const fs = createTuddoFs({
+    pool,
+    storage,
+    inlineMaxBytes: 4,
+    grants: { resolve: async () => ({ read: true, write: 'direct' }) },
+  })
+  const session = await fs.open({ actor, sessionId: 'stream-coherence', mounts: [{ key: 'project:media' }] })
+  await session.write('project:media:/file', 'base')
+
+  await assert.rejects(
+    session.writeStream('project:media:/file/child', Readable.from([Buffer.from('streamed child')])),
+    (error: unknown) =>
+      error instanceof InvalidPathError &&
+      error.path === '/file/child' &&
+      error.message.includes('collides with existing file /file'),
+  )
 })

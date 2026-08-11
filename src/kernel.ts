@@ -1602,6 +1602,10 @@ export function createTuddoFs(inputOptions: TuddoFsOptions): TuddoFsKernel {
         const current = heads.get(path)
         if (input.ifSha !== undefined && input.ifSha !== (current?.sha256 ?? null))
           throw new PreconditionFailedError(input.ifSha, current?.sha256 ?? null, context)
+        const collision = findPathCollision(path, heads)
+        if (collision !== undefined) {
+          throw new InvalidPathError(path, `collides with existing file ${collision}`, context)
+        }
         if (current?.sha256 === input.sha256) {
           await client.query('ROLLBACK')
           return {
