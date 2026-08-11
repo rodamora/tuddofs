@@ -1,6 +1,6 @@
 # s3-s3-adapter — reference BlobStore adapter package
 
-Status: in-progress (red commit: 2c56c71)
+Status: done (evidence: https://github.com/rodamora/tuddofs/pull/3)
 Stage: S3 (parallel-safe with everything)
 Depends on: —
 Spec: `../architecture.md` §8.4, §10 rule 3 (core ships no storage SDK)
