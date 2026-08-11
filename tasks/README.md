@@ -35,13 +35,13 @@ flowchart LR
 
 ## Board
 
-| Task | Stage | Status | Depends on |
-|---|---|---|---|
-| [s1-surface-diet](s1-surface-diet.md) | S1 pre-work | open | — |
-| [s1-tree-coherence](s1-tree-coherence.md) | S1 pre-work | open | — |
-| [s1-sync-core](s1-sync-core.md) | S1 | open | s1-surface-diet, s1-tree-coherence |
-| [s2-ssh-target](s2-ssh-target.md) | S2 | open | s1-sync-core |
-| [s3-session-streaming](s3-session-streaming.md) | S3 | open | — |
-| [s3-capture-blobs](s3-capture-blobs.md) | S3 | open | s1-sync-core |
-| [s3-s3-adapter](s3-s3-adapter.md) | S3 | open | — |
-| [s4-hardening](s4-hardening.md) | S4 | open | everything above |
+| Task                                            | Stage       | Status | Depends on                         |
+| ----------------------------------------------- | ----------- | ------ | ---------------------------------- |
+| [s1-surface-diet](s1-surface-diet.md)           | S1 pre-work | open   | —                                  |
+| [s1-tree-coherence](s1-tree-coherence.md)       | S1 pre-work | open   | —                                  |
+| [s1-sync-core](s1-sync-core.md)                 | S1          | open   | s1-surface-diet, s1-tree-coherence |
+| [s2-ssh-target](s2-ssh-target.md)               | S2          | open   | s1-sync-core                       |
+| [s3-session-streaming](s3-session-streaming.md) | S3          | done   | —                                  |
+| [s3-capture-blobs](s3-capture-blobs.md)         | S3          | open   | s1-sync-core                       |
+| [s3-s3-adapter](s3-s3-adapter.md)               | S3          | open   | —                                  |
+| [s4-hardening](s4-hardening.md)                 | S4          | open   | everything above                   |
