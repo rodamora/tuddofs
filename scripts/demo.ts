@@ -43,7 +43,7 @@ try {
   const stat = await tools.stat_file({ path: `${mount}:/notes/plan.md` })
   await tools.edit_file({
     path: `${mount}:/notes/plan.md`,
-    edits: [{ oldText: 'Draft.\n', newText: 'Draft.\nWrite through the governed session.\n' }],
+    edits: [{ oldText: '# Plan\n', newText: '# Plan\nWrite through the governed session.\n' }],
     ifSha: stat.sha256,
   })
   const text = await tools.read_file({ path: `${mount}:/notes/plan.md` })

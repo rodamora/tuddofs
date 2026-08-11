@@ -35,38 +35,36 @@ test('session file API writes, edits, lists, globs, stats, deletes, and maps err
     mounts: [{ key: 'project:docs' }],
   })
 
-  const created = await session.write('project:docs:/notes.md', 'hello')
+  const docs = session.mount('project:docs')
+  const created = await docs.write('/notes.md', 'hello')
   assert.equal(created.sizeBytes, 5n)
-  assert.equal(await session.read('project:docs:/notes.md'), 'hello')
-  assert.equal((await session.readBytes('project:docs:/notes.md')).toString(), 'hello')
-  assert.equal((await session.stat('project:docs:/notes.md')).sha256, created.sha256)
+  assert.equal(await docs.read('/notes.md'), 'hello')
+  assert.equal((await docs.readBytes('/notes.md')).toString(), 'hello')
+  assert.equal((await docs.stat('/notes.md')).sha256, created.sha256)
   assert.deepEqual(
-    (await session.list('project:docs:/')).map(entry => entry.path),
+    (await docs.list('/')).map(entry => entry.path),
     ['/notes.md'],
   )
   assert.deepEqual(
-    (await session.glob('project:docs:/**/*.md')).map(entry => entry.path),
+    (await docs.glob('/**/*.md')).map(entry => entry.path),
     ['/notes.md'],
   )
 
-  const edited = await session.edit('project:docs:/notes.md', [{ oldText: 'hello', newText: 'hello world' }], {
+  const edited = await docs.edit('/notes.md', [{ oldText: 'hello', newText: 'hello world' }], {
     ifSha: created.sha256,
   })
-  assert.equal(await session.read('project:docs:/notes.md'), 'hello world')
+  assert.equal(await docs.read('/notes.md'), 'hello world')
   assert.notEqual(edited.commitSha, created.commitSha)
-  await assert.rejects(
-    session.write('project:docs:/notes.md', 'bad', { ifSha: created.sha256 }),
-    PreconditionFailedError,
-  )
-  assert.ok((await session.history('project:docs:/notes.md')).length >= 2)
+  await assert.rejects(docs.write('/notes.md', 'bad', { ifSha: created.sha256 }), PreconditionFailedError)
+  assert.ok((await docs.history('/notes.md')).length >= 2)
   assert.ok((await session.timeline({ runId: 'run-api' })).length >= 2)
   assert.ok((await session.diff(created.commitSha, edited.commitSha)).some(item => item.path === '/notes.md'))
 
-  await session.delete('project:docs:/notes.md')
-  await assert.rejects(session.read('project:docs:/notes.md'), NotFoundError)
-  await session.write('project:docs:/missing', 'x')
+  await docs.delete('/notes.md')
+  await assert.rejects(docs.read('/notes.md'), NotFoundError)
+  await docs.write('/missing', 'x')
   await session.discard()
-  await assert.rejects(session.write('project:docs:/notes.md', 'x'), BranchSettledError)
+  await assert.rejects(docs.write('/notes.md', 'x'), BranchSettledError)
 })
 
 test('session merge skips virtual mounts and is idempotent after completion', async () => {
@@ -93,7 +91,7 @@ test('session merge skips virtual mounts and is idempotent after completion', as
     ],
   })
 
-  await session.write('project:docs:/notes.md', 'hello')
+  await session.mount('project:docs').write('/notes.md', 'hello')
   const first = await session.merge()
   assert.deepEqual(first['project:docs'], { status: 'merged' })
   assert.equal(first['team:roster'], undefined)
@@ -133,11 +131,12 @@ test('ref mount listings use UTF-16 code-unit ordering', async () => {
     sessionId: 'session-ref-list-order',
     mounts: [{ key: 'project:docs' }],
   })
-  await session.write('project:docs:/😀', 'astral')
-  await session.write('project:docs:/z', 'letter')
+  const docs = session.mount('project:docs')
+  await docs.write('/😀', 'astral')
+  await docs.write('/z', 'letter')
 
   assert.deepEqual(
-    (await session.list('project:docs:/')).map(entry => entry.path),
+    (await docs.list('/')).map(entry => entry.path),
     ['/z', '/😀'],
   )
 })
@@ -193,9 +192,10 @@ test('virtual delete is rejected without fabricating an empty file', async () =>
     ],
   })
 
-  await assert.rejects(session.delete('team:roster:/alice.md'), PermissionDeniedError)
+  const roster = session.mount('team:roster')
+  await assert.rejects(roster.delete('/alice.md'), PermissionDeniedError)
   assert.equal(writes, 0)
-  assert.equal(await session.read('team:roster:/alice.md'), 'alice')
+  assert.equal(await roster.read('/alice.md'), 'alice')
 })
 
 test('timeline exposes commit-sha parents and path deltas including deletes', async () => {
@@ -208,9 +208,10 @@ test('timeline exposes commit-sha parents and path deltas including deletes', as
     sessionId: 'session-timeline-delta',
     mounts: [{ key: 'project:docs' }],
   })
-  await session.write('project:docs:/a.md', 'a')
-  const bWrite = await session.write('project:docs:/b.md', 'b')
-  await session.delete('project:docs:/a.md')
+  const docs = session.mount('project:docs')
+  await docs.write('/a.md', 'a')
+  const bWrite = await docs.write('/b.md', 'b')
+  await docs.delete('/a.md')
 
   const records = await session.timeline()
   const deletion = records.find(record => record.op === 'delete')
@@ -229,7 +230,7 @@ test('restore returns a dedicated tree result for created and unchanged restores
     sessionId: 'session-restore-result',
     mounts: [{ key: 'project:docs' }],
   })
-  const created = await session.write('project:docs:/notes.md', 'hello')
+  const created = await session.mount('project:docs').write('/notes.md', 'hello')
   const initial = (await session.timeline()).find(record => record.commitSha !== created.commitSha)
   assert.ok(initial)
 
@@ -278,7 +279,7 @@ test('virtual glob walks nested handler directories', async () => {
   })
 
   assert.deepEqual(
-    (await session.glob('team:roster:/**/*.md')).map(entry => entry.path),
+    (await session.mount('team:roster').glob('/**/*.md')).map(entry => entry.path),
     ['/nested/alice.md'],
   )
 })

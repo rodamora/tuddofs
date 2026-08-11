@@ -72,7 +72,7 @@ test('fork and merge bypass the grant cache, and invalidation is actor+mount sco
   assert.deepEqual(await session.merge(), { 'project:grant': { status: 'merged' } })
   assert.ok(calls > beforeMerge)
   mode = 'none'
-  await assert.rejects(session.write('project:grant:/denied', 'x'), PermissionDeniedError)
+  await assert.rejects(session.mount('project:grant').write('/denied', 'x'), PermissionDeniedError)
   assert.deepEqual(await session.merge(), { 'project:grant': { status: 'merged' } })
 })
 
@@ -89,7 +89,7 @@ test('permission revocation is enforced at write time and system actor cannot op
     mounts: [{ key: 'project:grant' }],
   })
   mode = 'none'
-  await assert.rejects(session.write('project:grant:/revoked', 'x'), PermissionDeniedError)
+  await assert.rejects(session.mount('project:grant').write('/revoked', 'x'), PermissionDeniedError)
   await assert.rejects(
     fs.open({
       actor: { id: 'system', tenant },

@@ -33,8 +33,9 @@ test('virtual session reads and lists through the executing actor', async () => 
     ],
   })
 
-  assert.equal((await session.read('team:roster:/alice.md')).toString(), 'alice')
-  assert.deepEqual(await session.list('team:roster:/'), [{ path: '/alice.md', type: 'file', sizeBytes: 5, mode: 420 }])
+  const roster = session.mount('team:roster')
+  assert.equal((await roster.read('/alice.md')).toString(), 'alice')
+  assert.deepEqual(await roster.list('/'), [{ path: '/alice.md', type: 'file', sizeBytes: 5, mode: 420 }])
   assert.deepEqual(calls, ['/alice.md:user-1', '/:user-1'])
 })
 
@@ -65,8 +66,9 @@ test('virtual mounts are read-only when handler write is absent and have no hist
     ],
   })
 
-  await assert.rejects(session.write('live:data:/x', 'x'), PermissionDeniedError)
-  await assert.rejects(session.history('live:data:/x'), NotFoundError)
+  const live = session.mount('live:data')
+  await assert.rejects(live.write('/x', 'x'), PermissionDeniedError)
+  await assert.rejects(live.history('/x'), NotFoundError)
   await assert.rejects(session.diff('live:data:/x', 'live:data:/y'), NotFoundError)
   await assert.rejects(session.restore('live:data', 'tag/live'), NotFoundError)
   await assert.rejects(session.tag('live:data', 'snapshot'), NotFoundError)
@@ -106,7 +108,7 @@ test('virtual glob entries use UTF-16 code-unit ordering', async () => {
   })
 
   assert.deepEqual(
-    (await session.glob('live:data:/*')).map(entry => entry.path),
+    (await session.mount('live:data').glob('/*')).map(entry => entry.path),
     ['/z', '/😀'],
   )
 })

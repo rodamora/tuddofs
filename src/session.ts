@@ -170,15 +170,6 @@ export interface SessionFileSystem {
   readonly actor: Actor
   readonly sessionId: string
   mount(key: string): MountFileSystem
-  read(path: string): Promise<string>
-  readBytes(path: string): Promise<Buffer>
-  write(path: string, bytes: Buffer | Uint8Array | string, options?: WriteOptions): Promise<WriteResult>
-  edit(path: string, edits: readonly TextEdit[], options?: EditOptions): Promise<WriteResult>
-  list(dir: string): Promise<readonly SessionEntry[]>
-  glob(pattern: string): Promise<readonly SessionEntry[]>
-  stat(path: string): Promise<SessionStat>
-  delete(path: string, options?: { ifSha?: string | null }): Promise<DeleteResult>
-  history(path: string): Promise<readonly HistoryRecord[]>
   timeline(filter?: TimelineFilter): Promise<readonly TimelineRecord[]>
   diff(a: string, b: string): Promise<readonly DiffRecord[]>
   merge(options?: {
@@ -850,7 +841,7 @@ export function createSessionApi(kernel: SessionKernel, options: TuddoFsOptions)
           ...(path === undefined ? {} : { path }),
         })
       }
-      const session: SessionFileSystem = {
+      const compoundSession: SessionFileSystem & MountFileSystem = {
         actor: input.actor,
         sessionId: input.sessionId,
         mount(key: string) {
@@ -862,15 +853,15 @@ export function createSessionApi(kernel: SessionKernel, options: TuddoFsOptions)
             })
           const prefix = (path: string) => `${key}:${path}`
           return {
-            read: (path: string) => session.read(prefix(path)),
-            readBytes: (path: string) => session.readBytes(prefix(path)),
-            write: (path, value, writeOptions) => session.write(prefix(path), value, writeOptions),
-            edit: (path, edits, editOptions) => session.edit(prefix(path), edits, editOptions),
-            list: (path: string) => session.list(prefix(path)),
-            glob: (pattern: string) => session.glob(prefix(pattern)),
-            stat: (path: string) => session.stat(prefix(path)),
-            delete: (path, deleteOptions) => session.delete(prefix(path), deleteOptions),
-            history: (path: string) => session.history(prefix(path)),
+            read: (path: string) => compoundSession.read(prefix(path)),
+            readBytes: (path: string) => compoundSession.readBytes(prefix(path)),
+            write: (path, value, writeOptions) => compoundSession.write(prefix(path), value, writeOptions),
+            edit: (path, edits, editOptions) => compoundSession.edit(prefix(path), edits, editOptions),
+            list: (path: string) => compoundSession.list(prefix(path)),
+            glob: (pattern: string) => compoundSession.glob(prefix(pattern)),
+            stat: (path: string) => compoundSession.stat(prefix(path)),
+            delete: (path, deleteOptions) => compoundSession.delete(prefix(path), deleteOptions),
+            history: (path: string) => compoundSession.history(prefix(path)),
           }
         },
         async read(address: string) {
@@ -935,19 +926,14 @@ export function createSessionApi(kernel: SessionKernel, options: TuddoFsOptions)
             })
           let text = old.toString('utf8')
           for (const edit of edits) {
-            let count = 0
-            let index = text.indexOf(edit.oldText)
-            while (index !== -1) {
-              count += 1
-              index = text.indexOf(edit.oldText, index + edit.oldText.length)
-            }
+            const count = edit.oldText.length === 0 ? text.length + 1 : text.split(edit.oldText).length - 1
             if (!edit.replaceAll && count !== 1)
               throw new EditMatchError(count, { tenant: input.actor.tenant, mount: mount.key, path })
             text = edit.replaceAll
-              ? text.split(edit.oldText).join(edit.newText)
+              ? text.replaceAll(edit.oldText, edit.newText)
               : text.replace(edit.oldText, edit.newText)
           }
-          return this.write(address, text, { ifSha: currentSha })
+          return compoundSession.write(address, text, { ifSha: currentSha })
         },
         async list(address: string) {
           const { mount, path } = mountFor(address, true)
@@ -1364,6 +1350,17 @@ export function createSessionApi(kernel: SessionKernel, options: TuddoFsOptions)
             client.release()
           }
         },
+      }
+      const session: SessionFileSystem = {
+        actor: compoundSession.actor,
+        sessionId: compoundSession.sessionId,
+        mount: key => compoundSession.mount(key),
+        timeline: filter => compoundSession.timeline(filter),
+        diff: (a, b) => compoundSession.diff(a, b),
+        merge: mergeOptions => compoundSession.merge(mergeOptions),
+        restore: (mountKey, at) => compoundSession.restore(mountKey, at),
+        tag: (mountKey, label) => compoundSession.tag(mountKey, label),
+        discard: () => compoundSession.discard(),
       }
       return session
       async function mergeRef(mount: RefMount, mergeOptions: { approver?: Actor } = {}): Promise<MergeAttemptResult> {
