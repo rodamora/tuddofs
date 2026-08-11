@@ -1,6 +1,6 @@
 # s4-hardening — standalone product hardening
 
-Status: in-progress — branch `s4/hardening`; evidence recorded below
+Status: done — PR https://github.com/rodamora/tuddofs/pull/11 (branch `s4/hardening`); evidence below
 Stage: S4 (final gate)
 Depends on: all other tasks
 Spec: `../architecture.md` §10 (host obligations), §12 (budgets), §13.7 (docs contract), §15 (close remaining decisions)
@@ -43,4 +43,5 @@ Acceptance evidence (local gate, 2026-08-11):
 - `TUDDOFS_NO_SKIPS=1 npm test` with MinIO up — 113 core + 10 adapter tests, 0 failures, 0 skips.
 - `TUDDOFS_NO_SKIPS=1 npm run test:integration` against disposable PostgreSQL 16 — 160 tests, 0 failures, 0 skips; §12 local rows printed.
 - `TUDDOFS_NO_SKIPS=1 npm run test:ssh` — 38 tests, 0 failures, 0 skips; kill matrix plus the §12 network rows printed.
+- Fixed en route: `packages/s3/test/s3-specific.test.ts` depended on `contract.test.ts` having created the bucket, which Node's parallel file execution does not order. It now creates its own (`packages/s3/test/bucket.ts`). Reproduced against a fresh MinIO — three 404s before, green after — and it is what turned the Node 20 CI leg red on the first run of this branch.
 - `npm run gate:quickstart` — packed tarball installed into an empty project inside a scratch `node:22-alpine` container on a private network with a scratch PostgreSQL; the README quickstart printed `Ship safely.` and the host-guide maintenance job printed `{"collectedBlobs":0,"collectedObjects":0,"settledBranches":0,"skippedTenants":[],"verifyOk":true,"findings":0}`.

@@ -4,6 +4,7 @@ import { Readable } from 'node:stream'
 import test from 'node:test'
 
 import { S3BlobStore } from '../src/index.js'
+import { ensureBucket } from './bucket.js'
 
 const endpoint = process.env.TUDDOFS_S3_ENDPOINT
 const bucket = process.env.TUDDOFS_S3_BUCKET ?? 'tuddofs'
@@ -53,6 +54,15 @@ if (!endpoint) {
     })
 
     try {
+      // The bucket is this suite's own prerequisite; test files run in parallel
+      // and nothing orders them.
+      await ensureBucket({
+        bucket,
+        endpoint,
+        region,
+        forcePathStyle: process.env.TUDDOFS_S3_FORCE_PATH_STYLE !== 'false',
+        credentials: { accessKeyId, secretAccessKey },
+      })
       const key = `tuddo/specific-checksum-${process.pid}-${Date.now()}`
       const expected = Buffer.from('signed checksum body')
       const checksum = createHash('sha256').update(expected).digest('base64')
@@ -91,6 +101,13 @@ if (!endpoint) {
     })
 
     try {
+      await ensureBucket({
+        bucket,
+        endpoint,
+        region,
+        forcePathStyle: process.env.TUDDOFS_S3_FORCE_PATH_STYLE !== 'false',
+        credentials: { accessKeyId, secretAccessKey },
+      })
       const key = `tuddo/specific-get-${process.pid}-${Date.now()}`
       const bytes = Buffer.from('presigned response')
       await store.put(key, bytes)
