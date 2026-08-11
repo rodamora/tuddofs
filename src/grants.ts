@@ -1,4 +1,4 @@
-import { AgentFsError, GrantResolverError } from './errors.js'
+import { TuddoFsError, GrantResolverError } from './errors.js'
 import type { Actor, GrantResolver, WriteMode } from './kernel.js'
 
 export interface Grant {
@@ -53,7 +53,7 @@ export class GrantController {
     try {
       result = await this.withTimeout(this.resolveFn(actor, mount))
     } catch (error) {
-      if (error instanceof AgentFsError) throw error
+      if (error instanceof TuddoFsError) throw error
       throw new GrantResolverError(error instanceof Error ? error.message : 'Grant resolver failed', {
         tenant: actor.tenant,
         mount: mount.key,

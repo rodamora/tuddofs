@@ -1,6 +1,6 @@
 import { Pool } from 'pg'
 
-import { createAgentFs, createDirectAdapter } from '../src/index.js'
+import { createTuddoFs, createDirectAdapter } from '../src/index.js'
 
 const connectionString = process.env.TUDDOFS_DATABASE_URL ?? process.env.DATABASE_URL
 if (!connectionString) throw new Error('TUDDOFS_DATABASE_URL or DATABASE_URL is required')
@@ -8,7 +8,7 @@ if (!connectionString) throw new Error('TUDDOFS_DATABASE_URL or DATABASE_URL is 
 const pool = new Pool({ connectionString })
 const tenant = `demo-${Date.now()}`
 const mount = 'project:demo'
-const fs = createAgentFs({
+const fs = createTuddoFs({
   pool,
   grants: {
     async resolve(actor, mountRef) {

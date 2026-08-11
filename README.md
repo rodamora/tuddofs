@@ -52,13 +52,13 @@ The final command prints JSON containing the edited file, its listing, and `conf
 
 ```ts
 import { Pool } from 'pg'
-import { createAgentFs, createDirectAdapter } from 'tuddofs'
+import { createTuddoFs, createDirectAdapter } from 'tuddofs'
 
 const pool = new Pool({ connectionString: process.env.TUDDOFS_DATABASE_URL })
 const tenant = 'acme'
 const mount = 'project:notes'
 
-const fs = createAgentFs({
+const fs = createTuddoFs({
   pool,
   grants: {
     async resolve(actor, requestedMount) {
@@ -108,8 +108,8 @@ Writes create immutable content-addressed blobs, trees, and commits. Tree and co
 
 The package entry point exports:
 
-- `createAgentFs(options)` — construct the kernel with a `pg` pool, grants, optional blob storage, and lifecycle hooks.
-- `migrate()` and `agentFsDdl` — create or inspect the package-owned `tuddo_*` schema.
+- `createTuddoFs(options)` — construct the kernel with a `pg` pool, grants, optional blob storage, and lifecycle hooks.
+- `migrate()` and `tuddoFsDdl` — create or inspect the package-owned `tuddo_*` schema.
 - Kernel operations — `fork`, `read`, `write`, `delete`, `gc`, and `verify`.
 - `open(input)` — create a session with an actor, session ID, and mount list.
 - Session file operations — `read`, `readBytes`, `write`, `edit`, `list`, `glob`, `stat`, `delete`, `history`, `timeline`, and `diff`.

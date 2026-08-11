@@ -9,7 +9,7 @@ import {
   NotFoundError,
   PreconditionFailedError,
   RefConflictError,
-  createAgentFs,
+  createTuddoFs,
   migrate,
 } from '../index.js'
 
@@ -76,7 +76,7 @@ test('migrate is idempotent, records migration 001, and preserves the frozen sch
 })
 
 test('fork creates genesis, seeds heads, and re-fork is idempotent', async () => {
-  const fs = createAgentFs({ pool })
+  const fs = createTuddoFs({ pool })
   const first = await fs.fork({
     tenant,
     mount,
@@ -109,7 +109,7 @@ test('fork creates genesis, seeds heads, and re-fork is idempotent', async () =>
 })
 
 test('concurrent first touches adopt one genesis commit', async () => {
-  const fs = createAgentFs({ pool })
+  const fs = createTuddoFs({ pool })
   const [first, second] = await Promise.all([
     fs.fork({ tenant, mount, sessionId: 'concurrent-a', authorUser: actor }),
     fs.fork({ tenant, mount, sessionId: 'concurrent-b', authorUser: actor }),
@@ -125,7 +125,7 @@ test('concurrent first touches adopt one genesis commit', async () => {
 })
 
 test('fork does not wait for the tenant GC lock', async () => {
-  const fs = createAgentFs({ pool })
+  const fs = createTuddoFs({ pool })
   const holder = await pool.connect()
   const lockKey = `tuddo:gc:${tenant}`
   await holder.query('SELECT pg_advisory_lock(hashtext($1))', [lockKey])
@@ -144,7 +144,7 @@ test('fork does not wait for the tenant GC lock', async () => {
 })
 
 test('fork seeds existing mount heads idempotently', async () => {
-  const fs = createAgentFs({ pool })
+  const fs = createTuddoFs({ pool })
   await fs.fork({ tenant, mount, sessionId: 'seed-source', authorUser: actor })
   await fs.write({
     tenant,
@@ -176,7 +176,7 @@ test('fork seeds existing mount heads idempotently', async () => {
   assert.equal(heads.rows[0]?.count, '1')
 })
 test('re-fork does not reseed heads beyond the existing branch tip', async () => {
-  const fs = createAgentFs({ pool })
+  const fs = createTuddoFs({ pool })
   const first = await fs.fork({
     tenant,
     mount,
@@ -219,7 +219,7 @@ test('re-fork does not reseed heads beyond the existing branch tip', async () =>
 })
 
 test('first fork seeds heads from the captured tip tree, not live mount heads', async () => {
-  const fs = createAgentFs({ pool })
+  const fs = createTuddoFs({ pool })
   await fs.fork({
     tenant,
     mount,
@@ -265,7 +265,7 @@ test('large writes use the injected object store before the transaction', async 
     },
     async delete() {},
   }
-  const fs = createAgentFs({ pool, storage, inlineMaxBytes: 3 })
+  const fs = createTuddoFs({ pool, storage, inlineMaxBytes: 3 })
   const branch = await fs.fork({
     tenant,
     mount,
@@ -286,7 +286,7 @@ test('large writes use the injected object store before the transaction', async 
 })
 
 test('write/read enforces preconditions, same-sha no-op, and settled branches', async () => {
-  const fs = createAgentFs({ pool })
+  const fs = createTuddoFs({ pool })
   const branch = await fs.fork({
     tenant,
     mount,
@@ -354,7 +354,7 @@ test('write/read enforces preconditions, same-sha no-op, and settled branches', 
 })
 
 test('CAS retries and reports RefConflictError after three failed compares', async () => {
-  const fs = createAgentFs({ pool, maxCasRetries: 3 })
+  const fs = createTuddoFs({ pool, maxCasRetries: 3 })
   const branch = await fs.fork({
     tenant,
     mount,
@@ -380,7 +380,7 @@ test('CAS retries and reports RefConflictError after three failed compares', asy
       }
     },
   }
-  const conflictFs = createAgentFs({ pool: conflictPool })
+  const conflictFs = createTuddoFs({ pool: conflictPool })
   await assert.rejects(
     conflictFs.write({
       tenant,
@@ -395,7 +395,7 @@ test('CAS retries and reports RefConflictError after three failed compares', asy
   assert.equal(forcedConflicts, 3)
 })
 test('concurrent writers retry and leave heads equal to the resulting tip tree', async () => {
-  const fs = createAgentFs({ pool })
+  const fs = createTuddoFs({ pool })
   const branch = await fs.fork({
     tenant,
     mount,
@@ -468,7 +468,7 @@ test('onCommit starts only after write cleanup and caller settlement', async () 
     },
     async delete() {},
   }
-  const fs = createAgentFs({
+  const fs = createTuddoFs({
     pool: gatedPool,
     storage,
     inlineMaxBytes: 1,
@@ -550,7 +550,7 @@ test('unlock failure destroys the client before the tenant can write again', asy
       }
     },
   }
-  const fs = createAgentFs({ pool: guardedPool, storage, inlineMaxBytes: 1 })
+  const fs = createTuddoFs({ pool: guardedPool, storage, inlineMaxBytes: 1 })
   const branch = await fs.fork({
     tenant,
     mount,
@@ -584,7 +584,7 @@ test('unlock failure destroys the client before the tenant can write again', asy
 
 test('read validates a supplied mount key before resolving grants', async () => {
   const seen: string[] = []
-  const fs = createAgentFs({
+  const fs = createTuddoFs({
     pool,
     grants: {
       async resolve(_actor, mountRef) {
@@ -601,7 +601,7 @@ test('read validates a supplied mount key before resolving grants', async () => 
 })
 
 test('restore rejects unknown and cross-tenant source commits without changing refs or heads', async () => {
-  const fs = createAgentFs({ pool })
+  const fs = createTuddoFs({ pool })
   const branch = await fs.fork({
     tenant,
     mount,

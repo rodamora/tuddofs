@@ -7,18 +7,18 @@ export {
   validateMountKey,
   validatePath,
 } from './validation.js'
-export { migrate, agentFsDdl } from './migration.js'
-export type { AgentFsPool } from './migration.js'
-export { createAgentFs } from './kernel.js'
+export { migrate, tuddoFsDdl } from './migration.js'
+export type { TuddoFsPool } from './migration.js'
+export { createTuddoFs } from './kernel.js'
 export { createDirectAdapter } from './direct.js'
 export type { DirectAdapter } from './direct.js'
 export { GrantController } from './grants.js'
 export type { Grant, GrantControllerOptions } from './grants.js'
 export type {
   Actor,
-  AgentFsKernel,
-  AgentFsLogger,
-  AgentFsOptions,
+  TuddoFsKernel,
+  TuddoFsLogger,
+  TuddoFsOptions,
   BlobObject,
   BlobStore,
   CommitEvent,
@@ -59,7 +59,7 @@ export type {
   WriteOptions,
 } from './session.js'
 export {
-  AgentFsError,
+  TuddoFsError,
   BranchSettledError,
   GrantResolverError,
   InvariantError,

@@ -1,11 +1,11 @@
-import { AgentFsError } from './errors.js'
+import { TuddoFsError } from './errors.js'
 import type { ErrorContext } from './errors.js'
 
 /**
  * Error raised when a file path violates the kernel path contract.
  * @see spec §4.3
  */
-export class InvalidPathError extends AgentFsError {
+export class InvalidPathError extends TuddoFsError {
   constructor(path: unknown, reason: string, context?: Partial<ErrorContext>) {
     super(
       `Invalid path: ${reason}`,
@@ -19,7 +19,7 @@ export class InvalidPathError extends AgentFsError {
  * Error raised when a mount key violates the ref-name contract.
  * @see spec §4.4
  */
-export class InvalidMountKeyError extends AgentFsError {
+export class InvalidMountKeyError extends TuddoFsError {
   readonly mountKey: unknown
 
   constructor(mountKey: unknown, context?: Partial<ErrorContext>) {
@@ -36,7 +36,7 @@ export class InvalidMountKeyError extends AgentFsError {
  * Error raised when a commit timestamp is not canonical UTC millisecond precision.
  * @see spec §4.2
  */
-export class InvalidCommitTimestampError extends AgentFsError {
+export class InvalidCommitTimestampError extends TuddoFsError {
   readonly timestamp: unknown
 
   constructor(timestamp: unknown, context?: Partial<ErrorContext>) {

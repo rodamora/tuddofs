@@ -7,7 +7,7 @@ import {
   NotFoundError,
   PermissionDeniedError,
   PreconditionFailedError,
-  createAgentFs,
+  createTuddoFs,
   migrate,
 } from '../index.js'
 
@@ -24,7 +24,7 @@ beforeEach(async () => {
 after(async () => pool.end())
 
 test('session file API writes, edits, lists, globs, stats, deletes, and maps errors', async () => {
-  const fs = createAgentFs({
+  const fs = createTuddoFs({
     pool,
     grants: { resolve: async () => ({ read: true, write: 'direct' }) },
   })
@@ -70,7 +70,7 @@ test('session file API writes, edits, lists, globs, stats, deletes, and maps err
 })
 
 test('session merge skips virtual mounts and is idempotent after completion', async () => {
-  const fs = createAgentFs({
+  const fs = createTuddoFs({
     pool,
     grants: { resolve: async () => ({ read: true, write: 'direct' }) },
   })
@@ -102,7 +102,7 @@ test('session merge skips virtual mounts and is idempotent after completion', as
   assert.deepEqual(second, first)
 })
 test('ref mount listings use UTF-16 code-unit ordering', async () => {
-  const fs = createAgentFs({
+  const fs = createTuddoFs({
     pool,
     grants: { resolve: async () => ({ read: true, write: 'direct' }) },
   })
@@ -121,7 +121,7 @@ test('ref mount listings use UTF-16 code-unit ordering', async () => {
 })
 
 test('merge with no branch changes does not create an empty commit', async () => {
-  const fs = createAgentFs({
+  const fs = createTuddoFs({
     pool,
     grants: { resolve: async () => ({ read: true, write: 'direct' }) },
   })
@@ -146,7 +146,7 @@ test('merge with no branch changes does not create an empty commit', async () =>
 
 test('virtual delete is rejected without fabricating an empty file', async () => {
   let writes = 0
-  const fs = createAgentFs({
+  const fs = createTuddoFs({
     pool,
     grants: { resolve: async () => ({ read: true, write: 'direct' }) },
   })
@@ -177,7 +177,7 @@ test('virtual delete is rejected without fabricating an empty file', async () =>
 })
 
 test('timeline exposes commit-sha parents and path deltas including deletes', async () => {
-  const fs = createAgentFs({
+  const fs = createTuddoFs({
     pool,
     grants: { resolve: async () => ({ read: true, write: 'direct' }) },
   })
@@ -198,7 +198,7 @@ test('timeline exposes commit-sha parents and path deltas including deletes', as
   assert.ok(deletion.parentShas.every(parent => /^[0-9a-f]{64}$/u.test(parent)))
 })
 test('restore returns a dedicated tree result for created and unchanged restores', async () => {
-  const fs = createAgentFs({
+  const fs = createTuddoFs({
     pool,
     grants: { resolve: async () => ({ read: true, write: 'direct' }) },
   })
@@ -223,7 +223,7 @@ test('restore returns a dedicated tree result for created and unchanged restores
 })
 
 test('virtual glob walks nested handler directories', async () => {
-  const fs = createAgentFs({
+  const fs = createTuddoFs({
     pool,
     grants: { resolve: async () => ({ read: true, write: 'direct' }) },
   })

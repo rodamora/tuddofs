@@ -13,7 +13,7 @@ test('resolver throw surfaces GrantResolverError and denies the operation', asyn
   await assert.rejects(grants.resolve({ id: 'u1', tenant: 't1' }, { key: 'project:one' }), GrantResolverError)
 })
 
-test('typed AgentFsError from a resolver propagates without taxonomy wrapping', async () => {
+test('typed TuddoFsError from a resolver propagates without taxonomy wrapping', async () => {
   const denied = new PermissionDeniedError('resolver denied', { tenant: 't1', mount: 'project:one' })
   const grants = new GrantController({
     resolve: async () => {

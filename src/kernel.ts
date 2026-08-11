@@ -2,7 +2,7 @@ import type { Readable } from 'node:stream'
 
 import { commitPreimage, hashCommit, hashTree, sha256 as hashSha256, type TreeEntry } from './hashing.js'
 import {
-  AgentFsError,
+  TuddoFsError,
   BranchSettledError,
   GrantResolverError,
   InvariantError,
@@ -14,7 +14,7 @@ import {
   type ErrorContext,
 } from './errors.js'
 import { InvalidCommitTimestampError } from './validation.js'
-import { migrate, type AgentFsPool } from './migration.js'
+import { migrate, type TuddoFsPool } from './migration.js'
 import { validateMountKey, validatePath } from './validation.js'
 import { GrantController, type Grant } from './grants.js'
 import { createSessionApi } from './session.js'
@@ -141,7 +141,7 @@ export interface GrantResolutionOptions {
 }
 
 /** Receives post-commit hook failures without affecting write durability. @see spec §10b */
-export interface AgentFsLogger {
+export interface TuddoFsLogger {
   error(error: unknown, context?: object): void
 }
 
@@ -245,11 +245,11 @@ export interface CommitEvent {
   readonly changedPaths: readonly string[]
 }
 
-export interface AgentFsOptions {
-  readonly pool: AgentFsPool
+export interface TuddoFsOptions {
+  readonly pool: TuddoFsPool
   readonly storage?: BlobStore
   readonly grants?: GrantResolver
-  readonly logger?: AgentFsLogger
+  readonly logger?: TuddoFsLogger
   readonly inlineMaxBytes?: number
   readonly maxCasRetries?: number
   readonly grantCacheTtlMs?: number
@@ -258,7 +258,7 @@ export interface AgentFsOptions {
   readonly onCommit?: (event: CommitEvent) => void | Promise<void>
 }
 
-export interface AgentFsKernel {
+export interface TuddoFsKernel {
   migrate(): Promise<void>
   gc(input?: GcOptions): Promise<GcReport>
   verify(input?: VerifyOptions): Promise<VerifyReport>
@@ -933,7 +933,7 @@ type VerifyBlobRow = {
   size_bytes: string
 }
 
-export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
+export function createTuddoFs(options: TuddoFsOptions): TuddoFsKernel {
   const inlineMaxBytes = options.inlineMaxBytes ?? DEFAULT_INLINE_MAX_BYTES
   const maxCasRetries = options.maxCasRetries ?? DEFAULT_CAS_RETRIES
   const now = options.now ?? (() => new Date())
@@ -1571,9 +1571,9 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
               .catch(error => {
                 try {
                   if (options.logger) options.logger.error(error, event)
-                  else console.error('AgentFs onCommit hook failed', error, event)
+                  else console.error('TuddoFs onCommit hook failed', error, event)
                 } catch (loggerError) {
-                  console.error('AgentFs onCommit hook logger failed', loggerError, { error, event })
+                  console.error('TuddoFs onCommit hook logger failed', loggerError, { error, event })
                 }
               })
           })

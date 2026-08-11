@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { NotFoundError, PermissionDeniedError, createAgentFs } from '../index.js'
+import { NotFoundError, PermissionDeniedError, createTuddoFs } from '../index.js'
 
 test('virtual session reads and lists through the executing actor', async () => {
   const calls: string[] = []
-  const fs = createAgentFs({
+  const fs = createTuddoFs({
     pool: {
       connect: async () => {
         throw new Error('not expected')
@@ -39,7 +39,7 @@ test('virtual session reads and lists through the executing actor', async () => 
 })
 
 test('virtual mounts are read-only when handler write is absent and have no history surfaces', async () => {
-  const fs = createAgentFs({
+  const fs = createTuddoFs({
     pool: {
       connect: async () => {
         throw new Error('not expected')
@@ -73,7 +73,7 @@ test('virtual mounts are read-only when handler write is absent and have no hist
   await assert.rejects(session.resolveMerge('live:data'), NotFoundError)
 })
 test('virtual glob entries use UTF-16 code-unit ordering', async () => {
-  const fs = createAgentFs({
+  const fs = createTuddoFs({
     pool: {
       connect: async () => {
         throw new Error('not expected')

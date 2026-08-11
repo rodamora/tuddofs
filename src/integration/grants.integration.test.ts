@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test, { after, before, beforeEach } from 'node:test'
 
 import { Pool } from 'pg'
-import { GrantResolverError, PermissionDeniedError, createAgentFs, migrate } from '../index.js'
+import { GrantResolverError, PermissionDeniedError, createTuddoFs, migrate } from '../index.js'
 
 const pool = new Pool({ connectionString: process.env.TUDDOFS_DATABASE_URL })
 const tenant = 'grants-integration'
@@ -18,7 +18,7 @@ beforeEach(async () => {
 after(async () => pool.end())
 
 test('resolver throw and timeout fail closed as GrantResolverError during open', async () => {
-  const throwing = createAgentFs({
+  const throwing = createTuddoFs({
     pool,
     grants: {
       resolve: async () => {
@@ -34,7 +34,7 @@ test('resolver throw and timeout fail closed as GrantResolverError during open',
     }),
     GrantResolverError,
   )
-  const hanging = createAgentFs({
+  const hanging = createTuddoFs({
     pool,
     grantTimeoutMs: 5,
     grants: { resolve: async () => never },
@@ -52,7 +52,7 @@ test('resolver throw and timeout fail closed as GrantResolverError during open',
 test('fork and merge bypass the grant cache, and invalidation is actor+mount scoped', async () => {
   let calls = 0
   let mode: 'direct' | 'none' = 'direct'
-  const fs = createAgentFs({
+  const fs = createTuddoFs({
     pool,
     grants: {
       resolve: async () => {
@@ -77,7 +77,7 @@ test('fork and merge bypass the grant cache, and invalidation is actor+mount sco
 
 test('permission revocation is enforced at write time and system actor cannot open a session', async () => {
   let mode: 'direct' | 'none' = 'direct'
-  const fs = createAgentFs({
+  const fs = createTuddoFs({
     pool,
     grantCacheTtlMs: 0,
     grants: { resolve: async () => ({ read: true, write: mode }) },

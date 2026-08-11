@@ -1,6 +1,6 @@
 import { hashCommit, hashTree, sha256, type TreeEntry } from './hashing.js'
 import {
-  AgentFsError,
+  TuddoFsError,
   BranchSettledError,
   NotFoundError,
   PermissionDeniedError,
@@ -10,15 +10,15 @@ import {
 import { InvalidPathError, validateMountKey, validatePath } from './validation.js'
 import type {
   Actor,
-  AgentFsKernel,
-  AgentFsOptions,
+  TuddoFsKernel,
+  TuddoFsOptions,
   DeleteResult,
   ForkResult,
   ReadResult,
   RestoreResult,
   WriteResult,
 } from './kernel.js'
-import type { AgentFsClient } from './migration.js'
+import type { TuddoFsClient } from './migration.js'
 import type { ErrorContext } from './errors.js'
 
 /** A file or directory returned by a virtual mount handler. @see spec §6.1 */
@@ -264,9 +264,9 @@ function sameHead(left: Head | undefined, right: Head | undefined): boolean {
   return left.sha256 === right.sha256 && left.mode === right.mode
 }
 
-type SessionKernel = Omit<AgentFsKernel, 'open'>
+type SessionKernel = Omit<TuddoFsKernel, 'open'>
 /** Build the session API over a kernel and its host options. @see spec §6 */
-export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions) {
+export function createSessionApi(kernel: SessionKernel, options: TuddoFsOptions) {
   return {
     invalidate(actorId: string, mountKey?: string, tenant?: string) {
       kernel.invalidate(actorId, mountKey, tenant)
@@ -361,7 +361,7 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
 
       type LineageCommit = { id: string; commit_sha: string }
       const assertCommitInMountLineage = async (
-        client: AgentFsClient,
+        client: TuddoFsClient,
         mountKey: string,
         commitSha: string,
       ): Promise<LineageCommit> => {
@@ -766,7 +766,7 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
         })
       }
 
-      const readTree = async (client: AgentFsClient, commitId: string): Promise<Map<string, Head>> => {
+      const readTree = async (client: TuddoFsClient, commitId: string): Promise<Map<string, Head>> => {
         const result = await client.query<{
           path: string
           blob_id: string
@@ -794,7 +794,7 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
       }
 
       const readTrees = async (
-        client: AgentFsClient,
+        client: TuddoFsClient,
         commitIds: readonly string[],
       ): Promise<Map<string, Map<string, Head>>> => {
         const trees = new Map<string, Map<string, Head>>()
@@ -1529,7 +1529,7 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
   }
 }
 
-async function readAll(options: AgentFsOptions, objectKey: string, context: ErrorContext): Promise<Buffer> {
+async function readAll(options: TuddoFsOptions, objectKey: string, context: ErrorContext): Promise<Buffer> {
   if (!options.storage) throw new NotFoundError(`Blob unavailable: ${objectKey}`, context)
   try {
     const chunks: Buffer[] = []
@@ -1537,13 +1537,13 @@ async function readAll(options: AgentFsOptions, objectKey: string, context: Erro
       chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
     return Buffer.concat(chunks)
   } catch (error) {
-    if (error instanceof AgentFsError) throw error
+    if (error instanceof TuddoFsError) throw error
     throw new StorageError(error instanceof Error ? error.message : 'Object storage failed', context)
   }
 }
 
 async function insertTreeCommit(
-  client: AgentFsClient,
+  client: TuddoFsClient,
   tenant: string,
   entries: Map<string, Head>,
   parents: bigint[],
@@ -1597,7 +1597,7 @@ async function insertTreeCommit(
 }
 
 async function replaceHeads(
-  client: AgentFsClient,
+  client: TuddoFsClient,
   tenant: string,
   ref: string,
   entries: Map<string, Head>,

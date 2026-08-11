@@ -9,7 +9,7 @@ import {
   NotFoundError,
   PermissionDeniedError,
   PreconditionFailedError,
-  createAgentFs,
+  createTuddoFs,
   migrate,
 } from '../index.js'
 
@@ -31,7 +31,7 @@ function fsWith(
     write: 'direct' | 'staged' | 'none'
   },
 ) {
-  return createAgentFs({
+  return createTuddoFs({
     pool,
     grants: { resolve: async (_actor, mount) => grant(mount.key) },
   })
@@ -257,7 +257,7 @@ test('commit resolution ignores a revoked unrelated mount until lineage matches'
     ['locked', true],
     ['okmount', true],
   ])
-  const fs = createAgentFs({
+  const fs = createTuddoFs({
     pool,
     grants: {
       resolve: async (_actor, mount) => ({
@@ -341,7 +341,7 @@ test('kernel delete retries a compare-and-swap conflict before failing', async (
       }
     },
   }
-  const flaky = createAgentFs({
+  const flaky = createTuddoFs({
     pool: flakyPool,
     grants: { resolve: async () => ({ read: true, write: 'direct' }) },
     maxCasRetries: 2,
@@ -443,7 +443,7 @@ test('merge does not hold its transaction connection across a pool-backed grant 
     max: 2,
   })
   try {
-    const fs = createAgentFs({
+    const fs = createTuddoFs({
       pool: resolverPool,
       grantTimeoutMs: 100,
       grants: {
@@ -482,7 +482,7 @@ test('merge refreshes a grant that aged while waiting for a saturated pool', asy
   const { promise: grantSeen, resolve: grantObserved } = deferred<void>()
   let held: { release(): void } | undefined
   try {
-    const fs = createAgentFs({
+    const fs = createTuddoFs({
       pool: saturatedPool,
       grants: {
         resolve: async () => {
@@ -541,7 +541,7 @@ test('merge refreshes a stale denied grant after it is restored while waiting', 
   const { promise: grantRelease, resolve: releaseGrant } = deferred<void>()
   let held: { release(): void } | undefined
   try {
-    const fs = createAgentFs({
+    const fs = createTuddoFs({
       pool: saturatedPool,
       grants: {
         resolve: async () => {
@@ -589,7 +589,7 @@ test('merge refreshes a stale denied grant after it is restored while waiting', 
 
 test('merge records the other mount when a settled mount throws', async () => {
   let pWrite: 'direct' | 'none' = 'direct'
-  const fs = createAgentFs({
+  const fs = createTuddoFs({
     pool,
 
     grants: {
@@ -674,7 +674,7 @@ test('history includes a parentless import commit when the path is present', asy
 
 test('merge rejects an approver from another tenant before resolving its grant', async () => {
   const seen: string[] = []
-  const fs = createAgentFs({
+  const fs = createTuddoFs({
     pool,
     grants: {
       resolve: async actorForGrant => {

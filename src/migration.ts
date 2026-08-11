@@ -4,7 +4,7 @@ import { SchemaDriftError } from './errors.js'
  * The database handle accepted by package-owned migrations.
  * @see spec §4.1 and §10b.2
  */
-export interface AgentFsClient {
+export interface TuddoFsClient {
   query<Row extends Record<string, unknown> = Record<string, unknown>>(
     text: string,
     values?: readonly unknown[],
@@ -12,8 +12,8 @@ export interface AgentFsClient {
   release(error?: Error): void
 }
 
-export interface AgentFsPool {
-  connect(): Promise<AgentFsClient>
+export interface TuddoFsPool {
+  connect(): Promise<TuddoFsClient>
 }
 
 type SchemaColumn = { table_name: string; column_name: string }
@@ -141,7 +141,7 @@ const EXPECTED_COLUMNS: readonly SchemaColumn[] = [
 
 const MIGRATIONS = [{ version: 1, name: 'initial schema', statements: DDL }] as const
 
-async function assertFrozenSchema(client: AgentFsClient): Promise<void> {
+async function assertFrozenSchema(client: TuddoFsClient): Promise<void> {
   const tableNames = [...new Set(EXPECTED_COLUMNS.map(column => column.table_name))].sort()
   const tables = await client.query<{ table_name: string }>(
     `SELECT table_name
@@ -180,7 +180,7 @@ async function assertFrozenSchema(client: AgentFsClient): Promise<void> {
  * verify the live §4.1 schema even when every migration is already recorded.
  * @see spec §4.1, §10b.2, and §15.7
  */
-export async function migrate(pool: AgentFsPool): Promise<void> {
+export async function migrate(pool: TuddoFsPool): Promise<void> {
   const client = await pool.connect()
   let committed = false
   try {
@@ -215,4 +215,4 @@ export async function migrate(pool: AgentFsPool): Promise<void> {
   }
 }
 
-export const agentFsDdl = DDL
+export const tuddoFsDdl = DDL

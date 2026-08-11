@@ -16,14 +16,14 @@ function normalizeContext(context?: Partial<ErrorContext>): ErrorContext {
 }
 
 /** Base class for the package's discriminated error taxonomy. @see spec §9 */
-export class AgentFsError extends Error {
+export class TuddoFsError extends Error {
   readonly context: ErrorContext
   readonly tenant: string
   readonly mount?: string
   readonly path?: string
   readonly ref?: string
 
-  constructor(message: string, context?: Partial<ErrorContext>, name = 'AgentFsError') {
+  constructor(message: string, context?: Partial<ErrorContext>, name = 'TuddoFsError') {
     super(message)
     this.name = name
     this.context = normalizeContext(context)
@@ -35,28 +35,28 @@ export class AgentFsError extends Error {
 }
 
 /** The package-owned schema no longer matches the frozen §4.1 contract. @see spec §9 */
-export class SchemaDriftError extends AgentFsError {
+export class SchemaDriftError extends TuddoFsError {
   constructor(reason = 'Agent FS schema drift detected', context?: Partial<ErrorContext>) {
     super(reason, context, 'SchemaDriftError')
   }
 }
 
 /** An internal content-addressed invariant was violated. @see spec §9 */
-export class InvariantError extends AgentFsError {
+export class InvariantError extends TuddoFsError {
   constructor(reason: string, context?: Partial<ErrorContext>) {
     super(reason, context, 'InvariantError')
   }
 }
 
 /** Grant refused a filesystem operation. @see spec §9 */
-export class PermissionDeniedError extends AgentFsError {
+export class PermissionDeniedError extends TuddoFsError {
   constructor(reason = 'Permission denied', context?: Partial<ErrorContext>) {
     super(reason, context, 'PermissionDeniedError')
   }
 }
 
 /** The caller's optimistic file precondition did not hold. @see spec §9 */
-export class PreconditionFailedError extends AgentFsError {
+export class PreconditionFailedError extends TuddoFsError {
   readonly expectedSha: string | null | undefined
   readonly actualSha: string | null | undefined
 
@@ -76,7 +76,7 @@ export class PreconditionFailedError extends AgentFsError {
 }
 
 /** The ref compare-and-swap was exhausted. @see spec §9 */
-export class RefConflictError extends AgentFsError {
+export class RefConflictError extends TuddoFsError {
   readonly attempts: number
 
   constructor(context?: Partial<ErrorContext>, attempts = 3) {
@@ -86,14 +86,14 @@ export class RefConflictError extends AgentFsError {
 }
 
 /** A requested path, ref, or commit does not exist. @see spec §9 */
-export class NotFoundError extends AgentFsError {
+export class NotFoundError extends TuddoFsError {
   constructor(resource = 'Resource not found', context?: Partial<ErrorContext>) {
     super(resource, context, 'NotFoundError')
   }
 }
 
 /** A branch was already merged, abandoned, or otherwise settled. @see spec §9 */
-export class BranchSettledError extends AgentFsError {
+export class BranchSettledError extends TuddoFsError {
   readonly state: string
 
   constructor(state: string, context?: Partial<ErrorContext>) {
@@ -103,21 +103,21 @@ export class BranchSettledError extends AgentFsError {
 }
 
 /** A staged writer attempted to merge without an approver. @see spec §9 */
-export class MergePendingApprovalError extends AgentFsError {
+export class MergePendingApprovalError extends TuddoFsError {
   constructor(context?: Partial<ErrorContext>) {
     super('Merge is pending approval', context, 'MergePendingApprovalError')
   }
 }
 
 /** The host grant resolver failed closed. @see spec §9 */
-export class GrantResolverError extends AgentFsError {
+export class GrantResolverError extends TuddoFsError {
   constructor(reason = 'Grant resolver failed', context?: Partial<ErrorContext>) {
     super(reason, context, 'GrantResolverError')
   }
 }
 
 /** Object storage failed. @see spec §9 */
-export class StorageError extends AgentFsError {
+export class StorageError extends TuddoFsError {
   constructor(reason = 'Object storage failed', context?: Partial<ErrorContext>) {
     super(reason, context, 'StorageError')
   }
