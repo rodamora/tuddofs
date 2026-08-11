@@ -45,6 +45,7 @@ test('virtual mounts are read-only when handler write is absent and have no hist
         throw new Error('not expected')
       },
     },
+    grants: { resolve: async () => ({ read: false, write: 'none' }) },
   })
   const session = await fs.open({
     actor: { id: 'user-1', tenant: 'tenant-1' },
@@ -79,6 +80,7 @@ test('virtual glob entries use UTF-16 code-unit ordering', async () => {
         throw new Error('not expected')
       },
     },
+    grants: { resolve: async () => ({ read: false, write: 'none' }) },
   })
   const session = await fs.open({
     actor: { id: 'user-1', tenant: 'tenant-1' },

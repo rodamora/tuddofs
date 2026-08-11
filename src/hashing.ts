@@ -4,7 +4,6 @@ import { InvalidCommitTimestampError, InvalidPathError, validatePath } from './v
 
 /**
  * A regular file entry in a canonical tree.
- * @see spec §4.2
  */
 export interface TreeEntry {
   readonly path: string
@@ -14,7 +13,6 @@ export interface TreeEntry {
 
 /**
  * Fields included in a canonical commit preimage.
- * @see spec §4.2
  */
 export interface CommitHashInput {
   readonly treeSha: string
@@ -29,7 +27,6 @@ export interface CommitHashInput {
 
 /**
  * Hash bytes with SHA-256 and return lowercase hexadecimal.
- * @see spec §4.2
  */
 export function sha256(input: Uint8Array | string): string {
   return createHash('sha256').update(input).digest('hex')
@@ -37,7 +34,6 @@ export function sha256(input: Uint8Array | string): string {
 
 /**
  * Serialize tree entries in the pinned UTF-8 byte order.
- * @see spec §4.2
  */
 export function treePreimage(entries: readonly TreeEntry[]): Buffer {
   const serialized = entries.map(entry => {
@@ -59,7 +55,6 @@ export function treePreimage(entries: readonly TreeEntry[]): Buffer {
 
 /**
  * Compute a content-addressed tree digest.
- * @see spec §4.2
  */
 export function hashTree(entries: readonly TreeEntry[]): string {
   return sha256(treePreimage(entries))
@@ -67,7 +62,6 @@ export function hashTree(entries: readonly TreeEntry[]): string {
 
 /**
  * Serialize a commit in the pinned field order and byte format.
- * @see spec §4.2
  */
 export function commitPreimage(commit: CommitHashInput): Buffer {
   if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(commit.ts)) {
@@ -90,7 +84,6 @@ export function commitPreimage(commit: CommitHashInput): Buffer {
 
 /**
  * Compute a content-addressed commit digest.
- * @see spec §4.2
  */
 export function hashCommit(commit: CommitHashInput): string {
   return sha256(commitPreimage(commit))

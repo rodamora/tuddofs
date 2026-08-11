@@ -8,7 +8,7 @@ export {
   validatePath,
 } from './validation.js'
 export { migrate, tuddoFsDdl } from './migration.js'
-export type { TuddoFsPool } from './migration.js'
+export type { TuddoFsClient, TuddoFsMigrationOptions, TuddoFsPool } from './migration.js'
 export { createTuddoFs } from './kernel.js'
 export { createDirectAdapter } from './direct.js'
 export type { DirectAdapter } from './direct.js'

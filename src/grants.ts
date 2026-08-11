@@ -15,7 +15,7 @@ export interface GrantControllerOptions {
 
 type CacheEntry = { readonly expiresAt: number; readonly grant: Grant }
 
-/** Live, fail-closed grant resolution with bounded process-local caching. @see spec §5 */
+/** Live, fail-closed grant resolution with bounded process-local caching. */
 export class GrantController {
   private readonly resolveFn: GrantResolver['resolve']
   private readonly ttlMs: number
@@ -25,7 +25,7 @@ export class GrantController {
   private nextReapAt = 0
 
   constructor(options: GrantControllerOptions | GrantResolver) {
-    this.resolveFn = options.resolve
+    this.resolveFn = (actor, mount) => options.resolve(actor, mount)
     this.ttlMs = 'ttlMs' in options ? (options.ttlMs ?? 30_000) : 30_000
     this.timeoutMs = 'timeoutMs' in options ? (options.timeoutMs ?? 5_000) : 5_000
     this.now = 'now' in options ? (options.now ?? (() => Date.now())) : () => Date.now()

@@ -21,7 +21,7 @@ import type {
 import type { TuddoFsClient } from './migration.js'
 import type { ErrorContext } from './errors.js'
 
-/** A file or directory returned by a virtual mount handler. @see spec §6.1 */
+/** A file or directory returned by a virtual mount handler. */
 export interface VirtualEntry {
   readonly path: string
   readonly type: 'file' | 'directory'
@@ -30,14 +30,14 @@ export interface VirtualEntry {
   readonly mode?: number
 }
 
-/** Handler SPI for live, non-versioned mount data. @see spec §6.1 */
+/** Handler SPI for live, non-versioned mount data. */
 export interface VirtualMountHandler {
   list(dir: string, actor: Actor): Promise<readonly VirtualEntry[]>
   read(path: string, actor: Actor): Promise<Buffer | null>
   write?(path: string, bytes: Buffer, actor: Actor): Promise<void>
 }
 
-/** A ref-backed or virtual mount included in a session. @see spec §6 */
+/** A ref-backed or virtual mount included in a session. */
 export type MountSpec =
   | {
       readonly key: string
@@ -45,7 +45,7 @@ export type MountSpec =
     }
   | { readonly key: string; readonly virtual: VirtualMountHandler }
 
-/** Inputs used to open an executing actor's multi-mount session. @see spec §6 */
+/** Inputs used to open an executing actor's multi-mount session. */
 export interface OpenInput {
   readonly actor: Actor
   readonly sessionId: string
@@ -57,7 +57,7 @@ export interface OpenInput {
   readonly mounts: readonly MountSpec[]
 }
 
-/** Metadata for one file path in a session. @see spec §6 */
+/** Metadata for one file path in a session. */
 export interface SessionStat {
   readonly path: string
   readonly sha256: string
@@ -65,7 +65,7 @@ export interface SessionStat {
   readonly mode: number
 }
 
-/** A direct child returned by `list` or a glob match. @see spec §6 */
+/** A direct child returned by `list` or a glob match. */
 export interface SessionEntry {
   readonly path: string
   readonly type: 'file' | 'directory'
@@ -78,31 +78,30 @@ export interface SessionEntry {
  * A structured text replacement applied in UTF-16 code-unit offsets.
  * `start` and `end` are half-open offsets into the current UTF-16 string;
  * edits are applied from the end of the string toward the beginning.
- * @see spec §6
  */
 export interface TextEdit {
   readonly start: number
   readonly end: number
   readonly text: string
 }
-/** Optimistic concurrency options for `write`. @see spec §4.5 */
+/** Optimistic concurrency options for `write`. */
 export interface WriteOptions {
   readonly ifSha?: string | null
 }
 
-/** Optimistic precondition options for `edit`. @see spec §6 */
+/** Optimistic precondition options for `edit`. */
 export interface EditOptions {
   readonly ifSha?: string | null
 }
 
-/** Optional provenance filters for timeline queries. @see spec §6 */
+/** Optional provenance filters for timeline queries. */
 export interface TimelineFilter {
   readonly runId?: string
   readonly agentKind?: string
   readonly threadId?: string
 }
 
-/** One commit that changed a requested path. @see spec §6 */
+/** One commit that changed a requested path. */
 export interface HistoryRecord {
   readonly commitSha: string
   readonly parentShas: readonly string[]
@@ -115,7 +114,7 @@ export interface HistoryRecord {
   readonly createdAt: Date
 }
 
-/** One commit and its actual tree delta. @see spec §6 */
+/** One commit and its actual tree delta. */
 export interface TimelineRecord {
   readonly commitSha: string
   readonly parentShas: readonly string[]
@@ -128,7 +127,7 @@ export interface TimelineRecord {
   readonly createdAt: Date
 }
 
-/** Per-path difference between two commits. @see spec §6 */
+/** Per-path difference between two commits. */
 export interface DiffRecord {
   readonly path: string
   readonly beforeSha: string | null
@@ -137,7 +136,7 @@ export interface DiffRecord {
   readonly afterMode?: number
 }
 
-/** Per-mount merge outcome; conflicts are data, not thrown exceptions. @see spec §4.7 */
+/** Per-mount merge outcome; conflicts are data, not thrown exceptions. */
 export type MergeResult =
   | 'merged'
   | 'unauthorized'
@@ -152,7 +151,7 @@ export type MergeResult =
     }
   | { readonly settled: string }
 
-/** File and history operations exposed by an opened session. @see spec §6 */
+/** File and history operations exposed by an opened session. */
 export interface SessionFileSystem {
   readonly actor: Actor
   readonly sessionId: string
@@ -265,7 +264,7 @@ function sameHead(left: Head | undefined, right: Head | undefined): boolean {
 }
 
 type SessionKernel = Omit<TuddoFsKernel, 'open'>
-/** Build the session API over a kernel and its host options. @see spec §6 */
+/** Build the session API over a kernel and its host options. */
 export function createSessionApi(kernel: SessionKernel, options: TuddoFsOptions) {
   return {
     invalidate(actorId: string, mountKey?: string, tenant?: string) {
@@ -833,7 +832,7 @@ export function createSessionApi(kernel: SessionKernel, options: TuddoFsOptions)
           ...(path === undefined ? {} : { path }),
         })
       }
-      return {
+      const session: SessionFileSystem = {
         actor: input.actor,
         sessionId: input.sessionId,
         async read(address: string) {
@@ -1340,7 +1339,8 @@ export function createSessionApi(kernel: SessionKernel, options: TuddoFsOptions)
             client.release()
           }
         },
-      } as SessionFileSystem
+      }
+      return session
       async function mergeRef(mount: RefMount, mergeOptions: { approver?: Actor } = {}): Promise<MergeResult> {
         if (!mount.fork || !mount.ref) return 'merged'
         if (mergeOptions.approver && mergeOptions.approver.tenant !== input.actor.tenant)
@@ -1534,7 +1534,7 @@ async function readAll(options: TuddoFsOptions, objectKey: string, context: Erro
   try {
     const chunks: Buffer[] = []
     for await (const chunk of await options.storage.get(objectKey))
-      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array))
     return Buffer.concat(chunks)
   } catch (error) {
     if (error instanceof TuddoFsError) throw error

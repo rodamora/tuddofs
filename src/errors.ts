@@ -15,7 +15,7 @@ function normalizeContext(context?: Partial<ErrorContext>): ErrorContext {
   }
 }
 
-/** Base class for the package's discriminated error taxonomy. @see spec §9 */
+/** Base class for the package's discriminated error taxonomy. */
 export class TuddoFsError extends Error {
   readonly context: ErrorContext
   readonly tenant: string
@@ -34,28 +34,28 @@ export class TuddoFsError extends Error {
   }
 }
 
-/** The package-owned schema no longer matches the frozen §4.1 contract. @see spec §9 */
+/** The package-owned schema no longer matches the frozen contract. */
 export class SchemaDriftError extends TuddoFsError {
-  constructor(reason = 'Agent FS schema drift detected', context?: Partial<ErrorContext>) {
+  constructor(reason = 'tuddofs schema drift detected', context?: Partial<ErrorContext>) {
     super(reason, context, 'SchemaDriftError')
   }
 }
 
-/** An internal content-addressed invariant was violated. @see spec §9 */
+/** An internal content-addressed invariant was violated. */
 export class InvariantError extends TuddoFsError {
   constructor(reason: string, context?: Partial<ErrorContext>) {
     super(reason, context, 'InvariantError')
   }
 }
 
-/** Grant refused a filesystem operation. @see spec §9 */
+/** Grant refused a filesystem operation. */
 export class PermissionDeniedError extends TuddoFsError {
   constructor(reason = 'Permission denied', context?: Partial<ErrorContext>) {
     super(reason, context, 'PermissionDeniedError')
   }
 }
 
-/** The caller's optimistic file precondition did not hold. @see spec §9 */
+/** The caller's optimistic file precondition did not hold. */
 export class PreconditionFailedError extends TuddoFsError {
   readonly expectedSha: string | null | undefined
   readonly actualSha: string | null | undefined
@@ -75,7 +75,7 @@ export class PreconditionFailedError extends TuddoFsError {
   }
 }
 
-/** The ref compare-and-swap was exhausted. @see spec §9 */
+/** The ref compare-and-swap was exhausted. */
 export class RefConflictError extends TuddoFsError {
   readonly attempts: number
 
@@ -85,14 +85,14 @@ export class RefConflictError extends TuddoFsError {
   }
 }
 
-/** A requested path, ref, or commit does not exist. @see spec §9 */
+/** A requested path, ref, or commit does not exist. */
 export class NotFoundError extends TuddoFsError {
   constructor(resource = 'Resource not found', context?: Partial<ErrorContext>) {
     super(resource, context, 'NotFoundError')
   }
 }
 
-/** A branch was already merged, abandoned, or otherwise settled. @see spec §9 */
+/** A branch was already merged, abandoned, or otherwise settled. */
 export class BranchSettledError extends TuddoFsError {
   readonly state: string
 
@@ -102,21 +102,21 @@ export class BranchSettledError extends TuddoFsError {
   }
 }
 
-/** A staged writer attempted to merge without an approver. @see spec §9 */
+/** A staged writer attempted to merge without an approver. */
 export class MergePendingApprovalError extends TuddoFsError {
   constructor(context?: Partial<ErrorContext>) {
     super('Merge is pending approval', context, 'MergePendingApprovalError')
   }
 }
 
-/** The host grant resolver failed closed. @see spec §9 */
+/** The host grant resolver failed closed. */
 export class GrantResolverError extends TuddoFsError {
   constructor(reason = 'Grant resolver failed', context?: Partial<ErrorContext>) {
     super(reason, context, 'GrantResolverError')
   }
 }
 
-/** Object storage failed. @see spec §9 */
+/** Object storage failed. */
 export class StorageError extends TuddoFsError {
   constructor(reason = 'Object storage failed', context?: Partial<ErrorContext>) {
     super(reason, context, 'StorageError')

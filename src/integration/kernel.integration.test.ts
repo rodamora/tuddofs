@@ -17,6 +17,7 @@ const pool = new Pool({ connectionString: process.env.TUDDOFS_DATABASE_URL })
 const tenant = 'integration-tenant'
 const mount = 'project:kernel'
 const actor = 'user-1'
+const grants = { resolve: async () => ({ read: true, write: 'direct' as const }) }
 
 function deferred<T>() {
   let resolve!: (value?: T | PromiseLike<T>) => void
@@ -76,7 +77,7 @@ test('migrate is idempotent, records migration 001, and preserves the frozen sch
 })
 
 test('fork creates genesis, seeds heads, and re-fork is idempotent', async () => {
-  const fs = createTuddoFs({ pool })
+  const fs = createTuddoFs({ pool, grants })
   const first = await fs.fork({
     tenant,
     mount,
@@ -109,7 +110,7 @@ test('fork creates genesis, seeds heads, and re-fork is idempotent', async () =>
 })
 
 test('concurrent first touches adopt one genesis commit', async () => {
-  const fs = createTuddoFs({ pool })
+  const fs = createTuddoFs({ pool, grants })
   const [first, second] = await Promise.all([
     fs.fork({ tenant, mount, sessionId: 'concurrent-a', authorUser: actor }),
     fs.fork({ tenant, mount, sessionId: 'concurrent-b', authorUser: actor }),
@@ -125,7 +126,7 @@ test('concurrent first touches adopt one genesis commit', async () => {
 })
 
 test('fork does not wait for the tenant GC lock', async () => {
-  const fs = createTuddoFs({ pool })
+  const fs = createTuddoFs({ pool, grants })
   const holder = await pool.connect()
   const lockKey = `tuddo:gc:${tenant}`
   await holder.query('SELECT pg_advisory_lock(hashtext($1))', [lockKey])
@@ -144,7 +145,7 @@ test('fork does not wait for the tenant GC lock', async () => {
 })
 
 test('fork seeds existing mount heads idempotently', async () => {
-  const fs = createTuddoFs({ pool })
+  const fs = createTuddoFs({ pool, grants })
   await fs.fork({ tenant, mount, sessionId: 'seed-source', authorUser: actor })
   await fs.write({
     tenant,
@@ -176,7 +177,7 @@ test('fork seeds existing mount heads idempotently', async () => {
   assert.equal(heads.rows[0]?.count, '1')
 })
 test('re-fork does not reseed heads beyond the existing branch tip', async () => {
-  const fs = createTuddoFs({ pool })
+  const fs = createTuddoFs({ pool, grants })
   const first = await fs.fork({
     tenant,
     mount,
@@ -219,7 +220,7 @@ test('re-fork does not reseed heads beyond the existing branch tip', async () =>
 })
 
 test('first fork seeds heads from the captured tip tree, not live mount heads', async () => {
-  const fs = createTuddoFs({ pool })
+  const fs = createTuddoFs({ pool, grants })
   await fs.fork({
     tenant,
     mount,
@@ -265,7 +266,7 @@ test('large writes use the injected object store before the transaction', async 
     },
     async delete() {},
   }
-  const fs = createTuddoFs({ pool, storage, inlineMaxBytes: 3 })
+  const fs = createTuddoFs({ pool, grants, storage, inlineMaxBytes: 3 })
   const branch = await fs.fork({
     tenant,
     mount,
@@ -286,7 +287,7 @@ test('large writes use the injected object store before the transaction', async 
 })
 
 test('write/read enforces preconditions, same-sha no-op, and settled branches', async () => {
-  const fs = createTuddoFs({ pool })
+  const fs = createTuddoFs({ pool, grants })
   const branch = await fs.fork({
     tenant,
     mount,
@@ -354,7 +355,7 @@ test('write/read enforces preconditions, same-sha no-op, and settled branches', 
 })
 
 test('CAS retries and reports RefConflictError after three failed compares', async () => {
-  const fs = createTuddoFs({ pool, maxCasRetries: 3 })
+  const fs = createTuddoFs({ pool, grants, maxCasRetries: 3 })
   const branch = await fs.fork({
     tenant,
     mount,
@@ -380,7 +381,7 @@ test('CAS retries and reports RefConflictError after three failed compares', asy
       }
     },
   }
-  const conflictFs = createTuddoFs({ pool: conflictPool })
+  const conflictFs = createTuddoFs({ pool: conflictPool, grants })
   await assert.rejects(
     conflictFs.write({
       tenant,
@@ -395,7 +396,7 @@ test('CAS retries and reports RefConflictError after three failed compares', asy
   assert.equal(forcedConflicts, 3)
 })
 test('concurrent writers retry and leave heads equal to the resulting tip tree', async () => {
-  const fs = createTuddoFs({ pool })
+  const fs = createTuddoFs({ pool, grants })
   const branch = await fs.fork({
     tenant,
     mount,
@@ -470,6 +471,7 @@ test('onCommit starts only after write cleanup and caller settlement', async () 
   }
   const fs = createTuddoFs({
     pool: gatedPool,
+    grants,
     storage,
     inlineMaxBytes: 1,
     onCommit: async () => {
@@ -534,7 +536,7 @@ test('unlock failure destroys the client before the tenant can write again', asy
     async connect() {
       const client = await realPool.connect()
       const pid = await client.query<{ pid: number }>('SELECT pg_backend_pid() AS pid')
-      backendPids.push(pid.rows[0]?.pid as number)
+      backendPids.push(pid.rows[0]?.pid)
       return {
         query: async <Row extends Record<string, unknown>>(text: string, values?: readonly unknown[]) => {
           if (text.includes('pg_advisory_unlock') && failUnlock) {
@@ -550,7 +552,7 @@ test('unlock failure destroys the client before the tenant can write again', asy
       }
     },
   }
-  const fs = createTuddoFs({ pool: guardedPool, storage, inlineMaxBytes: 1 })
+  const fs = createTuddoFs({ pool: guardedPool, grants, storage, inlineMaxBytes: 1 })
   const branch = await fs.fork({
     tenant,
     mount,
@@ -601,7 +603,7 @@ test('read validates a supplied mount key before resolving grants', async () => 
 })
 
 test('restore rejects unknown and cross-tenant source commits without changing refs or heads', async () => {
-  const fs = createTuddoFs({ pool })
+  const fs = createTuddoFs({ pool, grants })
   const branch = await fs.fork({
     tenant,
     mount,

@@ -28,6 +28,8 @@ npm install tuddofs pg
 
 `tuddofs` owns its PostgreSQL schema. Its tables use the `tuddo_*` prefix and are created by `migrate`; they do not require an ORM migration in the host application.
 
+Migrations and kernel connections default to the `public` schema. Set `schema` on `createTuddoFs` and pass `{ schema }` to `migrate(pool, { schema })` when the package-owned tables belong in another PostgreSQL schema; tuddofs pins that schema for every connection.
+
 ## Quickstart
 
 Run this from an empty directory. It installs the published package and its example PostgreSQL driver; no repository checkout or build step is required:
@@ -157,7 +159,7 @@ Authorization fails closed. Resolver exceptions, timeouts, malformed results, an
 The package entry point exports:
 
 - `createTuddoFs(options)` — construct the kernel with a PostgreSQL-compatible pool, required grants, optional blob storage, and lifecycle hooks.
-- `migrate()` and `tuddoFsDdl` — create or inspect the package-owned `tuddo_*` schema.
+- `migrate(pool, { schema })` and `tuddoFsDdl` — create or inspect the package-owned `tuddo_*` schema; the schema defaults to `public`.
 - Kernel operations — `fork`, `read`, `write`, `delete`, `gc`, and `verify`.
 - `open(input)` — create a session with an actor, session ID, and mount list.
 - Session file operations — `read`, `readBytes`, `write`, `edit`, `list`, `glob`, `stat`, `delete`, `history`, `timeline`, `diff`, `merge`, `resolveMerge`, `restore`, `tag`, and `discard`.

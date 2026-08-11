@@ -2,7 +2,6 @@ import { SchemaDriftError } from './errors.js'
 
 /**
  * The database handle accepted by package-owned migrations.
- * @see spec §4.1 and §10b.2
  */
 export interface TuddoFsClient {
   query<Row extends Record<string, unknown> = Record<string, unknown>>(
@@ -25,10 +24,58 @@ const LEDGER_DDL = `CREATE TABLE IF NOT EXISTS tuddo_migrations (
   applied_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 )`
 
+export interface TuddoFsMigrationOptions {
+  readonly schema?: string
+}
+
+export const DEFAULT_TUDDOFS_SCHEMA = 'public'
+
+const SCHEMA_IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_$]{0,62}$/u
+
+export function normalizeTuddoFsSchema(schema: string | undefined): string {
+  const value = schema ?? DEFAULT_TUDDOFS_SCHEMA
+  if (typeof value !== 'string' || !SCHEMA_IDENTIFIER.test(value))
+    throw new TypeError('tuddofs schema must be a 1-63 character PostgreSQL identifier')
+  return value
+}
+
+function quotedIdentifier(identifier: string): string {
+  return `"${identifier.replaceAll('"', '""')}"`
+}
+
+export function createTuddoFsSchemaPool(pool: TuddoFsPool, schema: string): TuddoFsPool {
+  const normalizedSchema = normalizeTuddoFsSchema(schema)
+  const quotedSchema = quotedIdentifier(normalizedSchema)
+  return {
+    async connect() {
+      const client = await pool.connect()
+      try {
+        await client.query(`SET search_path TO ${quotedSchema}, pg_catalog`)
+      } catch (error) {
+        client.release(error instanceof Error ? error : undefined)
+        throw error
+      }
+      let released = false
+      return {
+        async query<Row extends Record<string, unknown>>(text: string, values?: readonly unknown[]) {
+          const result = await client.query<Row>(text, values)
+          if (/^BEGIN(?:\s|$)/iu.test(text.trim()))
+            await client.query(`SET LOCAL search_path TO ${quotedSchema}, pg_catalog`)
+          return result
+        },
+        release(error?: Error) {
+          if (released) return
+          released = true
+          client.release(error)
+        },
+      }
+    },
+  }
+}
+
 /**
  * Migration 001 is the frozen §4.1 kernel schema. It is immutable once its
  * ledger row is committed; future schema changes must append a new migration.
- * @see spec §15.7
  */
 const DDL = [
   `CREATE TABLE IF NOT EXISTS tuddo_blobs (
@@ -141,36 +188,54 @@ const EXPECTED_COLUMNS: readonly SchemaColumn[] = [
 
 const MIGRATIONS = [{ version: 1, name: 'initial schema', statements: DDL }] as const
 
-async function assertFrozenSchema(client: TuddoFsClient): Promise<void> {
+function symmetricDifference(
+  expected: readonly string[],
+  actual: readonly string[],
+): {
+  missing: string[]
+  unexpected: string[]
+} {
+  const expectedSet = new Set(expected)
+  const actualSet = new Set(actual)
+  return {
+    missing: expected.filter(value => !actualSet.has(value)),
+    unexpected: actual.filter(value => !expectedSet.has(value)),
+  }
+}
+
+const RECOVERY_GUIDANCE =
+  'Migration 001 is already recorded; restore missing objects from a backup or, if data can be discarded, drop the configured schema and rerun migrate.'
+
+async function assertFrozenSchema(client: TuddoFsClient, schema: string): Promise<void> {
   const tableNames = [...new Set(EXPECTED_COLUMNS.map(column => column.table_name))].sort()
   const tables = await client.query<{ table_name: string }>(
     `SELECT table_name
      FROM information_schema.tables
-     WHERE table_schema = 'public' AND table_name LIKE 'tuddo\\_%'
+     WHERE table_schema = $1 AND table_name LIKE 'tuddo\\_%'
      ORDER BY table_name`,
+    [schema],
   )
   const expectedTables = [...tableNames, 'tuddo_migrations'].sort()
   const actualTables = tables.rows.map(row => row.table_name).sort()
-  if (
-    actualTables.length !== expectedTables.length ||
-    actualTables.some((tableName, index) => tableName !== expectedTables[index])
-  ) {
+  const tableDiff = symmetricDifference(expectedTables, actualTables)
+  if (tableDiff.missing.length > 0 || tableDiff.unexpected.length > 0) {
     throw new SchemaDriftError(
-      `Agent FS schema drift detected: expected ${expectedTables.length} tables, found ${actualTables.length}`,
+      `tuddofs schema drift detected in schema "${schema}": missing tables [${tableDiff.missing.join(', ') || 'none'}], unexpected tables [${tableDiff.unexpected.join(', ') || 'none'}]. ${RECOVERY_GUIDANCE}`,
     )
   }
   const result = await client.query<SchemaColumn>(
     `SELECT table_name, column_name
      FROM information_schema.columns
-     WHERE table_schema = 'public' AND table_name = ANY($1::text[])
+     WHERE table_schema = $1 AND table_name = ANY($2::text[])
      ORDER BY table_name, ordinal_position`,
-    [tableNames],
+    [schema, tableNames],
   )
   const expected = EXPECTED_COLUMNS.map(column => `${column.table_name}.${column.column_name}`).sort()
   const actual = result.rows.map(column => `${column.table_name}.${column.column_name}`).sort()
-  if (actual.length !== expected.length || actual.some((column, index) => column !== expected[index])) {
+  const columnDiff = symmetricDifference(expected, actual)
+  if (columnDiff.missing.length > 0 || columnDiff.unexpected.length > 0) {
     throw new SchemaDriftError(
-      `Agent FS schema drift detected: expected ${expected.length} frozen columns, found ${actual.length}`,
+      `tuddofs schema drift detected in schema "${schema}": missing columns [${columnDiff.missing.join(', ') || 'none'}], unexpected columns [${columnDiff.unexpected.join(', ') || 'none'}]. ${RECOVERY_GUIDANCE}`,
     )
   }
 }
@@ -178,21 +243,26 @@ async function assertFrozenSchema(client: TuddoFsClient): Promise<void> {
 /**
  * Apply package-owned migrations under a transaction-local advisory lock, then
  * verify the live §4.1 schema even when every migration is already recorded.
- * @see spec §4.1, §10b.2, and §15.7
  */
-export async function migrate(pool: TuddoFsPool): Promise<void> {
+export async function migrate(pool: TuddoFsPool, options: TuddoFsMigrationOptions | string = {}): Promise<void> {
+  const schema = normalizeTuddoFsSchema(typeof options === 'string' ? options : options.schema)
+  const quotedSchema = quotedIdentifier(schema)
   const client = await pool.connect()
   let committed = false
   try {
     await client.query('BEGIN')
+    await client.query(`SET LOCAL search_path TO ${quotedSchema}, pg_catalog`)
     await client.query(`SELECT pg_advisory_xact_lock(hashtext('tuddofs:migrations'))`)
+    await client.query(`CREATE SCHEMA IF NOT EXISTS ${quotedSchema}`)
     await client.query(LEDGER_DDL)
     const applied = await client.query<MigrationRow>('SELECT version, name FROM tuddo_migrations ORDER BY version')
     for (const migration of MIGRATIONS) {
       const row = applied.rows.find(candidate => candidate.version === migration.version)
       if (row) {
         if (row.name !== migration.name) {
-          throw new SchemaDriftError(`Migration ${migration.version} has immutable name drift`)
+          throw new SchemaDriftError(
+            `Migration ${migration.version} has immutable name drift: expected "${migration.name}", found "${row.name}".`,
+          )
         }
         continue
       }
@@ -204,7 +274,7 @@ export async function migrate(pool: TuddoFsPool): Promise<void> {
         [migration.version, migration.name],
       )
     }
-    await assertFrozenSchema(client)
+    await assertFrozenSchema(client, schema)
     await client.query('COMMIT')
     committed = true
   } catch (error) {
@@ -215,4 +285,4 @@ export async function migrate(pool: TuddoFsPool): Promise<void> {
   }
 }
 
-export const tuddoFsDdl = DDL
+export const tuddoFsDdl: readonly string[] = DDL

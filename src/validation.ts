@@ -3,7 +3,6 @@ import type { ErrorContext } from './errors.js'
 
 /**
  * Error raised when a file path violates the kernel path contract.
- * @see spec §4.3
  */
 export class InvalidPathError extends TuddoFsError {
   constructor(path: unknown, reason: string, context?: Partial<ErrorContext>) {
@@ -17,7 +16,6 @@ export class InvalidPathError extends TuddoFsError {
 
 /**
  * Error raised when a mount key violates the ref-name contract.
- * @see spec §4.4
  */
 export class InvalidMountKeyError extends TuddoFsError {
   readonly mountKey: unknown
@@ -34,7 +32,6 @@ export class InvalidMountKeyError extends TuddoFsError {
 
 /**
  * Error raised when a commit timestamp is not canonical UTC millisecond precision.
- * @see spec §4.2
  */
 export class InvalidCommitTimestampError extends TuddoFsError {
   readonly timestamp: unknown
@@ -51,7 +48,6 @@ export class InvalidCommitTimestampError extends TuddoFsError {
 
 /**
  * Normalize a path to NFC, then validate it without repairing invalid syntax.
- * @see spec §4.3
  */
 export function validatePath(path: string, context?: Partial<ErrorContext>): string {
   if (typeof path !== 'string') {
@@ -85,7 +81,6 @@ export function validatePath(path: string, context?: Partial<ErrorContext>): str
 
 /**
  * Validate a mount key exactly as supplied; mount keys are never normalized.
- * @see spec §4.4
  */
 export function validateMountKey(mountKey: string, context?: Partial<ErrorContext>): string {
   if (typeof mountKey !== 'string' || !/^[a-z0-9][a-z0-9:._-]{0,63}$/u.test(mountKey)) {

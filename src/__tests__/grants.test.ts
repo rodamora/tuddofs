@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { GrantResolverError, GrantController, PermissionDeniedError } from '../index.js'
+import { GrantResolverError, GrantController, PermissionDeniedError, createTuddoFs } from '../index.js'
 
 test('resolver throw surfaces GrantResolverError and denies the operation', async () => {
   const grants = new GrantController({
@@ -72,4 +72,16 @@ test('grant cache reaps expired entries when resolving a new grant', async () =>
   now = 30_001
   await grants.resolve({ id: 'fresh', tenant: 't1' }, { key: 'project:one' })
   assert.equal((grants as unknown as { cache: Map<string, unknown> }).cache.size, 1)
+})
+
+test('grant configuration is required and missing runtime grants fail closed', async () => {
+  const pool = {
+    connect: async () => {
+      throw new Error('database should not be reached')
+    },
+  }
+  // @ts-expect-error grants is required for every typed kernel construction.
+  createTuddoFs({ pool })
+  const fs = createTuddoFs({ pool } as never)
+  await assert.rejects(fs.resolveGrant({ id: 'nobody', tenant: 'whoever' }, { key: 'any:mount' }), GrantResolverError)
 })

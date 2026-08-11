@@ -60,15 +60,17 @@ function fakePool(
   const state = {
     migrations: [] as { version: number; name: string }[],
     ddlApplications: 0,
+    commands: [] as string[],
   }
   return {
     state,
     async connect() {
       return {
         async query<Row extends Record<string, unknown>>(text: string) {
+          state.commands.push(text)
           if (text.includes('FROM tuddo_migrations')) {
             return {
-              rows: state.migrations as Row[],
+              rows: state.migrations as unknown as Row[],
               rowCount: state.migrations.length,
             }
           }
@@ -81,14 +83,14 @@ function fakePool(
               : allTables
             tables.sort()
             return {
-              rows: tables.map(table_name => ({ table_name })) as Row[],
+              rows: tables.map(table_name => ({ table_name })) as unknown as Row[],
               rowCount: tables.length,
             }
           }
           if (text.includes('FROM information_schema.columns')) {
             const orderedSchema = [...schema].sort((left, right) => left.table_name.localeCompare(right.table_name))
             return {
-              rows: orderedSchema as Row[],
+              rows: orderedSchema as unknown as Row[],
               rowCount: orderedSchema.length,
             }
           }
@@ -97,7 +99,9 @@ function fakePool(
             return { rows: [], rowCount: 1 }
           }
           if (
-            !/^(BEGIN|COMMIT|ROLLBACK|SELECT pg_advisory)/.test(text) &&
+            !/^(BEGIN|COMMIT|ROLLBACK|SET LOCAL|SET search_path|RESET search_path|CREATE SCHEMA|SELECT pg_advisory)/.test(
+              text,
+            ) &&
             !text.includes('information_schema') &&
             !text.includes('tuddo_migrations')
           )
@@ -166,4 +170,36 @@ test('migrate rejects a drifted frozen table with a typed error', async () => {
   const pool = fakePool(schema)
 
   await assert.rejects(migrate(pool), error => error instanceof SchemaDriftError)
+})
+
+test('migrate pins the configured schema with a transaction-local search path', async () => {
+  const pool = fakePool()
+
+  await migrate(pool, { schema: 'app' })
+
+  assert.ok(pool.state.commands.some(command => command === 'SET LOCAL search_path TO "app", pg_catalog'))
+})
+
+test('migrate names differing tables and explains recovery', async () => {
+  const pool = fakePool(undefined, ['tuddo_unexpected'])
+
+  await assert.rejects(
+    migrate(pool),
+    error =>
+      error instanceof SchemaDriftError &&
+      error.message.includes('tuddo_unexpected') &&
+      error.message.includes('restore missing objects'),
+  )
+})
+
+test('migrate names differing columns', async () => {
+  const schema = frozenColumns
+    .filter(([, column_name]) => column_name !== 'size_bytes')
+    .map(([table_name, column_name]) => ({ table_name, column_name }))
+  const pool = fakePool(schema)
+
+  await assert.rejects(
+    migrate(pool),
+    error => error instanceof SchemaDriftError && error.message.includes('tuddo_blobs.size_bytes'),
+  )
 })

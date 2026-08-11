@@ -12,6 +12,7 @@ const tenant2 = 'gc-verify-tenant-two'
 const mount = 'project:gc'
 const actor = 'gc-user'
 const now = new Date('2026-08-10T12:00:00.000Z')
+const grants = { resolve: async () => ({ read: true, write: 'direct' as const }) }
 function deferred<T = void>() {
   let resolve!: (value?: T | PromiseLike<T>) => void
   const promise = new Promise<T>(resolvePromise => {
@@ -71,7 +72,7 @@ after(async () => {
 })
 
 test('gc keeps every commit reachable from refs and tags while collecting unreachable old history', async () => {
-  const fs = createTuddoFs({ pool, now: () => now })
+  const fs = createTuddoFs({ pool, grants, now: () => now })
   const branch = await fs.fork({
     tenant,
     mount,
@@ -112,7 +113,7 @@ test('gc keeps every commit reachable from refs and tags while collecting unreac
   assert.ok(!rows.rows.some(row => row.id === unreachable.rows[0]?.id))
 })
 test('gc reports skipped false when no tenants are available', async () => {
-  const fs = createTuddoFs({ pool, now: () => now })
+  const fs = createTuddoFs({ pool, grants, now: () => now })
 
   const result = await fs.gc({ graceMs: 0 })
 
@@ -134,7 +135,7 @@ test('gc deletes old orphan uploads under tuddo tenant prefix but keeps young an
     bytes: Buffer.from('foreign'),
     lastModified: new Date('2026-08-01T00:00:00.000Z'),
   })
-  const fs = createTuddoFs({ pool, storage, now: () => now })
+  const fs = createTuddoFs({ pool, grants, storage, now: () => now })
 
   await fs.gc({ tenant, graceMs: 24 * 60 * 60 * 1000 })
 
@@ -143,7 +144,7 @@ test('gc deletes old orphan uploads under tuddo tenant prefix but keeps young an
   assert.equal(storage.objects.has(`other/${tenant}/must-stay`), true)
 })
 test('seeded randomized GC preserves reachable forks, merge-shaped parents, and tags', async () => {
-  const fs = createTuddoFs({ pool, now: () => now })
+  const fs = createTuddoFs({ pool, grants, now: () => now })
   const configuredSeed = process.env.TUDDOFS_PROPERTY_SEED
   const initialSeed = configuredSeed === undefined ? 0x9e3779b9 : Number(configuredSeed)
   assert.ok(
@@ -239,7 +240,7 @@ test('seeded randomized GC preserves reachable forks, merge-shaped parents, and 
 })
 
 test('gc protects ancestors of grace-protected commits and collects both after grace expiry', async () => {
-  const fs = createTuddoFs({ pool, now: () => now })
+  const fs = createTuddoFs({ pool, grants, now: () => now })
   const branch = await fs.fork({
     tenant,
     mount,
@@ -343,6 +344,7 @@ test('storage-backed writes hold a shared tenant lock while GC exclusive acquisi
   }
   const fs = createTuddoFs({
     pool,
+    grants,
     storage,
     inlineMaxBytes: 1,
     now: () => now,
@@ -395,6 +397,7 @@ test('storage-backed writes to different refs share the tenant lock and overlap'
   }
   const fs = createTuddoFs({
     pool,
+    grants,
     storage,
     inlineMaxBytes: 1,
     now: () => now,
@@ -465,7 +468,7 @@ test('gc deletes an unreachable deep linear chain child-first in bounded mainten
       }
     },
   }
-  const fs = createTuddoFs({ pool: countingPool, now: () => now })
+  const fs = createTuddoFs({ pool: countingPool, grants, now: () => now })
   const branch = await fs.fork({
     tenant,
     mount,
@@ -518,6 +521,7 @@ test('gc race keeps a blob readable when an identical write lands during orphan 
   const storage = new MemoryStore()
   const fs = createTuddoFs({
     pool,
+    grants,
     storage,
     inlineMaxBytes: 1,
     now: () => now,
@@ -591,7 +595,7 @@ test('gc race keeps a blob readable when an identical write lands during orphan 
 })
 
 test('verify keeps same-named refs isolated across tenants', async () => {
-  const fs = createTuddoFs({ pool, now: () => now })
+  const fs = createTuddoFs({ pool, grants, now: () => now })
   const first = await fs.fork({
     tenant,
     mount,
@@ -627,7 +631,7 @@ test('verify keeps same-named refs isolated across tenants', async () => {
 })
 
 test('verify reports zero checked blobs when storage sampling is unavailable', async () => {
-  const fs = createTuddoFs({ pool, now: () => now })
+  const fs = createTuddoFs({ pool, grants, now: () => now })
   const branch = await fs.fork({
     tenant,
     mount,
@@ -650,6 +654,7 @@ test('verify SQL sampling limits hash and storage checks without false ref drift
   const storage = new MemoryStore()
   const fs = createTuddoFs({
     pool,
+    grants,
     storage,
     inlineMaxBytes: 1,
     now: () => now,
@@ -677,7 +682,7 @@ test('verify SQL sampling limits hash and storage checks without false ref drift
 })
 
 test('tag-only commits survive collection after their branch ref is removed', async () => {
-  const fs = createTuddoFs({ pool, now: () => now })
+  const fs = createTuddoFs({ pool, grants, now: () => now })
   const branch = await fs.fork({
     tenant,
     mount,
@@ -722,7 +727,7 @@ test('concurrent gc skips when the tenant advisory lock is already held', async 
   storage.listGate = new Promise<void>(resolve => {
     release = resolve
   })
-  const fs = createTuddoFs({ pool, storage, now: () => now })
+  const fs = createTuddoFs({ pool, grants, storage, now: () => now })
 
   const first = fs.gc({ tenant, graceMs: 0 })
   await startedPromise
@@ -732,7 +737,7 @@ test('concurrent gc skips when the tenant advisory lock is already held', async 
   assert.equal((await first).skipped, false)
 })
 test('unscoped gc reports busy tenants separately from tenants it processed', async () => {
-  const fs = createTuddoFs({ pool, now: () => now })
+  const fs = createTuddoFs({ pool, grants, now: () => now })
   const first = await fs.fork({
     tenant,
     mount,
@@ -760,7 +765,7 @@ test('unscoped gc reports busy tenants separately from tenants it processed', as
 })
 
 test('gc removes settled branch refs and heads atomically after retention', async () => {
-  const fs = createTuddoFs({ pool, now: () => now })
+  const fs = createTuddoFs({ pool, grants, now: () => now })
   const branch = await fs.fork({
     tenant,
     mount,
@@ -801,7 +806,7 @@ test('gc removes settled branch refs and heads atomically after retention', asyn
 })
 
 test('verify reports tree hash drift as a finding without throwing', async () => {
-  const fs = createTuddoFs({ pool, now: () => now })
+  const fs = createTuddoFs({ pool, grants, now: () => now })
   const branch = await fs.fork({
     tenant,
     mount,
@@ -819,7 +824,7 @@ test('verify reports tree hash drift as a finding without throwing', async () =>
 })
 
 test('verify reports heads drift as a finding without throwing', async () => {
-  const fs = createTuddoFs({ pool, now: () => now })
+  const fs = createTuddoFs({ pool, grants, now: () => now })
   const branch = await fs.fork({
     tenant,
     mount,
@@ -845,7 +850,7 @@ test('verify reports heads drift as a finding without throwing', async () => {
   assert.ok(report.findings.some(finding => finding.kind === 'heads-drift'))
 })
 test('verify includes actual values for unexpected heads drift', async () => {
-  const fs = createTuddoFs({ pool, now: () => now })
+  const fs = createTuddoFs({ pool, grants, now: () => now })
   const branch = await fs.fork({
     tenant,
     mount,
@@ -885,6 +890,7 @@ test('verify reports missing CAS storage as a finding without throwing', async (
   const storage = new MemoryStore()
   const fs = createTuddoFs({
     pool,
+    grants,
     storage,
     inlineMaxBytes: 1,
     now: () => now,
@@ -911,7 +917,7 @@ test('verify reports missing CAS storage as a finding without throwing', async (
 })
 
 test('verify reports dangling parent ids as a finding without throwing', async () => {
-  const fs = createTuddoFs({ pool, now: () => now })
+  const fs = createTuddoFs({ pool, grants, now: () => now })
   const branch = await fs.fork({
     tenant,
     mount,
@@ -928,7 +934,7 @@ test('verify reports dangling parent ids as a finding without throwing', async (
 })
 
 test('verify reports orphaned heads rows as a finding', async () => {
-  const fs = createTuddoFs({ pool, now: () => now })
+  const fs = createTuddoFs({ pool, grants, now: () => now })
   await pool.query(
     `INSERT INTO tuddo_heads (tenant, ref_name, path, blob_id, sha256, size_bytes)
      VALUES ($1, 'missing-ref', '/orphan', 1, repeat('0', 64), 1)`,

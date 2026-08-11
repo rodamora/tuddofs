@@ -2,7 +2,6 @@ import type { Readable } from 'node:stream'
 
 import { commitPreimage, hashCommit, hashTree, sha256 as hashSha256, type TreeEntry } from './hashing.js'
 import {
-  TuddoFsError,
   BranchSettledError,
   GrantResolverError,
   InvariantError,
@@ -14,7 +13,7 @@ import {
   type ErrorContext,
 } from './errors.js'
 import { InvalidCommitTimestampError } from './validation.js'
-import { migrate, type TuddoFsPool } from './migration.js'
+import { createTuddoFsSchemaPool, migrate, normalizeTuddoFsSchema, type TuddoFsPool } from './migration.js'
 import { validateMountKey, validatePath } from './validation.js'
 import { GrantController, type Grant } from './grants.js'
 import { createSessionApi } from './session.js'
@@ -34,13 +33,13 @@ export interface BlobStore {
   presignGet?(key: string, opts: { ttlSeconds: number }): Promise<string>
 }
 
-/** Reachability-GC windows and optional tenant scope. @see spec §4.8 */
+/** Reachability-GC windows and optional tenant scope. */
 export interface GcOptions {
   readonly tenant?: string
   readonly graceMs?: number
   readonly settledBranchRetentionMs?: number
 }
-/** Counts returned by a GC cycle; `skipped` is true only when no tenant could run. @see spec §4.8 */
+/** Counts returned by a GC cycle; `skipped` is true only when no tenant could run. */
 export interface GcReport {
   readonly skipped: boolean
   readonly skippedTenants: readonly string[]
@@ -51,7 +50,7 @@ export interface GcReport {
   readonly deletedObjects: number
   readonly settledBranches: number
 }
-/** Typed fsck findings; corruption is reported as data instead of aborting the scan. @see spec §4.9 */
+/** Typed fsck findings; corruption is reported as data instead of aborting the scan. */
 export type VerifyFinding =
   | {
       readonly kind: 'tree-hash-drift'
@@ -99,13 +98,13 @@ export type VerifyFinding =
       readonly path: string
       readonly blobId: string
     }
-/** Limits fsck scope to one tenant and randomizes the tree, commit, and CAS spot-check samples. Ref/head drift remains full-scope. @see spec §4.9 */
+/** Limits fsck scope to one tenant and randomizes the tree, commit, and CAS spot-check samples. Ref/head drift remains full-scope. */
 export interface VerifyOptions {
   readonly tenant?: string
   readonly sample?: number
 }
 
-/** Result of an integrity scan; findings are data, not thrown scan errors. @see spec §4.9 */
+/** Result of an integrity scan; findings are data, not thrown scan errors. */
 export interface VerifyReport {
   readonly tenant?: string
   readonly ok: boolean
@@ -130,7 +129,6 @@ export type WriteMode = 'direct' | 'staged' | 'none'
  * Resolve live permissions. An omitted read mount is passed as `key: ''` to
  * represent an unmounted read; resolvers MUST deny unknown keys (including
  * `''` when they do not support unmounted reads) rather than fail open.
- * @see spec §5
  */
 export interface GrantResolver {
   resolve(actor: Actor, mount: { key: string }): Promise<{ read: boolean; write: WriteMode }>
@@ -140,7 +138,7 @@ export interface GrantResolutionOptions {
   readonly bypassCache?: boolean
 }
 
-/** Receives post-commit hook failures without affecting write durability. @see spec §10b */
+/** Receives post-commit hook failures without affecting write durability. */
 export interface TuddoFsLogger {
   error(error: unknown, context?: object): void
 }
@@ -221,7 +219,7 @@ export interface DeleteResult {
   readonly path: string
   readonly commitSha: string
 }
-/** Result of restoring a prior tree; unchanged restores are explicit no-ops. @see spec §6 */
+/** Result of restoring a prior tree; unchanged restores are explicit no-ops. */
 export interface RestoreResult {
   readonly commitSha: string
   readonly treeSha: string
@@ -247,8 +245,9 @@ export interface CommitEvent {
 
 export interface TuddoFsOptions {
   readonly pool: TuddoFsPool
+  readonly schema?: string
   readonly storage?: BlobStore
-  readonly grants?: GrantResolver
+  readonly grants: GrantResolver
   readonly logger?: TuddoFsLogger
   readonly inlineMaxBytes?: number
   readonly maxCasRetries?: number
@@ -330,7 +329,7 @@ function bytesFor(input: Buffer | Uint8Array | string): Buffer {
 
 async function readAll(readable: Readable): Promise<Buffer> {
   const chunks: Buffer[] = []
-  for await (const chunk of readable) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
+  for await (const chunk of readable) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array))
   return Buffer.concat(chunks)
 }
 
@@ -933,21 +932,23 @@ type VerifyBlobRow = {
   size_bytes: string
 }
 
-export function createTuddoFs(options: TuddoFsOptions): TuddoFsKernel {
+export function createTuddoFs(inputOptions: TuddoFsOptions): TuddoFsKernel {
+  const schema = normalizeTuddoFsSchema(inputOptions.schema)
+  const options: TuddoFsOptions = {
+    ...inputOptions,
+    pool: createTuddoFsSchemaPool(inputOptions.pool, schema),
+  }
   const inlineMaxBytes = options.inlineMaxBytes ?? DEFAULT_INLINE_MAX_BYTES
   const maxCasRetries = options.maxCasRetries ?? DEFAULT_CAS_RETRIES
   const now = options.now ?? (() => new Date())
-  const grants = options.grants
-    ? new GrantController({
-        resolve: options.grants.resolve.bind(options.grants),
-        ttlMs: options.grantCacheTtlMs,
-        timeoutMs: options.grantTimeoutMs,
-        now: () => now().getTime(),
-      })
-    : new GrantController({
-        resolve: async () => ({ read: true, write: 'direct' }),
-        now: () => now().getTime(),
-      })
+  const grants = new GrantController({
+    resolve: options.grants
+      ? (actor, mount) => options.grants.resolve(actor, mount)
+      : () => Promise.reject(new GrantResolverError('A grant resolver is required')),
+    ttlMs: options.grantCacheTtlMs,
+    timeoutMs: options.grantTimeoutMs,
+    now: () => now().getTime(),
+  })
 
   async function gc(input: GcOptions = {}): Promise<GcReport> {
     const graceMs = input.graceMs ?? DEFAULT_GRACE_MS
@@ -1220,7 +1221,8 @@ export function createTuddoFs(options: TuddoFsOptions): TuddoFsKernel {
       for (const row of refEntriesResult.rows) {
         if (row.path === null || row.blob_id === null || row.blob_sha === null || row.blob_size === null) continue
         const refKey = `${row.tenant}\u0000${row.name}`
-        const expected = expectedByRef.get(refKey) ?? new Map()
+        const expected =
+          expectedByRef.get(refKey) ?? new Map<string, { blobId: string; sha256: string; sizeBytes: string }>()
         expected.set(row.path, {
           blobId: row.blob_id,
           sha256: row.blob_sha,
@@ -1244,7 +1246,8 @@ export function createTuddoFs(options: TuddoFsOptions): TuddoFsKernel {
       const refs = new Set(refsResult.rows.map(row => `${row.tenant}\u0000${row.name}`))
       for (const ref of refsResult.rows) {
         const refKey = `${ref.tenant}\u0000${ref.name}`
-        const expected = expectedByRef.get(refKey) ?? new Map()
+        const expected =
+          expectedByRef.get(refKey) ?? new Map<string, { blobId: string; sha256: string; sizeBytes: string }>()
         const actual = headsByRef.get(refKey) ?? new Map<string, VerifyHeadRow>()
         for (const [path, entry] of expected) {
           const head = actual.get(path)
@@ -1566,16 +1569,18 @@ export function createTuddoFs(options: TuddoFsOptions): TuddoFsKernel {
         }
         if (options.onCommit) {
           setImmediate(() => {
-            void Promise.resolve()
-              .then(() => options.onCommit?.(event))
-              .catch(error => {
+            void (async () => {
+              try {
+                await options.onCommit?.(event)
+              } catch (error: unknown) {
                 try {
                   if (options.logger) options.logger.error(error, event)
                   else console.error('TuddoFs onCommit hook failed', error, event)
-                } catch (loggerError) {
+                } catch (loggerError: unknown) {
                   console.error('TuddoFs onCommit hook logger failed', loggerError, { error, event })
                 }
-              })
+              }
+            })()
           })
         }
         return {
@@ -1600,7 +1605,7 @@ export function createTuddoFs(options: TuddoFsOptions): TuddoFsKernel {
         }
         if (lockState !== 'none') {
           const releaseError =
-            failure instanceof Error ? failure : new Error('Agent FS advisory lock state is uncertain')
+            failure instanceof Error ? failure : new Error('tuddofs advisory lock state is uncertain')
           client.release(releaseError)
         } else {
           client.release()
@@ -1815,7 +1820,7 @@ export function createTuddoFs(options: TuddoFsOptions): TuddoFsKernel {
 
   const session = createSessionApi(
     {
-      migrate: () => migrate(options.pool),
+      migrate: () => migrate(inputOptions.pool, { schema }),
       gc,
       verify,
       fork,
@@ -1829,7 +1834,7 @@ export function createTuddoFs(options: TuddoFsOptions): TuddoFsKernel {
     options,
   )
   return {
-    migrate: () => migrate(options.pool),
+    migrate: () => migrate(inputOptions.pool, { schema }),
     gc,
     verify,
     fork,
