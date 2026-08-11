@@ -54,6 +54,7 @@
     "test:minio": "node --import tsx --test scripts/minio-streaming.test.ts",
     "test:s3": "npm test --workspace @tuddofs/s3",
     "test:s3:contract": "npm run test:contract --workspace @tuddofs/s3",
+    "test:ssh": "node --import tsx --test src/integration/sync-ssh-target.ssh.test.ts",
     "demo": "node --import tsx scripts/demo.ts",
     "typecheck": "npm run typecheck:core && npm run typecheck:s3",
     "typecheck:core": "tsc --noEmit -p tsconfig.typecheck.json",
