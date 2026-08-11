@@ -1,6 +1,7 @@
 # s1-surface-diet — cut the consumer API to the §6.2 tiers
 
-Status: in-progress
+Status: done
+Evidence: `da09e9f` (red contract tests), `src/__tests__/surface.test.ts`, `src/__tests__/readme.test.ts`, and `src/integration/{readme,session}.integration.test.ts`.
 Stage: S1 pre-work (ships with s1-tree-coherence as one breaking release)
 Depends on: —
 Spec: `../architecture.md` §6.2 (all four items), §9 (EditMatchError), §13.7 (README same-PR rule)

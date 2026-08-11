@@ -146,6 +146,12 @@ export type MergeResult =
       }[]
     }
 
+type MergeAttemptResult =
+  | 'merged'
+  | 'unauthorized'
+  | 'pendingApproval'
+  | { readonly conflicts: Extract<MergeResult, { status: 'conflicts' }>['conflicts'] }
+
 /** File operations bound to one mount and accepting plain absolute paths (§6.2). */
 export interface MountFileSystem {
   read(path: string): Promise<string>
@@ -175,7 +181,10 @@ export interface SessionFileSystem {
   history(path: string): Promise<readonly HistoryRecord[]>
   timeline(filter?: TimelineFilter): Promise<readonly TimelineRecord[]>
   diff(a: string, b: string): Promise<readonly DiffRecord[]>
-  merge(options?: { mounts?: readonly string[]; approver?: Actor }): Promise<Readonly<Partial<Record<string, MergeResult>>>>
+  merge(options?: {
+    mounts?: readonly string[]
+    approver?: Actor
+  }): Promise<Readonly<Partial<Record<string, MergeResult>>>>
   restore(mountKey: string, at: string): Promise<RestoreResult>
   tag(mountKey: string, label: string): Promise<string>
   discard(): Promise<void>
@@ -934,7 +943,9 @@ export function createSessionApi(kernel: SessionKernel, options: TuddoFsOptions)
             }
             if (!edit.replaceAll && count !== 1)
               throw new EditMatchError(count, { tenant: input.actor.tenant, mount: mount.key, path })
-            text = edit.replaceAll ? text.split(edit.oldText).join(edit.newText) : text.replace(edit.oldText, edit.newText)
+            text = edit.replaceAll
+              ? text.split(edit.oldText).join(edit.newText)
+              : text.replace(edit.oldText, edit.newText)
           }
           return this.write(address, text, { ifSha: currentSha })
         },
@@ -1203,11 +1214,7 @@ export function createSessionApi(kernel: SessionKernel, options: TuddoFsOptions)
             try {
               const result = await mergeRef(mount, mergeOptions)
               results[mount.key] =
-                typeof result === 'string'
-                  ? { status: result === 'pendingApproval' ? 'pendingApproval' : result }
-                  : 'conflicts' in result
-                    ? { status: 'conflicts', conflicts: result.conflicts }
-                    : result
+                typeof result === 'string' ? { status: result } : { status: 'conflicts', conflicts: result.conflicts }
             } catch (error) {
               if (error instanceof BranchSettledError) {
                 results[mount.key] = { status: 'unauthorized' }
@@ -1359,7 +1366,7 @@ export function createSessionApi(kernel: SessionKernel, options: TuddoFsOptions)
         },
       }
       return session
-      async function mergeRef(mount: RefMount, mergeOptions: { approver?: Actor } = {}): Promise<any> {
+      async function mergeRef(mount: RefMount, mergeOptions: { approver?: Actor } = {}): Promise<MergeAttemptResult> {
         if (!mount.fork || !mount.ref) return 'merged'
         if (mergeOptions.approver && mergeOptions.approver.tenant !== input.actor.tenant)
           throw new PermissionDeniedError('Approver tenant does not match session tenant', {

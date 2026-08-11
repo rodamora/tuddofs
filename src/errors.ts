@@ -132,7 +132,6 @@ export class EditMatchError extends TuddoFsError {
   }
 }
 
-
 export type KernelError =
   | InvalidPathError
   | InvalidMountKeyError

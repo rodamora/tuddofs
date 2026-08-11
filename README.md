@@ -26,9 +26,9 @@ These boundaries are reflected in the exported API; do not build a production wo
 npm install tuddofs pg
 ```
 
-`tuddofs` owns its PostgreSQL schema. Its tables use the `tuddo_*` prefix and are created by `migrate`; they do not require an ORM migration in the host application.
+`tuddofs` owns its PostgreSQL schema. Its tables use the `tuddo_*` prefix and are created by `fs.migrate()`; they do not require an ORM migration in the host application.
 
-Migrations and kernel connections default to the `public` schema. Set `schema` on `createTuddoFs` and pass `{ schema }` to `migrate(pool, { schema })` when the package-owned tables belong in another PostgreSQL schema; tuddofs pins that schema for every connection.
+Migrations and kernel connections default to the `public` schema. Set `schema` on `createTuddoFs` when the package-owned tables belong in another PostgreSQL schema; `fs.migrate()` and every operation use that schema.
 
 ## Quickstart
 
@@ -70,7 +70,7 @@ try {
   const session = await fs.open({
     actor: { id: 'quickstart-agent', tenant },
     sessionId: 'quickstart-run',
-    mounts: [{ key: mount }],
+    mounts: [mount],
   })
   const tools = createDirectAdapter(session)
   await tools.write_file({ path: `${mount}:/notes/today.md`, content: 'Ship safely.\n' })
@@ -96,7 +96,7 @@ For an application, the same setup can be embedded in your service code:
 
 ```ts
 import { Pool } from 'pg'
-import { createTuddoFs, createDirectAdapter } from 'tuddofs'
+import { createTuddoFs } from 'tuddofs'
 
 const pool = new Pool({ connectionString: process.env.TUDDOFS_DATABASE_URL })
 const tenant = 'acme'
@@ -117,14 +117,11 @@ await fs.migrate()
 const session = await fs.open({
   actor: { id: 'agent-1', tenant },
   sessionId: 'run-1',
-  mounts: [{ key: mount }],
+  mounts: [mount],
 })
-const tools = createDirectAdapter(session)
-await tools.write_file({
-  path: `${mount}:/notes/today.md`,
-  content: 'Ship safely.\n',
-})
-console.log(await tools.read_file({ path: `${mount}:/notes/today.md` }))
+const notes = session.mount(mount)
+await notes.write('/notes/today.md', 'Ship safely.\n')
+console.log(await notes.read('/notes/today.md'))
 await pool.end()
 ```
 
@@ -138,7 +135,7 @@ Every operation carries an actor with an `id` and `tenant`. A host-provided `Gra
 
 ### Mounts
 
-A mount is addressed as `mount-key:/absolute/path`, for example `project:notes:/notes/today.md`. Sessions can open multiple mounts. A normal mount follows its branch, while a pinned mount addresses a selected commit. Virtual mounts can expose a host-managed read/list/write handler without putting those files in the versioned kernel tables.
+Sessions can open multiple mounts. Host code selects one with `session.mount(key)` and uses plain absolute paths such as `/notes/today.md`. A normal mount follows its branch, while a pinned mount addresses a selected commit. Virtual mounts can expose a host-managed read/list/write handler without putting those files in the versioned kernel tables. Compound `mount-key:/absolute/path` addressing is reserved for tool adapters such as `createDirectAdapter`.
 
 ### Commits and content addressing
 
@@ -150,7 +147,7 @@ Directories are implicit: trees store files only, and path segments synthesize t
 
 ### Branches and sessions
 
-`fork` creates or reuses a tenant-and-mount branch for an agent session. The branch records provenance such as agent kind, thread ID, run ID, and author. An opened session gives the executing agent only the mounts and paths granted to its actor; it does not expose the host application's other data.
+Opening a session creates or reuses a tenant-and-mount branch for the supplied `sessionId`. The branch records provenance such as agent kind, thread ID, run ID, and author. An opened session gives the executing agent only the mounts and paths granted to its actor; it does not expose the host application's other data.
 
 ## Security model
 
@@ -160,17 +157,14 @@ Authorization fails closed. Resolver exceptions, timeouts, malformed results, an
 
 ## API surface
 
-The package entry point exports:
+The main `tuddofs` entry point exports only the Tier-1 consumer surface:
 
-- `createTuddoFs(options)` — construct the kernel with a PostgreSQL-compatible pool, required grants, optional blob storage, and lifecycle hooks.
-- `migrate(pool, { schema })` and `tuddoFsDdl` — create or inspect the package-owned `tuddo_*` schema; the schema defaults to `public`.
-- Kernel operations — `fork`, `read`, `write`, `delete`, `gc`, and `verify`.
-- `open(input)` — create a session with an actor, session ID, and mount list.
-- Session file operations — `read`, `readBytes`, `write`, `edit`, `list`, `glob`, `stat`, `delete`, `history`, `timeline`, `diff`, `merge`, `resolveMerge`, `restore`, `tag`, and `discard`.
-- `createDirectAdapter(session)` — expose the session's basic file operations as direct tool-shaped functions for an agent loop.
-- `BlobStore` and related types — integrate object storage for blobs that do not fit the inline threshold.
-- Deterministic hashing helpers — `sha256`, `treePreimage`, `hashTree`, `commitPreimage`, and `hashCommit`.
-- Typed errors — including `InvalidPathError`, `PermissionDeniedError`, `PreconditionFailedError`, `NotFoundError`, `RefConflictError`, `SchemaDriftError`, and `StorageError`.
+- `createTuddoFs(options)` — returns `{ migrate, open, gc, verify, invalidate }`.
+- `createDirectAdapter(session)` — exposes compound-addressed, tool-shaped file operations for an agent loop.
+- Public option, session, mount-handle, result, grant, storage, and maintenance types.
+- The typed error taxonomy: `InvalidPathError`, `InvalidMountKeyError`, `InvalidCommitTimestampError`, `PermissionDeniedError`, `PreconditionFailedError`, `RefConflictError`, `NotFoundError`, `BranchSettledError`, `MergePendingApprovalError`, `GrantResolverError`, `SchemaDriftError`, `StorageError`, `InvariantError`, and `EditMatchError`.
+
+Low-level ref operations, deterministic hashing helpers, `GrantController`, migrations, and validation functions live under the explicit `tuddofs/internal` subpath. Session `edit()` uses `{ oldText, newText, replaceAll? }`; `merge({ mounts?, approver? })` returns a discriminated status for each selected ref-backed mount.
 
 The TypeScript declarations in `dist/index.d.ts` are the authoritative details for option and result shapes.
 

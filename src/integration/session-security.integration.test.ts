@@ -460,7 +460,7 @@ test('merge does not hold its transaction connection across a pool-backed grant 
       mounts: [{ key: 'scratch' }],
     })
 
-    assert.deepEqual(await session.merge(), { scratch: 'merged' })
+    assert.deepEqual(await session.merge(), { scratch: { status: 'merged' } })
   } finally {
     await resolverPool.end()
   }

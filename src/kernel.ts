@@ -271,11 +271,11 @@ export interface TuddoFsOptions {
 
 /** Tier-1 host operations exposed by `createTuddoFs` (§6.2). */
 export interface TuddoFs {
-  migrate(): Promise<void>
-  gc(input?: GcOptions): Promise<GcReport>
-  verify(input?: VerifyOptions): Promise<VerifyReport>
-  invalidate(actorId: string, mountKey?: string, tenant?: string): void
-  open(input: OpenInput): Promise<SessionFileSystem>
+  readonly migrate: () => Promise<void>
+  readonly gc: (input?: GcOptions) => Promise<GcReport>
+  readonly verify: (input?: VerifyOptions) => Promise<VerifyReport>
+  readonly invalidate: (actorId: string, mountKey?: string, tenant?: string) => void
+  readonly open: (input: OpenInput) => Promise<SessionFileSystem>
 }
 
 /** Tier-2 raw ref operations exposed only through `tuddofs/internal` (§6.2). */

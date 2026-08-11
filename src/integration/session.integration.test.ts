@@ -2,7 +2,13 @@ import assert from 'node:assert/strict'
 import test, { after, before, beforeEach } from 'node:test'
 
 import { Pool } from 'pg'
-import { BranchSettledError, NotFoundError, PermissionDeniedError, PreconditionFailedError, createTuddoFs } from '../index.js'
+import {
+  BranchSettledError,
+  NotFoundError,
+  PermissionDeniedError,
+  PreconditionFailedError,
+  createTuddoFs,
+} from '../index.js'
 import { migrate } from '../internal.js'
 
 const pool = new Pool({ connectionString: process.env.TUDDOFS_DATABASE_URL })
@@ -151,7 +157,7 @@ test('merge with no branch changes does not create an empty commit', async () =>
     [tenant],
   )
 
-  assert.deepEqual(await session.merge(), { 'project:docs': 'merged' })
+  assert.deepEqual(await session.merge(), { 'project:docs': { status: 'merged' } })
 
   const after = await pool.query<{ count: string }>(
     'SELECT count(*)::text AS count FROM tuddo_commits WHERE tenant = $1',
