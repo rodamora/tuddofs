@@ -151,7 +151,6 @@ test('scan records reject malformed sha256sum output instead of reporting an emp
   assert.throws(() => parseScanRecords(`${sha('a')} notes/a.md\0`, dirs), InvalidPathError)
 })
 
-
 test('the size command reuses the scan list instead of interpolating any path', () => {
   const command = sizeCommand('/work space')
 
@@ -194,7 +193,8 @@ test('size records reject malformed stat output and mount escapes instead of gue
 })
 
 test('the upload command single-quotes the presigned URL and every signed header', () => {
-  const url = 'https://blobs.example/tuddo/t/abc?X-Amz-Signature=deadbeef&X-Amz-SignedHeaders=host;x-amz-checksum-sha256'
+  const url =
+    'https://blobs.example/tuddo/t/abc?X-Amz-Signature=deadbeef&X-Amz-SignedHeaders=host;x-amz-checksum-sha256'
   const command = uploadCommand('/work', {
     path: '/work/project%3Anotes/big.bin',
     url,

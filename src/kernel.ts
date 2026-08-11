@@ -1,6 +1,14 @@
 import type { Readable } from 'node:stream'
 
-import { commitPreimage, hashCommit, hashTree, sha256 as hashSha256, type TreeEntry } from './hashing.js'
+import {
+  CAS_SHA256,
+  casObjectKey,
+  commitPreimage,
+  hashCommit,
+  hashTree,
+  sha256 as hashSha256,
+  type TreeEntry,
+} from './hashing.js'
 import {
   BranchSettledError,
   GrantResolverError,
@@ -47,6 +55,14 @@ export interface ChecksumEnforcedPresignedPut {
 export interface ChecksumUnsupportedPresignedPut {
   readonly checksumEnforced: false
   readonly reason?: string
+  /**
+   * PUT URL the store can still issue, bound to no sha whatsoever. The ONLY
+   * legal destination is a quarantine key that a server-side re-hash promotes
+   * (§8.2); pointing it at a CAS key hands an untrusted uploader the entry that
+   * every branch dedupes against. The §8.1 host-facing presign API refuses this
+   * arm outright, and stores that cannot presign at all simply omit it.
+   */
+  readonly url?: string
 }
 
 /** Store-level PUT-presign result; callers reject the unsupported arm rather than trusting bytes (§8.2), with endpoint reachability governed by §8.3. */
@@ -283,11 +299,29 @@ export interface DeleteResult {
   readonly commitSha: string
 }
 
-/** One file observed on a target and re-hashed server-side before commit (§7.3 step 4). */
-export interface CaptureWrite {
+/** One file whose bytes the server fetched off the target and re-hashes here (§7.3 step 4). */
+export interface CaptureBytesWrite {
   readonly path: string
   readonly bytes: Buffer | Uint8Array | string
 }
+
+/**
+ * One file the target uploaded straight into object storage, so the server
+ * never held its bytes (§8.2). The sha is NOT a target claim by the time it
+ * arrives here: it was bound to the stored bytes either by the store rejecting
+ * a mismatched signed checksum at PUT, or by a server-side re-hash of the
+ * quarantine object before it was promoted to the CAS key. `captureBatch`
+ * re-confirms the object under the GC lock and takes the size from the store,
+ * never from this record.
+ */
+export interface CaptureUploadedWrite {
+  readonly path: string
+  readonly sha256: string
+  readonly sizeBytes: number | bigint
+}
+
+/** One file observed on a target, in whichever way its bytes reached storage (§7.3 step 4, §8.2). */
+export type CaptureWrite = CaptureBytesWrite | CaptureUploadedWrite
 
 /**
  * Batch commit form used by exec capture and turn-end reconcile: one commit per
@@ -716,7 +750,7 @@ async function ensureStorage(
 ): Promise<string | null> {
   if (bytes.length <= inlineMaxBytes) return null
   if (!storage) throw new StorageError('Large blob requires an object storage backend', context)
-  const key = `tuddo/${tenant}/${sha256}`
+  const key = casObjectKey(tenant, sha256)
   try {
     if (!(await storage.head(key))) await storage.put(key, bytes)
   } catch (error) {
@@ -724,6 +758,53 @@ async function ensureStorage(
     throw new StorageError(error instanceof Error ? error.message : 'Object storage failed', context)
   }
   return key
+}
+
+/**
+ * Confirm a §8.2 direct-upload capture entry, inside the tenant GC lock, right
+ * before a commit references it.
+ *
+ * This is NOT the sha verification — that already happened where the bytes
+ * were, at the store's signed-checksum PUT or at the server-side re-hash before
+ * promotion. §8.2 is explicit that existence and size prove nothing about
+ * identity. What this does prove is that the promoted object is still present
+ * under the lock GC respects, so the commit cannot reference a swept key, and
+ * it takes the SIZE from the store: a target that told the truth about the sha
+ * and lied about the length would otherwise put a wrong `size_bytes` into the
+ * tree and every fsck downstream would report drift.
+ */
+async function confirmStored(
+  storage: BlobStore | undefined,
+  tenant: string,
+  sha256: string,
+  claimedSizeBytes: bigint,
+  inlineMaxBytes: number,
+  context: ErrorContext,
+): Promise<{ key: string; sizeBytes: bigint }> {
+  if (!storage) throw new StorageError('Direct-upload capture requires an object storage backend', context)
+  if (claimedSizeBytes <= BigInt(inlineMaxBytes)) {
+    throw new StorageError(
+      `Direct-upload capture is for blobs above the ${inlineMaxBytes}-byte inline threshold`,
+      context,
+    )
+  }
+  const key = casObjectKey(tenant, sha256)
+  let head: { sizeBytes: number } | null
+  try {
+    head = await storage.head(key)
+  } catch (error) {
+    if (error instanceof StorageError) throw error
+    throw new StorageError(error instanceof Error ? error.message : 'Object storage failed', context)
+  }
+  if (!head) throw new StorageError(`Direct-upload capture found no object at ${key}`, context)
+  const sizeBytes = BigInt(head.sizeBytes)
+  if (sizeBytes !== claimedSizeBytes) {
+    throw new StorageError(
+      `Direct-upload capture claimed ${claimedSizeBytes} bytes but ${key} holds ${sizeBytes}`,
+      context,
+    )
+  }
+  return { key, sizeBytes }
 }
 
 async function updateHead(client: Queryable, tenant: string, ref: string, path: string, entry: Entry): Promise<void> {
@@ -1034,8 +1115,11 @@ type VerifyBlobRow = {
 
 export function createTuddoFs(inputOptions: TuddoFsOptions): TuddoFsKernel {
   const schema = normalizeTuddoFsSchema(inputOptions.schema)
+  // `inlineMaxBytes` is resolved here and carried in `options`, so the session
+  // layer reads one value instead of re-deriving the default and drifting.
   const options: TuddoFsOptions = {
     ...inputOptions,
+    inlineMaxBytes: inputOptions.inlineMaxBytes ?? DEFAULT_INLINE_MAX_BYTES,
     pool: createTuddoFsSchemaPool(inputOptions.pool, schema),
   }
   const inlineMaxBytes = options.inlineMaxBytes ?? DEFAULT_INLINE_MAX_BYTES
@@ -1898,8 +1982,13 @@ export function createTuddoFs(inputOptions: TuddoFsOptions): TuddoFsKernel {
    * deletion in a single commit (§7.3 phase 3 step 5, phase 4, §4.5 batch form).
    *
    * Invariants:
-   * - Bytes are hashed here. A target-reported sha never becomes commit identity
-   *   (§13 never-do list).
+   * - Bytes the server holds are hashed here. A target-reported sha never
+   *   becomes commit identity (§13 never-do list). A §8.2 direct-upload entry
+   *   carries no bytes to hash, and its sha is bound to the stored object
+   *   before it reaches this function — by the store rejecting a mismatched
+   *   signed checksum, or by a server-side re-hash of the quarantine object.
+   *   {@link confirmStored} re-confirms the object under the GC lock and takes
+   *   the length from the store, so a size lie cannot enter the tree either.
    * - Object-storage uploads happen BEFORE the transaction, under the tenant GC
    *   lock, exactly as single-path `write` does.
    * - §4.3 point 2 capture rule: a captured path that implies a directory over a
@@ -1919,8 +2008,20 @@ export function createTuddoFs(inputOptions: TuddoFsOptions): TuddoFsKernel {
     })
     validateMountKey(input.mount, context)
     const writes = input.writes.map(entry => {
-      const bytes = bytesFor(entry.bytes)
-      return { path: validatePath(entry.path, context), bytes, sha256: hashSha256(bytes) }
+      const path = validatePath(entry.path, context)
+      if ('bytes' in entry) {
+        const bytes = bytesFor(entry.bytes)
+        return { path, bytes, sha256: hashSha256(bytes), sizeBytes: BigInt(bytes.length), uploaded: false as const }
+      }
+      if (!CAS_SHA256.test(entry.sha256))
+        throw new StorageError('Direct-upload capture requires a lowercase hexadecimal sha256', context)
+      return {
+        path,
+        bytes: null,
+        sha256: entry.sha256,
+        sizeBytes: BigInt(entry.sizeBytes),
+        uploaded: true as const,
+      }
     })
     const deletes = input.deletes.map(path => validatePath(path, context))
     const selfCollision = findTreeCoherenceCollisions(writes.map(entry => entry.path))[0]
@@ -1932,7 +2033,7 @@ export function createTuddoFs(inputOptions: TuddoFsOptions): TuddoFsKernel {
       )
     }
     if (!(await grant(grants, 'write', input))) throw new PermissionDeniedError('Write permission denied', context)
-    const storageBacked = writes.some(entry => entry.bytes.length > inlineMaxBytes)
+    const storageBacked = writes.some(entry => entry.uploaded || entry.sizeBytes > BigInt(inlineMaxBytes))
 
     for (let attempt = 0; attempt < maxCasRetries; attempt += 1) {
       const client = await options.pool.connect()
@@ -1947,6 +2048,18 @@ export function createTuddoFs(inputOptions: TuddoFsOptions): TuddoFsKernel {
         const objectKeys = new Map<string, string | null>()
         for (const entry of writes) {
           if (objectKeys.has(entry.sha256)) continue
+          if (entry.bytes === null) {
+            const confirmed = await confirmStored(
+              options.storage,
+              input.tenant,
+              entry.sha256,
+              entry.sizeBytes,
+              inlineMaxBytes,
+              context,
+            )
+            objectKeys.set(entry.sha256, confirmed.key)
+            continue
+          }
           objectKeys.set(
             entry.sha256,
             await ensureStorage(options.storage, input.tenant, entry.bytes, entry.sha256, inlineMaxBytes, context),
@@ -1976,14 +2089,14 @@ export function createTuddoFs(inputOptions: TuddoFsOptions): TuddoFsKernel {
               client,
               input.tenant,
               entry.bytes,
-              entry.bytes.length,
+              entry.sizeBytes,
               entry.sha256,
               inlineMaxBytes,
               objectKeys.get(entry.sha256) ?? null,
               context,
             ),
             sha256: entry.sha256,
-            sizeBytes: BigInt(entry.bytes.length),
+            sizeBytes: entry.sizeBytes,
             mode: current?.mode ?? 420,
           })
         }

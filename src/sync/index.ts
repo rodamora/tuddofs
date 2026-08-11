@@ -36,15 +36,18 @@ export {
   mirrorDirName,
   mountKeyForMirrorDir,
   parseScanRecords,
+  parseSizeRecords,
   probeCommand,
   quoteShellArg,
   resolveUnderRoot,
   scanCommand,
+  sizeCommand,
   stampCommand,
+  uploadCommand,
   HYDRATION_MARKER_FILENAME,
   SCAN_LIST_FILENAME,
   STAMP_FILENAME,
   STATE_DIRNAME,
 } from './paths.js'
-export type { ScanCommandInput, ScanRecord } from './paths.js'
+export type { ScanCommandInput, ScanRecord, SizeRecord, UploadCommandInput } from './paths.js'
 export { CaptureSlot } from './slot.js'

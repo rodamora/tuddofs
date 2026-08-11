@@ -29,13 +29,7 @@ import {
   type SessionFileSystem,
   type WriteMode,
 } from '../index.js'
-import {
-  createLocalDirectoryTarget,
-  createSyncEngine,
-  migrate,
-  type SyncEngine,
-  type SyncTarget,
-} from '../internal.js'
+import { createLocalDirectoryTarget, createSyncEngine, migrate, type SyncEngine, type SyncTarget } from '../internal.js'
 
 const pool = new Pool({ connectionString: process.env.TUDDOFS_DATABASE_URL })
 const tenant = 'sync-capture-blobs-integration'
@@ -280,6 +274,13 @@ async function setup(
 const fill = (bytes: number, character: string) =>
   `head -c ${bytes} /dev/zero | tr '\\0' '${character}' > 'project%3Adocs/`
 
+/** The object key the target's `curl` actually PUT to, read back off the exec line. */
+function uploadedKey(probe: Probe): string | undefined {
+  const curl = probe.execs.find(cmd => cmd.startsWith('curl '))
+  const url = curl?.match(/'(https?:\/\/[^']+)'/u)?.[1]
+  return url === undefined ? undefined : decodeURIComponent(new URL(url).pathname.replace(/^\/o\//u, ''))
+}
+
 test('a large captured file uploads direct from the target and never through server memory', async () => {
   const { session, engine, probe } = await setup('blobs-direct')
 
@@ -296,18 +297,23 @@ test('a large captured file uploads direct from the target and never through ser
   assert.deepEqual(probe.readFiles, [])
   // Enforcing store: the presign named the CAS key itself, no quarantine hop.
   assert.deepEqual(storage.presignedKeys, [`tuddo/${tenant}/${sha}`])
+  assert.equal(uploadedKey(probe), `tuddo/${tenant}/${sha}`)
   assert.deepEqual([...storage.objects.keys()], [`tuddo/${tenant}/${sha}`])
 
-  const row = await pool.query<{ sha256: string; size_bytes: string; object_key: string | null; inline: Buffer | null }>(
-    'SELECT sha256, size_bytes::text, object_key, inline FROM tuddo_blobs WHERE tenant = $1',
-    [tenant],
-  )
+  const row = await pool.query<{
+    sha256: string
+    size_bytes: string
+    object_key: string | null
+    inline: Buffer | null
+  }>('SELECT sha256, size_bytes::text, object_key, inline FROM tuddo_blobs WHERE tenant = $1', [tenant])
   assert.deepEqual(row.rows, [{ sha256: sha, size_bytes: '4096', object_key: `tuddo/${tenant}/${sha}`, inline: null }])
 })
 
 test('a lying target cannot poison the CAS: the enforcing store rejects the PUT', async () => {
   const { session, engine, probe } = await setup('blobs-lying-enforced')
-  const poisoned = createHash('sha256').update(Buffer.from('the bytes another branch will dedupe against')).digest('hex')
+  const poisoned = createHash('sha256')
+    .update(Buffer.from('the bytes another branch will dedupe against'))
+    .digest('hex')
   probe.scanLies['project%3Adocs/big.bin'] = poisoned
 
   await engine.exec(`${fill(4096, 'B')}big.bin'`)
@@ -337,10 +343,11 @@ test('a lying target cannot poison the CAS: the fallback quarantines and discard
   // Existence and size are not verification (§8.2): the upload SUCCEEDED, and
   // the server-side re-hash is what caught it.
   assert.equal(storage.rejectedPuts, 0)
-  assert.equal(
-    storage.presignedKeys.every(key => key.includes('/quarantine/')),
-    true,
-  )
+  // The store was asked for the CAS key first and answered "I cannot enforce",
+  // so that URL was dropped unused and the target was handed a quarantine key.
+  assert.deepEqual(storage.presignedKeys[0], `tuddo/${tenant}/${poisoned}`)
+  assert.equal(storage.presignedKeys[1]?.includes('/quarantine/'), true)
+  assert.equal(uploadedKey(probe), storage.presignedKeys[1])
   assert.deepEqual([...storage.objects.keys()], [])
   await assert.rejects(session.mount('project:docs').readBytes('/big.bin'))
 })
@@ -357,8 +364,11 @@ test('a store that cannot enforce checksums promotes honest bytes through quaran
   assert.deepEqual(failures, [])
   assert.deepEqual(await session.mount('project:docs').readBytes('/big.bin'), expected)
   assert.deepEqual(probe.readFiles, [])
-  assert.equal(storage.presignedKeys.length, 1)
-  assert.equal(storage.presignedKeys[0]?.includes('/quarantine/'), true)
+  assert.deepEqual(storage.presignedKeys[0], `tuddo/${tenant}/${sha}`)
+  assert.equal(storage.presignedKeys[1]?.includes('/quarantine/'), true)
+  // An unverified PUT URL is never pointed at a CAS key: the target uploads to
+  // quarantine and a server-side re-hash is what lets the bytes out (§8.2).
+  assert.equal(uploadedKey(probe), storage.presignedKeys[1])
   // Promotion is a server-side copy to the CAS key and the quarantine object is
   // dropped; nothing is left behind for GC to find (§8.1, §8.2).
   assert.deepEqual([...storage.objects.keys()], [`tuddo/${tenant}/${sha}`])
