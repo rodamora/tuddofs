@@ -84,6 +84,9 @@ type PathCollection = {
   keys(): IterableIterator<string>
 }
 
+/**
+ * A file-prefix collision that violates the tree-coherence invariant in architecture §4.3.
+ */
 export type TreeCoherenceCollision = {
   readonly path: string
   readonly collidingPath: string
