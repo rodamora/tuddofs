@@ -7,84 +7,99 @@ import { SchemaDriftError } from '../errors.js'
 import { migrate } from '../migration.js'
 
 const frozenColumns = [
-  ['afs_blobs', 'id'],
-  ['afs_blobs', 'tenant'],
-  ['afs_blobs', 'sha256'],
-  ['afs_blobs', 'size_bytes'],
-  ['afs_blobs', 'inline'],
-  ['afs_blobs', 'object_key'],
-  ['afs_blobs', 'created_at'],
-  ['afs_trees', 'id'],
-  ['afs_trees', 'tenant'],
-  ['afs_trees', 'tree_sha'],
-  ['afs_trees', 'created_at'],
-  ['afs_tree_entries', 'tree_id'],
-  ['afs_tree_entries', 'path'],
-  ['afs_tree_entries', 'blob_id'],
-  ['afs_tree_entries', 'mode'],
-  ['afs_commits', 'id'],
-  ['afs_commits', 'tenant'],
-  ['afs_commits', 'commit_sha'],
-  ['afs_commits', 'tree_id'],
-  ['afs_commits', 'parents'],
-  ['afs_commits', 'author_user'],
-  ['afs_commits', 'agent_kind'],
-  ['afs_commits', 'thread_id'],
-  ['afs_commits', 'run_id'],
-  ['afs_commits', 'op'],
-  ['afs_commits', 'message'],
-  ['afs_commits', 'created_at'],
-  ['afs_refs', 'tenant'],
-  ['afs_refs', 'name'],
-  ['afs_refs', 'kind'],
-  ['afs_refs', 'commit_id'],
-  ['afs_refs', 'base_commit'],
-  ['afs_refs', 'state'],
-  ['afs_refs', 'created_at'],
-  ['afs_refs', 'settled_at'],
-  ['afs_heads', 'tenant'],
-  ['afs_heads', 'ref_name'],
-  ['afs_heads', 'path'],
-  ['afs_heads', 'blob_id'],
-  ['afs_heads', 'sha256'],
-  ['afs_heads', 'size_bytes'],
+  ['tuddo_blobs', 'id'],
+  ['tuddo_blobs', 'tenant'],
+  ['tuddo_blobs', 'sha256'],
+  ['tuddo_blobs', 'size_bytes'],
+  ['tuddo_blobs', 'inline'],
+  ['tuddo_blobs', 'object_key'],
+  ['tuddo_blobs', 'created_at'],
+  ['tuddo_trees', 'id'],
+  ['tuddo_trees', 'tenant'],
+  ['tuddo_trees', 'tree_sha'],
+  ['tuddo_trees', 'created_at'],
+  ['tuddo_tree_entries', 'tree_id'],
+  ['tuddo_tree_entries', 'path'],
+  ['tuddo_tree_entries', 'blob_id'],
+  ['tuddo_tree_entries', 'mode'],
+  ['tuddo_commits', 'id'],
+  ['tuddo_commits', 'tenant'],
+  ['tuddo_commits', 'commit_sha'],
+  ['tuddo_commits', 'tree_id'],
+  ['tuddo_commits', 'parents'],
+  ['tuddo_commits', 'author_user'],
+  ['tuddo_commits', 'agent_kind'],
+  ['tuddo_commits', 'thread_id'],
+  ['tuddo_commits', 'run_id'],
+  ['tuddo_commits', 'op'],
+  ['tuddo_commits', 'message'],
+  ['tuddo_commits', 'created_at'],
+  ['tuddo_refs', 'tenant'],
+  ['tuddo_refs', 'name'],
+  ['tuddo_refs', 'kind'],
+  ['tuddo_refs', 'commit_id'],
+  ['tuddo_refs', 'base_commit'],
+  ['tuddo_refs', 'state'],
+  ['tuddo_refs', 'created_at'],
+  ['tuddo_refs', 'settled_at'],
+  ['tuddo_heads', 'tenant'],
+  ['tuddo_heads', 'ref_name'],
+  ['tuddo_heads', 'path'],
+  ['tuddo_heads', 'blob_id'],
+  ['tuddo_heads', 'sha256'],
+  ['tuddo_heads', 'size_bytes'],
 ] as const
 
 function fakePool(
-  schema = frozenColumns.map(([table_name, column_name]) => ({ table_name, column_name })),
+  schema = frozenColumns.map(([table_name, column_name]) => ({
+    table_name,
+    column_name,
+  })),
   extraTables: readonly string[] = [],
 ) {
-  const state = { migrations: [] as { version: number; name: string }[], ddlApplications: 0 }
+  const state = {
+    migrations: [] as { version: number; name: string }[],
+    ddlApplications: 0,
+  }
   return {
     state,
     async connect() {
       return {
         async query<Row extends Record<string, unknown>>(text: string) {
-          if (text.includes('FROM afs_migrations')) {
-            return { rows: state.migrations as Row[], rowCount: state.migrations.length }
+          if (text.includes('FROM tuddo_migrations')) {
+            return {
+              rows: state.migrations as Row[],
+              rowCount: state.migrations.length,
+            }
           }
           if (text.includes('FROM information_schema.tables')) {
             const allTables = [
-              ...new Set([...schema.map(column => column.table_name), ...extraTables, 'afs_migrations']),
+              ...new Set([...schema.map(column => column.table_name), ...extraTables, 'tuddo_migrations']),
             ]
-            const tables = text.includes("LIKE 'afs\\_%'")
-              ? allTables.filter(table_name => table_name.startsWith('afs_'))
+            const tables = text.includes("LIKE 'tuddo\\_%'")
+              ? allTables.filter(table_name => table_name.startsWith('tuddo_'))
               : allTables
             tables.sort()
-            return { rows: tables.map(table_name => ({ table_name })) as Row[], rowCount: tables.length }
+            return {
+              rows: tables.map(table_name => ({ table_name })) as Row[],
+              rowCount: tables.length,
+            }
           }
           if (text.includes('FROM information_schema.columns')) {
             const orderedSchema = [...schema].sort((left, right) => left.table_name.localeCompare(right.table_name))
-            return { rows: orderedSchema as Row[], rowCount: orderedSchema.length }
+            return {
+              rows: orderedSchema as Row[],
+              rowCount: orderedSchema.length,
+            }
           }
-          if (text.startsWith('INSERT INTO afs_migrations')) {
+          if (text.startsWith('INSERT INTO tuddo_migrations')) {
             if (state.migrations.length === 0) state.migrations.push({ version: 1, name: 'initial schema' })
             return { rows: [], rowCount: 1 }
           }
           if (
             !/^(BEGIN|COMMIT|ROLLBACK|SELECT pg_advisory)/.test(text) &&
             !text.includes('information_schema') &&
-            !text.includes('afs_migrations')
+            !text.includes('tuddo_migrations')
           )
             state.ddlApplications += 1
           return { rows: [], rowCount: 0 }
@@ -106,8 +121,8 @@ test('migrate records migration 001 and makes the second call a schema-checked n
   assert.equal(pool.state.ddlApplications, firstDdlApplications)
 })
 
-test('migrate ignores cohabiting afsx_ tables when checking the frozen schema', async () => {
-  const pool = fakePool(undefined, ['afsx_cache'])
+test('migrate ignores cohabiting tuddox_ tables when checking the frozen schema', async () => {
+  const pool = fakePool(undefined, ['tuddox_cache'])
 
   await migrate(pool)
 

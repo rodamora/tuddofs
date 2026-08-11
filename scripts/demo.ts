@@ -2,8 +2,8 @@ import { Pool } from 'pg'
 
 import { createAgentFs, createDirectAdapter } from '../src/index.js'
 
-const connectionString = process.env.AGENT_FS_DATABASE_URL ?? process.env.DATABASE_URL
-if (!connectionString) throw new Error('AGENT_FS_DATABASE_URL or DATABASE_URL is required')
+const connectionString = process.env.TUDDOFS_DATABASE_URL ?? process.env.DATABASE_URL
+if (!connectionString) throw new Error('TUDDOFS_DATABASE_URL or DATABASE_URL is required')
 
 const pool = new Pool({ connectionString })
 const tenant = `demo-${Date.now()}`
@@ -24,13 +24,20 @@ try {
   const session = await fs.open({
     actor: { id: 'demo-user', tenant },
     sessionId: 'demo-session',
-    attribution: { agentKind: 'demo-agent', threadId: 'demo-thread', runId: 'demo-run' },
+    attribution: {
+      agentKind: 'demo-agent',
+      threadId: 'demo-thread',
+      runId: 'demo-run',
+    },
     mounts: [{ key: mount }],
   })
   const tools = createDirectAdapter(session)
 
   // A tiny in-process agent loop: each turn only receives the session tools.
-  await tools.write_file({ path: `${mount}:/notes/plan.md`, content: '# Plan\n' })
+  await tools.write_file({
+    path: `${mount}:/notes/plan.md`,
+    content: '# Plan\n',
+  })
   const stat = await tools.stat_file({ path: `${mount}:/notes/plan.md` })
   await tools.edit_file({
     path: `${mount}:/notes/plan.md`,
@@ -46,7 +53,15 @@ try {
     confined = true
   }
 
-  console.log(JSON.stringify({ tenant, mount, text, files: files.map(file => file.path), confined }))
+  console.log(
+    JSON.stringify({
+      tenant,
+      mount,
+      text,
+      files: files.map(file => file.path),
+      confined,
+    }),
+  )
 } finally {
   await pool.end()
 }

@@ -13,18 +13,5 @@ export default tseslint.config(
         tsconfigRootDir: import.meta.dirname,
       },
     },
-    rules: {
-      'no-restricted-imports': [
-        'error',
-        {
-          patterns: [
-            {
-              group: ['@/*'],
-              message: 'agent-fs must not import repository-internal @/* modules',
-            },
-          ],
-        },
-      ],
-    },
   },
 )

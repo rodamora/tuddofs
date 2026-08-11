@@ -337,7 +337,13 @@ async function readAll(readable: Readable): Promise<Buffer> {
 async function grant(
   controller: GrantController,
   action: 'read' | 'write',
-  input: { tenant: string; mount?: string; path?: string; ref?: string; authorUser?: string },
+  input: {
+    tenant: string
+    mount?: string
+    path?: string
+    ref?: string
+    authorUser?: string
+  },
   options: GrantResolutionOptions = {},
 ): Promise<boolean> {
   const result = await controller.resolve(
@@ -384,23 +390,23 @@ async function insertBlob(
   context: ErrorContext,
 ): Promise<bigint> {
   const result = await client.query<{ id: string }>(
-    `INSERT INTO afs_blobs (tenant, sha256, size_bytes, inline, object_key)
+    `INSERT INTO tuddo_blobs (tenant, sha256, size_bytes, inline, object_key)
      VALUES ($1, $2, $3, $4, $5)
      ON CONFLICT (tenant, sha256) DO NOTHING
      RETURNING id::text`,
     [tenant, sha256, bytes.length.toString(), bytes.length <= inlineMaxBytes ? bytes : null, objectKey],
   )
-  if (result.rows[0]) return asBigInt(result.rows[0].id, 'afs_blobs.id', context)
+  if (result.rows[0]) return asBigInt(result.rows[0].id, 'tuddo_blobs.id', context)
   const existing = await client.query<{ id: string; size_bytes: string }>(
-    'SELECT id::text, size_bytes::text FROM afs_blobs WHERE tenant = $1 AND sha256 = $2',
+    'SELECT id::text, size_bytes::text FROM tuddo_blobs WHERE tenant = $1 AND sha256 = $2',
     [tenant, sha256],
   )
   const row = existing.rows[0]
   if (!row) throw new InvariantError(`Blob insert/select failed for ${sha256}`, context)
-  if (asBigInt(row.size_bytes, 'afs_blobs.size_bytes', context) !== BigInt(bytes.length)) {
+  if (asBigInt(row.size_bytes, 'tuddo_blobs.size_bytes', context) !== BigInt(bytes.length)) {
     throw new InvariantError(`Blob collision for ${sha256}`, context)
   }
-  return asBigInt(row.id, 'afs_blobs.id', context)
+  return asBigInt(row.id, 'tuddo_blobs.id', context)
 }
 
 async function insertTree(
@@ -416,14 +422,14 @@ async function insertTree(
   }))
   const treeSha = hashTree(treeEntries)
   const inserted = await client.query<{ id: string }>(
-    `INSERT INTO afs_trees (tenant, tree_sha)
+    `INSERT INTO tuddo_trees (tenant, tree_sha)
      VALUES ($1, $2)
      ON CONFLICT (tenant, tree_sha) DO NOTHING
      RETURNING id::text`,
     [tenant, treeSha],
   )
   const treeId = inserted.rows[0]
-    ? asBigInt(inserted.rows[0].id, 'afs_trees.id', context)
+    ? asBigInt(inserted.rows[0].id, 'tuddo_trees.id', context)
     : await loadTreeId(client, tenant, treeSha, context)
   if (inserted.rows[0]) {
     const rows = [...entries]
@@ -437,7 +443,7 @@ async function insertTree(
         return `($1::bigint, $${base}, $${base + 1}::bigint, $${base + 2})`
       })
       await client.query(
-        `INSERT INTO afs_tree_entries (tree_id, path, blob_id, mode)
+        `INSERT INTO tuddo_tree_entries (tree_id, path, blob_id, mode)
          VALUES ${values.join(', ')}
          ON CONFLICT (tree_id, path) DO NOTHING`,
         params,
@@ -449,12 +455,12 @@ async function insertTree(
 
 async function loadTreeId(client: Queryable, tenant: string, treeSha: string, context: ErrorContext): Promise<bigint> {
   const selected = await client.query<{ id: string }>(
-    'SELECT id::text FROM afs_trees WHERE tenant = $1 AND tree_sha = $2',
+    'SELECT id::text FROM tuddo_trees WHERE tenant = $1 AND tree_sha = $2',
     [tenant, treeSha],
   )
   const row = selected.rows[0]
   if (!row) throw new InvariantError(`Tree insert/select failed for ${treeSha}`, context)
-  return asBigInt(row.id, 'afs_trees.id', context)
+  return asBigInt(row.id, 'tuddo_trees.id', context)
 }
 
 async function insertCommit(
@@ -488,7 +494,7 @@ async function insertCommit(
   }
   const commitSha = hashCommit(hashInput)
   const inserted = await client.query<{ id: string }>(
-    `INSERT INTO afs_commits (
+    `INSERT INTO tuddo_commits (
        tenant, commit_sha, tree_id, parents, author_user, agent_kind,
        thread_id, run_id, op, message, created_at
      ) VALUES ($1, $2, $3::bigint, $4::bigint[], $5, $6, $7, $8, $9, $10, $11)
@@ -508,19 +514,26 @@ async function insertCommit(
       input.createdAt,
     ],
   )
-  if (inserted.rows[0]) return { id: asBigInt(inserted.rows[0].id, 'afs_commits.id', input.context), sha: commitSha }
+  if (inserted.rows[0])
+    return {
+      id: asBigInt(inserted.rows[0].id, 'tuddo_commits.id', input.context),
+      sha: commitSha,
+    }
   const selected = await client.query<{ id: string }>(
-    'SELECT id::text FROM afs_commits WHERE tenant = $1 AND commit_sha = $2',
+    'SELECT id::text FROM tuddo_commits WHERE tenant = $1 AND commit_sha = $2',
     [input.tenant, commitSha],
   )
   const row = selected.rows[0]
   if (!row) throw new InvariantError(`Commit insert/select failed for ${commitSha}`, input.context)
-  return { id: asBigInt(row.id, 'afs_commits.id', input.context), sha: commitSha }
+  return {
+    id: asBigInt(row.id, 'tuddo_commits.id', input.context),
+    sha: commitSha,
+  }
 }
 async function loadRef(client: Queryable, tenant: string, ref: string, context: ErrorContext): Promise<RefRow> {
   const result = await client.query<RefRow>(
     `SELECT r.commit_id::text, r.base_commit::text, c.commit_sha, t.tree_sha, r.kind, r.state
-     FROM afs_refs r JOIN afs_commits c ON c.id = r.commit_id JOIN afs_trees t ON t.id = c.tree_id
+     FROM tuddo_refs r JOIN tuddo_commits c ON c.id = r.commit_id JOIN tuddo_trees t ON t.id = c.tree_id
      WHERE r.tenant = $1 AND r.name = $2`,
     [tenant, ref],
   )
@@ -539,9 +552,9 @@ async function loadHeads(
   const result = await client.query<HeadRow>(
     `SELECT h.path, h.blob_id::text, h.sha256, h.size_bytes::text,
             COALESCE(e.mode, 420)::int AS mode
-     FROM afs_heads h
-     LEFT JOIN afs_commits c ON c.id = $3::bigint
-     LEFT JOIN afs_tree_entries e ON e.tree_id = c.tree_id AND e.path = h.path
+     FROM tuddo_heads h
+     LEFT JOIN tuddo_commits c ON c.id = $3::bigint
+     LEFT JOIN tuddo_tree_entries e ON e.tree_id = c.tree_id AND e.path = h.path
      WHERE h.tenant = $1 AND h.ref_name = $2`,
     [tenant, ref, commitId.toString()],
   )
@@ -549,9 +562,9 @@ async function loadHeads(
     result.rows.map(row => [
       row.path,
       {
-        blobId: asBigInt(row.blob_id, 'afs_heads.blob_id', context),
+        blobId: asBigInt(row.blob_id, 'tuddo_heads.blob_id', context),
         sha256: row.sha256,
-        sizeBytes: asBigInt(row.size_bytes, 'afs_heads.size_bytes', context),
+        sizeBytes: asBigInt(row.size_bytes, 'tuddo_heads.size_bytes', context),
         mode: row.mode,
       },
     ]),
@@ -566,9 +579,9 @@ async function loadTreeEntries(
 ): Promise<Map<string, Entry>> {
   const result = await client.query<HeadRow>(
     `SELECT e.path, e.blob_id::text, b.sha256, b.size_bytes::text, e.mode
-     FROM afs_commits c
-     JOIN afs_tree_entries e ON e.tree_id = c.tree_id
-     JOIN afs_blobs b ON b.id = e.blob_id
+     FROM tuddo_commits c
+     JOIN tuddo_tree_entries e ON e.tree_id = c.tree_id
+     JOIN tuddo_blobs b ON b.id = e.blob_id
      WHERE c.tenant = $1 AND c.id = $2::bigint`,
     [tenant, commitId],
   )
@@ -576,9 +589,9 @@ async function loadTreeEntries(
     result.rows.map(row => [
       row.path,
       {
-        blobId: asBigInt(row.blob_id, 'afs_tree_entries.blob_id', context),
+        blobId: asBigInt(row.blob_id, 'tuddo_tree_entries.blob_id', context),
         sha256: row.sha256,
-        sizeBytes: asBigInt(row.size_bytes, 'afs_blobs.size_bytes', context),
+        sizeBytes: asBigInt(row.size_bytes, 'tuddo_blobs.size_bytes', context),
         mode: row.mode,
       },
     ]),
@@ -604,7 +617,7 @@ async function ensureStorage(
 ): Promise<string | null> {
   if (bytes.length <= inlineMaxBytes) return null
   if (!storage) throw new StorageError('Large blob requires an object storage backend', context)
-  const key = `afs/${tenant}/${sha256}`
+  const key = `tuddo/${tenant}/${sha256}`
   try {
     if (!(await storage.head(key))) await storage.put(key, bytes)
   } catch (error) {
@@ -616,7 +629,7 @@ async function ensureStorage(
 
 async function updateHead(client: Queryable, tenant: string, ref: string, path: string, entry: Entry): Promise<void> {
   await client.query(
-    `INSERT INTO afs_heads (tenant, ref_name, path, blob_id, sha256, size_bytes)
+    `INSERT INTO tuddo_heads (tenant, ref_name, path, blob_id, sha256, size_bytes)
      VALUES ($1, $2, $3, $4::bigint, $5, $6::bigint)
      ON CONFLICT (tenant, ref_name, path) DO UPDATE SET
        blob_id = EXCLUDED.blob_id,
@@ -631,7 +644,7 @@ async function replaceHeads(
   ref: string,
   entries: Map<string, Entry>,
 ): Promise<void> {
-  await client.query('DELETE FROM afs_heads WHERE tenant = $1 AND ref_name = $2', [tenant, ref])
+  await client.query('DELETE FROM tuddo_heads WHERE tenant = $1 AND ref_name = $2', [tenant, ref])
   for (const [path, entry] of entries) await updateHead(client, tenant, ref, path, entry)
 }
 
@@ -648,7 +661,13 @@ type GcCounts = {
 }
 
 function emptyGcCounts(): GcCounts {
-  return { deletedCommits: 0, deletedTrees: 0, deletedBlobs: 0, deletedObjects: 0, settledBranches: 0 }
+  return {
+    deletedCommits: 0,
+    deletedTrees: 0,
+    deletedBlobs: 0,
+    deletedObjects: 0,
+    settledBranches: 0,
+  }
 }
 
 function sampleLimit(sample: number | undefined): number | null {
@@ -675,14 +694,14 @@ async function deleteMaintenanceBatch(
   text: string,
   values: readonly unknown[],
 ): Promise<{ rows: Array<Record<string, unknown>>; rowCount: number | null }> {
-  await client.query('SAVEPOINT afs_gc_batch')
+  await client.query('SAVEPOINT tuddo_gc_batch')
   try {
     const result = await client.query(text, values)
-    await client.query('RELEASE SAVEPOINT afs_gc_batch')
+    await client.query('RELEASE SAVEPOINT tuddo_gc_batch')
     return result
   } catch (error) {
-    await client.query('ROLLBACK TO SAVEPOINT afs_gc_batch').catch(() => undefined)
-    await client.query('RELEASE SAVEPOINT afs_gc_batch').catch(() => undefined)
+    await client.query('ROLLBACK TO SAVEPOINT tuddo_gc_batch').catch(() => undefined)
+    await client.query('RELEASE SAVEPOINT tuddo_gc_batch').catch(() => undefined)
     if (error !== null && typeof error === 'object' && 'code' in error && error.code === '23503')
       return { rows: [], rowCount: 0 }
     throw error
@@ -713,7 +732,7 @@ async function collectTenant(
     const count = await maintenanceTransaction(client, async () => {
       const settled = await client.query<{ name: string }>(
         `SELECT name
-         FROM afs_refs
+         FROM tuddo_refs
          WHERE tenant = $1 AND kind = 'branch' AND state <> 'open'
            AND settled_at IS NOT NULL AND settled_at < $2
          ORDER BY name
@@ -722,9 +741,9 @@ async function collectTenant(
       )
       if (settled.rows.length === 0) return 0
       const names = settled.rows.map(row => row.name)
-      await client.query('DELETE FROM afs_heads WHERE tenant = $1 AND ref_name = ANY($2::text[])', [tenant, names])
+      await client.query('DELETE FROM tuddo_heads WHERE tenant = $1 AND ref_name = ANY($2::text[])', [tenant, names])
       const deleted = await client.query<{ name: string }>(
-        `DELETE FROM afs_refs
+        `DELETE FROM tuddo_refs
          WHERE tenant = $1 AND name = ANY($2::text[])
          RETURNING name`,
         [tenant, names],
@@ -741,17 +760,17 @@ async function collectTenant(
         client,
         `WITH RECURSIVE reachable(id) AS (
            SELECT commit_id
-           FROM afs_refs
+           FROM tuddo_refs
            WHERE tenant = $1
            UNION
            SELECT parent_id
            FROM reachable r
-           JOIN afs_commits c ON c.id = r.id AND c.tenant = $1
+           JOIN tuddo_commits c ON c.id = r.id AND c.tenant = $1
            CROSS JOIN LATERAL unnest(c.parents) AS parents(parent_id)
          ),
          grace_protected(id) AS (
            SELECT id
-           FROM afs_commits
+           FROM tuddo_commits
            WHERE tenant = $1 AND created_at > $2
          ),
          protected_ids(id) AS (
@@ -761,16 +780,16 @@ async function collectTenant(
            UNION
            SELECT parent_id
            FROM protected_ids p
-           JOIN afs_commits c ON c.id = p.id AND c.tenant = $1
+           JOIN tuddo_commits c ON c.id = p.id AND c.tenant = $1
            CROSS JOIN LATERAL unnest(c.parents) AS parents(parent_id)
          ),
          doomed AS MATERIALIZED (
            SELECT c.id
-           FROM afs_commits c
+           FROM tuddo_commits c
            WHERE c.tenant = $1 AND c.created_at <= $2
              AND NOT EXISTS (SELECT 1 FROM protected_ids p WHERE p.id = c.id)
              AND NOT EXISTS (
-               SELECT 1 FROM afs_refs r
+               SELECT 1 FROM tuddo_refs r
                WHERE r.tenant = c.tenant AND (r.commit_id = c.id OR r.base_commit = c.id)
              )
          ),
@@ -780,7 +799,7 @@ async function collectTenant(
            UNION ALL
            SELECT dd.ancestor_id, child.id, dd.depth + 1, dd.path || child.id
            FROM doomed_descendants dd
-           JOIN afs_commits child ON child.tenant = $1
+           JOIN tuddo_commits child ON child.tenant = $1
            JOIN doomed child_doomed ON child_doomed.id = child.id
            CROSS JOIN LATERAL unnest(child.parents) AS parents(parent_id)
            WHERE parents.parent_id = dd.id
@@ -793,7 +812,7 @@ async function collectTenant(
            ORDER BY max(depth) ASC, ancestor_id
            LIMIT $3
          )
-         DELETE FROM afs_commits c
+         DELETE FROM tuddo_commits c
          USING doomed_batch
          WHERE c.id = doomed_batch.id
          RETURNING c.id`,
@@ -811,13 +830,13 @@ async function collectTenant(
         client,
         `WITH doomed AS (
            SELECT t.id
-           FROM afs_trees t
+           FROM tuddo_trees t
            WHERE t.tenant = $1 AND t.created_at <= $2
-             AND NOT EXISTS (SELECT 1 FROM afs_commits c WHERE c.tree_id = t.id)
+             AND NOT EXISTS (SELECT 1 FROM tuddo_commits c WHERE c.tree_id = t.id)
            ORDER BY t.id
            LIMIT $3
          )
-         DELETE FROM afs_trees t
+         DELETE FROM tuddo_trees t
          USING doomed
          WHERE t.id = doomed.id
          RETURNING t.id`,
@@ -835,13 +854,13 @@ async function collectTenant(
         client,
         `WITH doomed AS (
            SELECT b.id
-           FROM afs_blobs b
+           FROM tuddo_blobs b
            WHERE b.tenant = $1 AND b.created_at <= $2
-             AND NOT EXISTS (SELECT 1 FROM afs_tree_entries e WHERE e.blob_id = b.id)
+             AND NOT EXISTS (SELECT 1 FROM tuddo_tree_entries e WHERE e.blob_id = b.id)
            ORDER BY b.id
            LIMIT $3
          )
-         DELETE FROM afs_blobs b
+         DELETE FROM tuddo_blobs b
          USING doomed
          WHERE b.id = doomed.id
          RETURNING b.id`,
@@ -858,13 +877,13 @@ async function collectTenant(
 
 async function discoverTenants(client: Queryable): Promise<string[]> {
   const result = await client.query<{ tenant: string }>(
-    `SELECT tenant FROM afs_refs
+    `SELECT tenant FROM tuddo_refs
      UNION
-     SELECT tenant FROM afs_blobs
+     SELECT tenant FROM tuddo_blobs
      UNION
-     SELECT tenant FROM afs_trees
+     SELECT tenant FROM tuddo_trees
      UNION
-     SELECT tenant FROM afs_commits
+     SELECT tenant FROM tuddo_commits
      ORDER BY tenant`,
   )
   return result.rows.map(row => row.tenant)
@@ -925,7 +944,10 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
         timeoutMs: options.grantTimeoutMs,
         now: () => now().getTime(),
       })
-    : new GrantController({ resolve: async () => ({ read: true, write: 'direct' }), now: () => now().getTime() })
+    : new GrantController({
+        resolve: async () => ({ read: true, write: 'direct' }),
+        now: () => now().getTime(),
+      })
 
   async function gc(input: GcOptions = {}): Promise<GcReport> {
     const graceMs = input.graceMs ?? DEFAULT_GRACE_MS
@@ -950,7 +972,7 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
       let locked = false
       try {
         const lock = await client.query<{ locked: boolean }>(`SELECT pg_try_advisory_lock(hashtext($1)) AS locked`, [
-          `afs:gc:${tenant}`,
+          `tuddo:gc:${tenant}`,
         ])
         locked = lock.rows[0]?.locked === true
         if (!locked) {
@@ -968,13 +990,13 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
         // may have been uploaded and referenced again after the batch commit.
         if (options.storage?.list) {
           try {
-            const prefix = `afs/${tenant}/`
+            const prefix = `tuddo/${tenant}/`
             const listed = await options.storage.list(prefix)
             const candidates = listed.filter(object => object.key.startsWith(prefix))
             if (candidates.length > 0) {
               const known = await client.query<{ object_key: string }>(
                 `SELECT object_key
-                 FROM afs_blobs
+                 FROM tuddo_blobs
                  WHERE tenant = $1 AND object_key = ANY($2::text[])`,
                 [tenant, candidates.map(object => object.key)],
               )
@@ -987,17 +1009,24 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
                   await options.storage.delete(object.key)
                   total.deletedObjects += 1
                 } catch (error) {
-                  options.logger?.error(error, { tenant, objectKey: object.key, operation: 'gc' })
+                  options.logger?.error(error, {
+                    tenant,
+                    objectKey: object.key,
+                    operation: 'gc',
+                  })
                 }
               }
             }
           } catch (error) {
-            options.logger?.error(error, { tenant, operation: 'gc-orphan-list' })
+            options.logger?.error(error, {
+              tenant,
+              operation: 'gc-orphan-list',
+            })
           }
         }
       } finally {
         if (locked)
-          await client.query('SELECT pg_advisory_unlock(hashtext($1))', [`afs:gc:${tenant}`]).catch(() => undefined)
+          await client.query('SELECT pg_advisory_unlock(hashtext($1))', [`tuddo:gc:${tenant}`]).catch(() => undefined)
         client.release()
       }
     }
@@ -1023,9 +1052,9 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
       limit === null
         ? ''
         : input.tenant === undefined
-          ? ` WHERE t.id IN (SELECT t_sample.id FROM afs_trees t_sample ORDER BY random() LIMIT ${limit})`
+          ? ` WHERE t.id IN (SELECT t_sample.id FROM tuddo_trees t_sample ORDER BY random() LIMIT ${limit})`
           : ` AND t.id IN (
-               SELECT t_sample.id FROM afs_trees t_sample
+               SELECT t_sample.id FROM tuddo_trees t_sample
                WHERE t_sample.tenant = $1
                ORDER BY random() LIMIT ${limit}
              )`
@@ -1033,9 +1062,9 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
       const treesResult = await client.query<VerifyTreeRow>(
         `SELECT t.id::text, t.tree_sha, e.path, e.mode, e.blob_id::text, b.sha256 AS blob_sha,
                 b.size_bytes::text AS blob_size
-         FROM afs_trees t
-         LEFT JOIN afs_tree_entries e ON e.tree_id = t.id
-         LEFT JOIN afs_blobs b ON b.id = e.blob_id${treeWhere}${treeSampleWhere}
+         FROM tuddo_trees t
+         LEFT JOIN tuddo_tree_entries e ON e.tree_id = t.id
+         LEFT JOIN tuddo_blobs b ON b.id = e.blob_id${treeWhere}${treeSampleWhere}
          ORDER BY t.id, e.path`,
         params,
       )
@@ -1056,11 +1085,24 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
         }
         if (row.path === null) continue
         if (row.blob_id === null || row.blob_sha === null || row.blob_size === null || row.mode === null) {
-          findings.push({ kind: 'tree-entry-missing-blob', treeId: row.id, path: row.path, blobId: row.blob_id ?? '' })
+          findings.push({
+            kind: 'tree-entry-missing-blob',
+            treeId: row.id,
+            path: row.path,
+            blobId: row.blob_id ?? '',
+          })
           continue
         }
-        tree.entries.push({ path: row.path, mode: row.mode, blobSha: row.blob_sha })
-        tree.expected.set(row.path, { blobId: row.blob_id, sha256: row.blob_sha, sizeBytes: row.blob_size })
+        tree.entries.push({
+          path: row.path,
+          mode: row.mode,
+          blobSha: row.blob_sha,
+        })
+        tree.expected.set(row.path, {
+          blobId: row.blob_id,
+          sha256: row.blob_sha,
+          sizeBytes: row.blob_size,
+        })
       }
       const sampledTrees = [...trees].slice(0, limit ?? trees.size)
       for (const [treeId, tree] of sampledTrees) {
@@ -1071,14 +1113,19 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
           computed = ''
         }
         if (computed !== tree.storedSha)
-          findings.push({ kind: 'tree-hash-drift', treeId, expectedSha: computed, actualSha: tree.storedSha })
+          findings.push({
+            kind: 'tree-hash-drift',
+            treeId,
+            expectedSha: computed,
+            actualSha: tree.storedSha,
+          })
       }
 
       const commitsResult = await client.query<VerifyCommitRow>(
         `SELECT c.id::text, c.commit_sha, t.tree_sha, c.parents, c.author_user, c.agent_kind,
                 c.thread_id, c.run_id, c.op, c.created_at
-         FROM afs_commits c
-         LEFT JOIN afs_trees t ON t.id = c.tree_id${commitWhere}
+         FROM tuddo_commits c
+         LEFT JOIN tuddo_trees t ON t.id = c.tree_id${commitWhere}
          ${limit === null ? 'ORDER BY c.id' : `ORDER BY random() LIMIT ${limit}`}`,
         params,
       )
@@ -1096,8 +1143,8 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
               await client.query<VerifyCommitRow>(
                 `SELECT c.id::text, c.commit_sha, t.tree_sha, c.parents, c.author_user, c.agent_kind,
                         c.thread_id, c.run_id, c.op, c.created_at
-                 FROM afs_commits c
-                 LEFT JOIN afs_trees t ON t.id = c.tree_id${parentWhere}`,
+                 FROM tuddo_commits c
+                 LEFT JOIN tuddo_trees t ON t.id = c.tree_id${parentWhere}`,
                 parentParams,
               )
             ).rows
@@ -1110,7 +1157,11 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
         for (const parentId of parentIds) {
           const parent = commits.get(parentId)
           if (!parent) {
-            findings.push({ kind: 'dangling-parent', commitId: row.id, parentId })
+            findings.push({
+              kind: 'dangling-parent',
+              commitId: row.id,
+              parentId,
+            })
             parentShas.push('')
           } else {
             parentShas.push(parent.commit_sha)
@@ -1145,7 +1196,7 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
 
       const refsResult = await client.query<VerifyRefRow>(
         `SELECT r.tenant, r.name, r.commit_id::text, c.tree_id::text
-         FROM afs_refs r JOIN afs_commits c ON c.id = r.commit_id${refWhere}
+         FROM tuddo_refs r JOIN tuddo_commits c ON c.id = r.commit_id${refWhere}
          ORDER BY r.tenant, r.name`,
         params,
       )
@@ -1158,10 +1209,10 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
         blob_size: string | null
       }>(
         `SELECT r.tenant, r.name, e.path, e.blob_id::text, b.sha256 AS blob_sha, b.size_bytes::text AS blob_size
-         FROM afs_refs r
-         JOIN afs_commits c ON c.id = r.commit_id
-         LEFT JOIN afs_tree_entries e ON e.tree_id = c.tree_id
-         LEFT JOIN afs_blobs b ON b.id = e.blob_id${refWhere}
+         FROM tuddo_refs r
+         JOIN tuddo_commits c ON c.id = r.commit_id
+         LEFT JOIN tuddo_tree_entries e ON e.tree_id = c.tree_id
+         LEFT JOIN tuddo_blobs b ON b.id = e.blob_id${refWhere}
          ORDER BY r.tenant, r.name, e.path`,
         params,
       )
@@ -1170,12 +1221,16 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
         if (row.path === null || row.blob_id === null || row.blob_sha === null || row.blob_size === null) continue
         const refKey = `${row.tenant}\u0000${row.name}`
         const expected = expectedByRef.get(refKey) ?? new Map()
-        expected.set(row.path, { blobId: row.blob_id, sha256: row.blob_sha, sizeBytes: row.blob_size })
+        expected.set(row.path, {
+          blobId: row.blob_id,
+          sha256: row.blob_sha,
+          sizeBytes: row.blob_size,
+        })
         expectedByRef.set(refKey, expected)
       }
       const headsResult = await client.query<VerifyHeadRow>(
         `SELECT h.tenant, h.ref_name, h.path, h.blob_id::text, h.sha256, h.size_bytes::text
-         FROM afs_heads h${headWhere}
+         FROM tuddo_heads h${headWhere}
          ORDER BY h.tenant, h.ref_name, h.path`,
         params,
       )
@@ -1214,7 +1269,11 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
               path,
               issue: 'mismatch',
               expected: entry,
-              actual: { blobId: head.blob_id, sha256: head.sha256, sizeBytes: head.size_bytes },
+              actual: {
+                blobId: head.blob_id,
+                sha256: head.sha256,
+                sizeBytes: head.size_bytes,
+              },
             })
           }
         }
@@ -1238,14 +1297,19 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
       }
       for (const row of headsResult.rows) {
         if (!refs.has(`${row.tenant}\u0000${row.ref_name}`))
-          findings.push({ kind: 'orphaned-head', tenant: row.tenant, ref: row.ref_name, path: row.path })
+          findings.push({
+            kind: 'orphaned-head',
+            tenant: row.tenant,
+            ref: row.ref_name,
+            path: row.path,
+          })
       }
 
       const blobs = options.storage
         ? (
             await client.query<VerifyBlobRow>(
               `SELECT id::text, object_key, size_bytes::text
-               FROM afs_blobs${blobWhere}
+               FROM tuddo_blobs${blobWhere}
                ${limit === null ? '' : `ORDER BY random() LIMIT ${limit}`}
                ${limit === null ? 'ORDER BY id' : ''}`,
               params,
@@ -1301,7 +1365,11 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
   }
   async function fork(input: ForkInput): Promise<ForkResult | null> {
     const ref = refForFork(input)
-    const context = contextFor({ tenant: input.tenant, mount: input.mount, ref })
+    const context = contextFor({
+      tenant: input.tenant,
+      mount: input.mount,
+      ref,
+    })
     validateMountKey(input.mount, context)
     if (!(await grant(grants, 'read', { ...input, ref }, { bypassCache: true }))) return null
 
@@ -1311,7 +1379,7 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
       await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`${input.tenant}:mount/${input.mount}`])
       let mountRef = await client.query<RefRow>(
         `SELECT r.commit_id::text, r.base_commit::text, c.commit_sha, r.kind, r.state
-         FROM afs_refs r JOIN afs_commits c ON c.id = r.commit_id
+         FROM tuddo_refs r JOIN tuddo_commits c ON c.id = r.commit_id
          WHERE r.tenant = $1 AND r.name = $2`,
         [input.tenant, `mount/${input.mount}`],
       )
@@ -1334,14 +1402,14 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
           context,
         })
         await client.query(
-          `INSERT INTO afs_refs (tenant, name, kind, commit_id, base_commit, state)
+          `INSERT INTO tuddo_refs (tenant, name, kind, commit_id, base_commit, state)
            VALUES ($1, $2, 'branch', $3::bigint, NULL, 'open')
            ON CONFLICT (tenant, name) DO NOTHING`,
           [input.tenant, `mount/${input.mount}`, genesis.id.toString()],
         )
         mountRef = await client.query<RefRow>(
           `SELECT r.commit_id::text, r.base_commit::text, c.commit_sha, r.kind, r.state
-           FROM afs_refs r JOIN afs_commits c ON c.id = r.commit_id
+           FROM tuddo_refs r JOIN tuddo_commits c ON c.id = r.commit_id
            WHERE r.tenant = $1 AND r.name = $2`,
           [input.tenant, `mount/${input.mount}`],
         )
@@ -1349,7 +1417,7 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
       const tip = mountRef.rows[0]
       if (!tip) throw new NotFoundError(`Mount ref not found: mount/${input.mount}`, context)
       const branchInsert = await client.query(
-        `INSERT INTO afs_refs (tenant, name, kind, commit_id, base_commit, state)
+        `INSERT INTO tuddo_refs (tenant, name, kind, commit_id, base_commit, state)
          VALUES ($1, $2, 'branch', $3::bigint, $3::bigint, 'open')
          ON CONFLICT (tenant, name) DO NOTHING`,
         [input.tenant, ref, tip.commit_id],
@@ -1360,11 +1428,11 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
         // Seed from the captured tip tree, never live mount heads: the tip is
         // the branch's snapshot even if a concurrent mount write races here.
         await client.query(
-          `INSERT INTO afs_heads (tenant, ref_name, path, blob_id, sha256, size_bytes)
+          `INSERT INTO tuddo_heads (tenant, ref_name, path, blob_id, sha256, size_bytes)
            SELECT $1, $2, e.path, e.blob_id, b.sha256, b.size_bytes
-           FROM afs_commits c
-           JOIN afs_tree_entries e ON e.tree_id = c.tree_id
-           JOIN afs_blobs b ON b.id = e.blob_id
+           FROM tuddo_commits c
+           JOIN tuddo_tree_entries e ON e.tree_id = c.tree_id
+           JOIN tuddo_blobs b ON b.id = e.blob_id
            WHERE c.id = $3::bigint
            ON CONFLICT (tenant, ref_name, path) DO NOTHING`,
           [input.tenant, ref, tip.commit_id],
@@ -1375,8 +1443,8 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
         tenant: input.tenant,
         mount: input.mount,
         ref,
-        commitId: asBigInt(branch.commit_id, 'afs_refs.commit_id', context),
-        baseCommitId: asBigInt(branch.base_commit ?? branch.commit_id, 'afs_refs.base_commit', context),
+        commitId: asBigInt(branch.commit_id, 'tuddo_refs.commit_id', context),
+        baseCommitId: asBigInt(branch.base_commit ?? branch.commit_id, 'tuddo_refs.base_commit', context),
         commitSha: branch.commit_sha,
       }
     } catch (error) {
@@ -1388,10 +1456,19 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
   }
 
   async function write(input: WriteInput): Promise<WriteResult> {
-    const initialContext = contextFor({ tenant: input.tenant, mount: input.mount, ref: input.ref })
+    const initialContext = contextFor({
+      tenant: input.tenant,
+      mount: input.mount,
+      ref: input.ref,
+    })
     validateMountKey(input.mount, initialContext)
     const path = validatePath(input.path, initialContext)
-    const context = contextFor({ tenant: input.tenant, mount: input.mount, path, ref: input.ref })
+    const context = contextFor({
+      tenant: input.tenant,
+      mount: input.mount,
+      path,
+      ref: input.ref,
+    })
     if (!(await grant(grants, 'write', input))) throw new PermissionDeniedError('Write permission denied', context)
     const bytes = bytesFor(input.bytes)
     const sha256 = hashSha256(bytes)
@@ -1409,7 +1486,7 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
           // through its orphan sweep, so no package write can upload and commit
           // a reference in the sweep's delete window.
           lockState = 'acquiring'
-          await client.query('SELECT pg_advisory_lock_shared(hashtext($1))', [`afs:gc:${input.tenant}`])
+          await client.query('SELECT pg_advisory_lock_shared(hashtext($1))', [`tuddo:gc:${input.tenant}`])
           lockState = 'held'
         }
         const objectKey = await ensureStorage(options.storage, input.tenant, bytes, sha256, inlineMaxBytes, context)
@@ -1420,7 +1497,7 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
           client,
           input.tenant,
           input.ref,
-          asBigInt(ref.commit_id, 'afs_refs.commit_id', context),
+          asBigInt(ref.commit_id, 'tuddo_refs.commit_id', context),
           context,
         )
         const current = heads.get(path)
@@ -1429,21 +1506,31 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
         }
         if (current?.sha256 === sha256) {
           await client.query('ROLLBACK')
-          return { path, sha256, sizeBytes: current.sizeBytes, commitSha: ref.commit_sha }
+          return {
+            path,
+            sha256,
+            sizeBytes: current.sizeBytes,
+            commitSha: ref.commit_sha,
+          }
         }
 
         // Spec §4.5 lists blob insertion earlier; doing it after ref checks
         // avoids orphan blob rows on precondition or settled-branch exits.
         const blobId = await insertBlob(client, input.tenant, bytes, sha256, inlineMaxBytes, objectKey, context)
         const next = new Map(heads)
-        next.set(path, { blobId, sha256, sizeBytes: BigInt(bytes.length), mode: current?.mode ?? 420 })
+        next.set(path, {
+          blobId,
+          sha256,
+          sizeBytes: BigInt(bytes.length),
+          mode: current?.mode ?? 420,
+        })
         const tree = await insertTree(client, input.tenant, next, context)
         const createdAt = timestamp(now, context)
         const commit = await insertCommit(client, {
           tenant: input.tenant,
           treeId: tree.id,
           treeSha: tree.sha,
-          parentIds: [asBigInt(ref.commit_id, 'afs_refs.commit_id', context)],
+          parentIds: [asBigInt(ref.commit_id, 'tuddo_refs.commit_id', context)],
           parentShas: [ref.commit_sha],
           authorUser: input.authorUser,
           agentKind: input.agentKind ?? null,
@@ -1455,7 +1542,7 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
           context,
         })
         const updated = await client.query(
-          `UPDATE afs_refs SET commit_id = $3::bigint
+          `UPDATE tuddo_refs SET commit_id = $3::bigint
            WHERE tenant = $1 AND name = $2 AND commit_id = $4::bigint`,
           [input.tenant, input.ref, commit.id.toString(), ref.commit_id],
         )
@@ -1474,7 +1561,7 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
         }
         if (lockState === 'held') {
           lockState = 'uncertain'
-          await client.query('SELECT pg_advisory_unlock_shared(hashtext($1))', [`afs:gc:${input.tenant}`])
+          await client.query('SELECT pg_advisory_unlock_shared(hashtext($1))', [`tuddo:gc:${input.tenant}`])
           lockState = 'none'
         }
         if (options.onCommit) {
@@ -1491,7 +1578,12 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
               })
           })
         }
-        return { path, sha256, sizeBytes: BigInt(bytes.length), commitSha: commit.sha }
+        return {
+          path,
+          sha256,
+          sizeBytes: BigInt(bytes.length),
+          commitSha: commit.sha,
+        }
       } catch (error) {
         failure = error
         await client.query('ROLLBACK').catch(() => undefined)
@@ -1500,7 +1592,7 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
         if (lockState === 'held') {
           lockState = 'uncertain'
           try {
-            await client.query('SELECT pg_advisory_unlock_shared(hashtext($1))', [`afs:gc:${input.tenant}`])
+            await client.query('SELECT pg_advisory_unlock_shared(hashtext($1))', [`tuddo:gc:${input.tenant}`])
             lockState = 'none'
           } catch (error) {
             failure ??= error
@@ -1518,7 +1610,11 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
     throw new RefConflictError(context, maxCasRetries)
   }
   async function restore(input: RestoreInput): Promise<RestoreResult> {
-    const initialContext = contextFor({ tenant: input.tenant, mount: input.mount, ref: input.ref })
+    const initialContext = contextFor({
+      tenant: input.tenant,
+      mount: input.mount,
+      ref: input.ref,
+    })
     validateMountKey(input.mount, initialContext)
     const context = initialContext
     if (!(await grant(grants, 'write', input))) throw new PermissionDeniedError('Write permission denied', context)
@@ -1532,18 +1628,22 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
           client,
           input.tenant,
           input.ref,
-          asBigInt(ref.commit_id, 'afs_refs.commit_id', context),
+          asBigInt(ref.commit_id, 'tuddo_refs.commit_id', context),
           context,
         )
         const source = await client.query<{ id: string }>(
-          'SELECT id::text FROM afs_commits WHERE tenant = $1 AND id = $2::bigint',
+          'SELECT id::text FROM tuddo_commits WHERE tenant = $1 AND id = $2::bigint',
           [input.tenant, input.sourceCommitId],
         )
         if (!source.rows[0]) throw new NotFoundError(`Source commit not found: ${input.sourceCommitId}`, context)
         const restored = await loadTreeEntries(client, input.tenant, input.sourceCommitId, context)
         if (sameEntries(current, restored)) {
           await client.query('ROLLBACK')
-          return { commitSha: ref.commit_sha, treeSha: ref.tree_sha, created: false }
+          return {
+            commitSha: ref.commit_sha,
+            treeSha: ref.tree_sha,
+            created: false,
+          }
         }
         const tree = await insertTree(client, input.tenant, restored, context)
         const createdAt = timestamp(now, context)
@@ -1551,7 +1651,7 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
           tenant: input.tenant,
           treeId: tree.id,
           treeSha: tree.sha,
-          parentIds: [asBigInt(ref.commit_id, 'afs_refs.commit_id', context)],
+          parentIds: [asBigInt(ref.commit_id, 'tuddo_refs.commit_id', context)],
           parentShas: [ref.commit_sha],
           authorUser: input.authorUser,
           agentKind: input.agentKind ?? null,
@@ -1563,7 +1663,7 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
           context,
         })
         const updated = await client.query(
-          `UPDATE afs_refs SET commit_id = $3::bigint
+          `UPDATE tuddo_refs SET commit_id = $3::bigint
            WHERE tenant = $1 AND name = $2 AND commit_id = $4::bigint`,
           [input.tenant, input.ref, commit.id.toString(), ref.commit_id],
         )
@@ -1593,15 +1693,19 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
     const client = await options.pool.connect()
     try {
       const result = await client.query<
-        HeadRow & { commit_sha: string; inline: Buffer | null; object_key: string | null }
+        HeadRow & {
+          commit_sha: string
+          inline: Buffer | null
+          object_key: string | null
+        }
       >(
         `SELECT h.path, h.blob_id::text, h.sha256, h.size_bytes::text, e.mode,
                 c.commit_sha, b.inline, b.object_key
-         FROM afs_heads h
-         JOIN afs_refs r ON r.tenant = h.tenant AND r.name = h.ref_name
-         JOIN afs_commits c ON c.id = r.commit_id
-         JOIN afs_tree_entries e ON e.tree_id = c.tree_id AND e.path = h.path
-         JOIN afs_blobs b ON b.id = h.blob_id
+         FROM tuddo_heads h
+         JOIN tuddo_refs r ON r.tenant = h.tenant AND r.name = h.ref_name
+         JOIN tuddo_commits c ON c.id = r.commit_id
+         JOIN tuddo_tree_entries e ON e.tree_id = c.tree_id AND e.path = h.path
+         JOIN tuddo_blobs b ON b.id = h.blob_id
          WHERE h.tenant = $1 AND h.ref_name = $2 AND h.path = $3`,
         [input.tenant, input.ref, path],
       )
@@ -1623,7 +1727,7 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
       return {
         path: row.path,
         sha256: row.sha256,
-        sizeBytes: asBigInt(row.size_bytes, 'afs_heads.size_bytes', context),
+        sizeBytes: asBigInt(row.size_bytes, 'tuddo_heads.size_bytes', context),
         mode: row.mode,
         bytes,
         commitSha: row.commit_sha,
@@ -1634,10 +1738,19 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
   }
 
   async function remove(input: DeleteInput): Promise<DeleteResult> {
-    const initialContext = contextFor({ tenant: input.tenant, mount: input.mount, ref: input.ref })
+    const initialContext = contextFor({
+      tenant: input.tenant,
+      mount: input.mount,
+      ref: input.ref,
+    })
     validateMountKey(input.mount, initialContext)
     const path = validatePath(input.path, initialContext)
-    const context = contextFor({ tenant: input.tenant, mount: input.mount, path, ref: input.ref })
+    const context = contextFor({
+      tenant: input.tenant,
+      mount: input.mount,
+      path,
+      ref: input.ref,
+    })
     if (!(await grant(grants, 'write', input))) throw new PermissionDeniedError('Write permission denied', context)
     for (let attempt = 0; attempt < maxCasRetries; attempt += 1) {
       const client = await options.pool.connect()
@@ -1649,7 +1762,7 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
           client,
           input.tenant,
           input.ref,
-          asBigInt(ref.commit_id, 'afs_refs.commit_id', context),
+          asBigInt(ref.commit_id, 'tuddo_refs.commit_id', context),
           context,
         )
         const current = heads.get(path)
@@ -1663,7 +1776,7 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
           tenant: input.tenant,
           treeId: tree.id,
           treeSha: tree.sha,
-          parentIds: [asBigInt(ref.commit_id, 'afs_refs.commit_id', context)],
+          parentIds: [asBigInt(ref.commit_id, 'tuddo_refs.commit_id', context)],
           parentShas: [ref.commit_sha],
           authorUser: input.authorUser,
           agentKind: input.agentKind ?? null,
@@ -1675,7 +1788,7 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
           context,
         })
         const updated = await client.query(
-          `UPDATE afs_refs SET commit_id = $3::bigint
+          `UPDATE tuddo_refs SET commit_id = $3::bigint
            WHERE tenant = $1 AND name = $2 AND commit_id = $4::bigint`,
           [input.tenant, input.ref, commit.id.toString(), ref.commit_id],
         )
@@ -1683,7 +1796,7 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
           await client.query('ROLLBACK')
           continue
         }
-        await client.query('DELETE FROM afs_heads WHERE tenant = $1 AND ref_name = $2 AND path = $3', [
+        await client.query('DELETE FROM tuddo_heads WHERE tenant = $1 AND ref_name = $2 AND path = $3', [
           input.tenant,
           input.ref,
           path,

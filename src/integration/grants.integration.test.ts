@@ -4,7 +4,7 @@ import test, { after, before, beforeEach } from 'node:test'
 import { Pool } from 'pg'
 import { GrantResolverError, PermissionDeniedError, createAgentFs, migrate } from '../index.js'
 
-const pool = new Pool({ connectionString: process.env.AGENT_FS_DATABASE_URL })
+const pool = new Pool({ connectionString: process.env.TUDDOFS_DATABASE_URL })
 const tenant = 'grants-integration'
 const actor = { id: 'user-grants', tenant }
 const never = new Promise<never>(() => undefined)
@@ -12,7 +12,7 @@ const never = new Promise<never>(() => undefined)
 before(async () => migrate(pool))
 beforeEach(async () => {
   await pool.query(
-    'TRUNCATE afs_heads, afs_refs, afs_commits, afs_tree_entries, afs_trees, afs_blobs RESTART IDENTITY CASCADE',
+    'TRUNCATE tuddo_heads, tuddo_refs, tuddo_commits, tuddo_tree_entries, tuddo_trees, tuddo_blobs RESTART IDENTITY CASCADE',
   )
 })
 after(async () => pool.end())
@@ -27,12 +27,24 @@ test('resolver throw and timeout fail closed as GrantResolverError during open',
     },
   })
   await assert.rejects(
-    throwing.open({ actor, sessionId: 'throw', mounts: [{ key: 'project:grant' }] }),
+    throwing.open({
+      actor,
+      sessionId: 'throw',
+      mounts: [{ key: 'project:grant' }],
+    }),
     GrantResolverError,
   )
-  const hanging = createAgentFs({ pool, grantTimeoutMs: 5, grants: { resolve: async () => never } })
+  const hanging = createAgentFs({
+    pool,
+    grantTimeoutMs: 5,
+    grants: { resolve: async () => never },
+  })
   await assert.rejects(
-    hanging.open({ actor, sessionId: 'timeout', mounts: [{ key: 'project:grant' }] }),
+    hanging.open({
+      actor,
+      sessionId: 'timeout',
+      mounts: [{ key: 'project:grant' }],
+    }),
     GrantResolverError,
   )
 })
@@ -49,7 +61,11 @@ test('fork and merge bypass the grant cache, and invalidation is actor+mount sco
       },
     },
   })
-  const session = await fs.open({ actor, sessionId: 'bypass', mounts: [{ key: 'project:grant' }] })
+  const session = await fs.open({
+    actor,
+    sessionId: 'bypass',
+    mounts: [{ key: 'project:grant' }],
+  })
   assert.ok(calls >= 2)
   const beforeMerge = calls
   assert.deepEqual(await session.merge(), { 'project:grant': 'merged' })
@@ -66,11 +82,19 @@ test('permission revocation is enforced at write time and system actor cannot op
     grantCacheTtlMs: 0,
     grants: { resolve: async () => ({ read: true, write: mode }) },
   })
-  const session = await fs.open({ actor, sessionId: 'revocation', mounts: [{ key: 'project:grant' }] })
+  const session = await fs.open({
+    actor,
+    sessionId: 'revocation',
+    mounts: [{ key: 'project:grant' }],
+  })
   mode = 'none'
   await assert.rejects(session.write('project:grant:/revoked', 'x'), PermissionDeniedError)
   await assert.rejects(
-    fs.open({ actor: { id: 'system', tenant }, sessionId: 'system', mounts: [{ key: 'project:grant' }] }),
+    fs.open({
+      actor: { id: 'system', tenant },
+      sessionId: 'system',
+      mounts: [{ key: 'project:grant' }],
+    }),
     PermissionDeniedError,
   )
 })

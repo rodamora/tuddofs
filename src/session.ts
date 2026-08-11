@@ -39,7 +39,10 @@ export interface VirtualMountHandler {
 
 /** A ref-backed or virtual mount included in a session. @see spec §6 */
 export type MountSpec =
-  | { readonly key: string; readonly mode?: 'follow' | { readonly pin: string } }
+  | {
+      readonly key: string
+      readonly mode?: 'follow' | { readonly pin: string }
+    }
   | { readonly key: string; readonly virtual: VirtualMountHandler }
 
 /** Inputs used to open an executing actor's multi-mount session. @see spec §6 */
@@ -139,7 +142,14 @@ export type MergeResult =
   | 'merged'
   | 'unauthorized'
   | 'pendingApproval'
-  | { readonly conflicts: readonly { path: string; baseSha?: string; oursSha?: string; theirsSha?: string }[] }
+  | {
+      readonly conflicts: readonly {
+        path: string
+        baseSha?: string
+        oursSha?: string
+        theirsSha?: string
+      }[]
+    }
   | { readonly settled: string }
 
 /** File and history operations exposed by an opened session. @see spec §6 */
@@ -170,10 +180,19 @@ type RefMount = {
   readonly ref?: string
   readonly fork?: ForkResult
 }
-type VirtualMount = { readonly key: string; readonly virtual: VirtualMountHandler }
+type VirtualMount = {
+  readonly key: string
+  readonly virtual: VirtualMountHandler
+}
 type Mount = RefMount | VirtualMount
 
-type Head = { path: string; sha256: string; sizeBytes: bigint; mode: number; blobId?: string }
+type Head = {
+  path: string
+  sha256: string
+  sizeBytes: bigint
+  mode: number
+  blobId?: string
+}
 type CommitRow = {
   id: string
   commit_sha: string
@@ -199,7 +218,10 @@ function bytesFor(value: Buffer | Uint8Array | string): Buffer {
 function pathForAddress(address: string, context?: Partial<ErrorContext>): { mountKey: string; path: string } {
   const separator = address.indexOf(':/')
   if (separator <= 0) throw new InvalidPathError(address, 'must be addressed as mount:/path', context)
-  return { mountKey: address.slice(0, separator), path: address.slice(separator + 1) }
+  return {
+    mountKey: address.slice(0, separator),
+    path: address.slice(separator + 1),
+  }
 }
 
 function globRegex(pattern: string): RegExp {
@@ -254,9 +276,15 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
         throw new PermissionDeniedError('Session actor must be an executing user', { tenant: input.actor.tenant })
       const mounts = new Map<string, Mount>()
       for (const spec of input.mounts) {
-        const key = validateMountKey(spec.key, { tenant: input.actor.tenant, mount: spec.key })
+        const key = validateMountKey(spec.key, {
+          tenant: input.actor.tenant,
+          mount: spec.key,
+        })
         if (mounts.has(key))
-          throw new PermissionDeniedError(`Duplicate mount: ${key}`, { tenant: input.actor.tenant, mount: key })
+          throw new PermissionDeniedError(`Duplicate mount: ${key}`, {
+            tenant: input.actor.tenant,
+            mount: key,
+          })
         if ('virtual' in spec) {
           mounts.set(key, { key, virtual: spec.virtual })
           continue
@@ -264,7 +292,10 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
         const mode = spec.mode ?? 'follow'
         const grant = await kernel.resolveGrant(input.actor, { key }, { bypassCache: true })
         if (!grant.read)
-          throw new PermissionDeniedError('Read permission denied', { tenant: input.actor.tenant, mount: key })
+          throw new PermissionDeniedError('Read permission denied', {
+            tenant: input.actor.tenant,
+            mount: key,
+          })
         if (typeof mode === 'object') {
           mounts.set(key, { key, mode })
           continue
@@ -278,7 +309,11 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
           threadId: input.attribution?.threadId,
           runId: input.attribution?.runId,
         })
-        if (!fork) throw new PermissionDeniedError('Read permission denied', { tenant: input.actor.tenant, mount: key })
+        if (!fork)
+          throw new PermissionDeniedError('Read permission denied', {
+            tenant: input.actor.tenant,
+            mount: key,
+          })
         mounts.set(key, { key, mode, ref: fork.ref, fork })
       }
 
@@ -293,14 +328,21 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
         const path =
           allowRoot && parsed.path === '/'
             ? '/'
-            : validatePath(parsed.path, { tenant: input.actor.tenant, mount: parsed.mountKey })
+            : validatePath(parsed.path, {
+                tenant: input.actor.tenant,
+                mount: parsed.mountKey,
+              })
         return { mount, path }
       }
 
       const readVirtual = async (mount: VirtualMount, path: string): Promise<Buffer> => {
         const bytes = await mount.virtual.read(path, input.actor)
         if (!bytes)
-          throw new NotFoundError(`Path not found: ${path}`, { tenant: input.actor.tenant, mount: mount.key, path })
+          throw new NotFoundError(`Path not found: ${path}`, {
+            tenant: input.actor.tenant,
+            mount: mount.key,
+            path,
+          })
         return Buffer.from(bytes)
       }
 
@@ -326,7 +368,7 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
         const result = await client.query<LineageCommit>(
           `WITH RECURSIVE lineage(id) AS (
              SELECT r.commit_id
-             FROM afs_refs r
+             FROM tuddo_refs r
              WHERE r.tenant = $1
                AND (
                  r.name = $2
@@ -336,12 +378,12 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
              UNION
              SELECT parent_id
              FROM lineage current
-             JOIN afs_commits c ON c.id = current.id
+             JOIN tuddo_commits c ON c.id = current.id
              CROSS JOIN LATERAL unnest(c.parents) AS parent_id
            )
            SELECT c.id::text, c.commit_sha
            FROM lineage
-           JOIN afs_commits c ON c.id = lineage.id
+           JOIN tuddo_commits c ON c.id = lineage.id
            WHERE c.tenant = $1 AND c.commit_sha = $5
            LIMIT 1`,
           [
@@ -370,7 +412,7 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
           if (pin.startsWith('mount/') || pin.startsWith('tag/') || pin.startsWith('agent/')) {
             const result = await client.query<LineageCommit>(
               `SELECT c.id::text, c.commit_sha
-               FROM afs_refs r JOIN afs_commits c ON c.id = r.commit_id
+               FROM tuddo_refs r JOIN tuddo_commits c ON c.id = r.commit_id
                WHERE r.tenant = $1 AND r.name = $2
                  AND (
                    r.name = $3
@@ -394,7 +436,10 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
               tenant: input.actor.tenant,
               mount: mount.key,
             })
-          return { ref: `__pin/${input.sessionId}/${mount.key}`, commitId: row.id }
+          return {
+            ref: `__pin/${input.sessionId}/${mount.key}`,
+            commitId: row.id,
+          }
         } finally {
           client.release()
         }
@@ -415,20 +460,32 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
             commit_sha: string
           }>(
             `SELECT e.path, b.sha256, b.size_bytes::text, e.mode, b.inline, b.object_key, c.commit_sha
-             FROM afs_commits c JOIN afs_tree_entries e ON e.tree_id = c.tree_id
-             JOIN afs_blobs b ON b.id = e.blob_id
+             FROM tuddo_commits c JOIN tuddo_tree_entries e ON e.tree_id = c.tree_id
+             JOIN tuddo_blobs b ON b.id = e.blob_id
              WHERE c.tenant = $1 AND c.id = $2::bigint AND e.path = $3`,
             [input.actor.tenant, pin.commitId, path],
           )
           const row = result.rows[0]
           if (!row)
-            throw new NotFoundError(`Path not found: ${path}`, { tenant: input.actor.tenant, mount: mount.key, path })
+            throw new NotFoundError(`Path not found: ${path}`, {
+              tenant: input.actor.tenant,
+              mount: mount.key,
+              path,
+            })
           let bytes: Buffer
           if (row.inline) bytes = Buffer.from(row.inline)
           else if (row.object_key && options.storage)
-            bytes = await readAll(options, row.object_key, { tenant: input.actor.tenant, mount: mount.key, path })
+            bytes = await readAll(options, row.object_key, {
+              tenant: input.actor.tenant,
+              mount: mount.key,
+              path,
+            })
           else
-            throw new NotFoundError(`Blob unavailable: ${path}`, { tenant: input.actor.tenant, mount: mount.key, path })
+            throw new NotFoundError(`Blob unavailable: ${path}`, {
+              tenant: input.actor.tenant,
+              mount: mount.key,
+              path,
+            })
           return {
             path,
             sha256: row.sha256,
@@ -463,11 +520,16 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
         try {
           let rows: Head[]
           if (mount.mode === 'follow') {
-            const result = await client.query<{ path: string; sha256: string; size_bytes: string; mode: number }>(
+            const result = await client.query<{
+              path: string
+              sha256: string
+              size_bytes: string
+              mode: number
+            }>(
               `SELECT h.path, h.sha256, h.size_bytes::text, COALESCE(e.mode, 420)::int AS mode
-               FROM afs_heads h JOIN afs_refs r ON r.tenant = h.tenant AND r.name = h.ref_name
-               JOIN afs_commits c ON c.id = r.commit_id
-               LEFT JOIN afs_tree_entries e ON e.tree_id = c.tree_id AND e.path = h.path
+               FROM tuddo_heads h JOIN tuddo_refs r ON r.tenant = h.tenant AND r.name = h.ref_name
+               JOIN tuddo_commits c ON c.id = r.commit_id
+               LEFT JOIN tuddo_tree_entries e ON e.tree_id = c.tree_id AND e.path = h.path
                WHERE h.tenant = $1 AND h.ref_name = $2 ORDER BY h.path`,
               [input.actor.tenant, refFor(mount)],
             )
@@ -479,9 +541,14 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
             }))
           } else {
             const pin = await pinnedRef(mount)
-            const result = await client.query<{ path: string; sha256: string; size_bytes: string; mode: number }>(
+            const result = await client.query<{
+              path: string
+              sha256: string
+              size_bytes: string
+              mode: number
+            }>(
               `SELECT e.path, b.sha256, b.size_bytes::text, e.mode
-               FROM afs_commits c JOIN afs_tree_entries e ON e.tree_id = c.tree_id JOIN afs_blobs b ON b.id = e.blob_id
+               FROM tuddo_commits c JOIN tuddo_tree_entries e ON e.tree_id = c.tree_id JOIN tuddo_blobs b ON b.id = e.blob_id
                WHERE c.tenant = $1 AND c.id = $2::bigint ORDER BY e.path`,
               [input.actor.tenant, pin.commitId],
             )
@@ -524,11 +591,16 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
         const client = await options.pool.connect()
         try {
           if (mount.mode === 'follow') {
-            const result = await client.query<{ path: string; sha256: string; size_bytes: string; mode: number }>(
+            const result = await client.query<{
+              path: string
+              sha256: string
+              size_bytes: string
+              mode: number
+            }>(
               `SELECT h.path, h.sha256, h.size_bytes::text, COALESCE(e.mode, 420)::int AS mode
-               FROM afs_heads h JOIN afs_refs r ON r.tenant = h.tenant AND r.name = h.ref_name
-               JOIN afs_commits c ON c.id = r.commit_id
-               LEFT JOIN afs_tree_entries e ON e.tree_id = c.tree_id AND e.path = h.path
+               FROM tuddo_heads h JOIN tuddo_refs r ON r.tenant = h.tenant AND r.name = h.ref_name
+               JOIN tuddo_commits c ON c.id = r.commit_id
+               LEFT JOIN tuddo_tree_entries e ON e.tree_id = c.tree_id AND e.path = h.path
                WHERE h.tenant = $1 AND h.ref_name = $2 ORDER BY h.path`,
               [input.actor.tenant, refFor(mount)],
             )
@@ -541,9 +613,14 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
             }))
           }
           const pin = await pinnedRef(mount)
-          const result = await client.query<{ path: string; sha256: string; size_bytes: string; mode: number }>(
+          const result = await client.query<{
+            path: string
+            sha256: string
+            size_bytes: string
+            mode: number
+          }>(
             `SELECT e.path, b.sha256, b.size_bytes::text, e.mode
-             FROM afs_commits c JOIN afs_tree_entries e ON e.tree_id = c.tree_id JOIN afs_blobs b ON b.id = e.blob_id
+             FROM tuddo_commits c JOIN tuddo_tree_entries e ON e.tree_id = c.tree_id JOIN tuddo_blobs b ON b.id = e.blob_id
              WHERE c.tenant = $1 AND c.id = $2::bigint ORDER BY e.path`,
             [input.actor.tenant, pin.commitId],
           )
@@ -606,7 +683,7 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
             const client = await options.pool.connect()
             try {
               const result = await client.query<{ commit_sha: string }>(
-                'SELECT commit_sha FROM afs_commits WHERE tenant = $1 AND id = $2::bigint',
+                'SELECT commit_sha FROM tuddo_commits WHERE tenant = $1 AND id = $2::bigint',
                 [input.actor.tenant, pinned.commitId],
               )
               const row = result.rows[0]
@@ -616,7 +693,11 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
                   mount: parsed.mountKey,
                   path: parsed.path,
                 })
-              return { id: pinned.commitId, sha: row.commit_sha, mountKey: mount.key }
+              return {
+                id: pinned.commitId,
+                sha: row.commit_sha,
+                mountKey: mount.key,
+              }
             } finally {
               client.release()
             }
@@ -625,7 +706,7 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
           try {
             const result = await client.query<{ commit_sha: string }>(
               `SELECT c.commit_sha
-               FROM afs_refs r JOIN afs_commits c ON c.id = r.commit_id
+               FROM tuddo_refs r JOIN tuddo_commits c ON c.id = r.commit_id
                WHERE r.tenant = $1 AND r.name = $2`,
               [input.actor.tenant, refFor(mount)],
             )
@@ -637,7 +718,11 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
                 path: parsed.path,
               })
             const confined = await assertCommitInMountLineage(client, mount.key, row.commit_sha)
-            return { id: confined.id, sha: confined.commit_sha, mountKey: mount.key }
+            return {
+              id: confined.id,
+              sha: confined.commit_sha,
+              mountKey: mount.key,
+            }
           } finally {
             client.release()
           }
@@ -653,7 +738,7 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
               const tagName = value.startsWith('tag/') ? value : `tag/${mount.key}/${value}`
               const tag = await client.query<{ commit_sha: string }>(
                 `SELECT c.commit_sha
-                 FROM afs_refs r JOIN afs_commits c ON c.id = r.commit_id
+                 FROM tuddo_refs r JOIN tuddo_commits c ON c.id = r.commit_id
                  WHERE r.tenant = $1 AND r.name = $2 AND r.kind = 'tag'`,
                 [input.actor.tenant, tagName],
               )
@@ -669,7 +754,11 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
             client.release()
           }
           if (optionsForResolution.checkRead !== false) await ensureRead(mount, { bypassCache: true })
-          return { id: confined.id, sha: confined.commit_sha, mountKey: mount.key }
+          return {
+            id: confined.id,
+            sha: confined.commit_sha,
+            mountKey: mount.key,
+          }
         }
         throw new NotFoundError(`Commit not found in granted mount lineage: ${value}`, {
           tenant: input.actor.tenant,
@@ -686,7 +775,7 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
           mode: number
         }>(
           `SELECT e.path, e.blob_id::text, b.sha256, b.size_bytes::text, e.mode
-           FROM afs_commits c JOIN afs_tree_entries e ON e.tree_id = c.tree_id JOIN afs_blobs b ON b.id = e.blob_id
+           FROM tuddo_commits c JOIN tuddo_tree_entries e ON e.tree_id = c.tree_id JOIN tuddo_blobs b ON b.id = e.blob_id
            WHERE c.tenant = $1 AND c.id = $2::bigint`,
           [input.actor.tenant, commitId],
         )
@@ -720,9 +809,9 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
           mode: number
         }>(
           `SELECT c.id::text AS commit_id, e.path, e.blob_id::text, b.sha256, b.size_bytes::text, e.mode
-           FROM afs_commits c
-           JOIN afs_tree_entries e ON e.tree_id = c.tree_id
-           JOIN afs_blobs b ON b.id = e.blob_id
+           FROM tuddo_commits c
+           JOIN tuddo_tree_entries e ON e.tree_id = c.tree_id
+           JOIN tuddo_blobs b ON b.id = e.blob_id
            WHERE c.tenant = $1 AND c.id = ANY($2::bigint[])`,
           [input.actor.tenant, [...commitIds]],
         )
@@ -762,7 +851,12 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
                 path,
               })
             await mount.virtual.write(path, bytes, input.actor)
-            return { path, sha256: sha256(bytes), sizeBytes: BigInt(bytes.length), commitSha: '' }
+            return {
+              path,
+              sha256: sha256(bytes),
+              sizeBytes: BigInt(bytes.length),
+              commitSha: '',
+            }
           }
           if (mount.mode !== 'follow')
             throw new PermissionDeniedError('Pinned mount is read-only', {
@@ -770,7 +864,9 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
               mount: mount.key,
               path,
             })
-          const grant = await kernel.resolveGrant(input.actor, { key: mount.key })
+          const grant = await kernel.resolveGrant(input.actor, {
+            key: mount.key,
+          })
           if (grant.write === 'none')
             throw new PermissionDeniedError('Write permission denied', {
               tenant: input.actor.tenant,
@@ -825,10 +921,15 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
           return listRef(mount, path)
         },
         async glob(address: string) {
-          const { mountKey, path } = pathForAddress(address, { tenant: input.actor.tenant })
+          const { mountKey, path } = pathForAddress(address, {
+            tenant: input.actor.tenant,
+          })
           const mount = mounts.get(mountKey)
           if (!mount)
-            throw new NotFoundError(`Mount not found: ${mountKey}`, { tenant: input.actor.tenant, mount: mountKey })
+            throw new NotFoundError(`Mount not found: ${mountKey}`, {
+              tenant: input.actor.tenant,
+              mount: mountKey,
+            })
           if (!('virtual' in mount)) await ensureRead(mount)
           const matcher = globRegex(path)
           const entries = 'virtual' in mount ? await allVirtualEntries(mount) : await allRefEntries(mount)
@@ -838,7 +939,12 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
           const { mount, path } = mountFor(address)
           if ('virtual' in mount) {
             const bytes = await readVirtual(mount, path)
-            return { path, sha256: sha256(bytes), sizeBytes: BigInt(bytes.length), mode: 420 }
+            return {
+              path,
+              sha256: sha256(bytes),
+              sizeBytes: BigInt(bytes.length),
+              mode: 420,
+            }
           }
           const result =
             mount.mode === 'follow'
@@ -850,7 +956,12 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
                   authorUser: input.actor.id,
                 })
               : await readPinned(mount, path)
-          return { path, sha256: result.sha256, sizeBytes: result.sizeBytes, mode: result.mode }
+          return {
+            path,
+            sha256: result.sha256,
+            sizeBytes: result.sizeBytes,
+            mode: result.mode,
+          }
         },
         async delete(address: string, deleteOptions = {}) {
           const { mount, path } = mountFor(address)
@@ -888,7 +999,7 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
             const ref = refFor(mount)
             const tip = await client.query<{ commit_sha: string }>(
               `SELECT c.commit_sha
-               FROM afs_refs r JOIN afs_commits c ON c.id = r.commit_id
+               FROM tuddo_refs r JOIN tuddo_commits c ON c.id = r.commit_id
                WHERE r.tenant = $1 AND r.name = $2`,
               [input.actor.tenant, ref],
             )
@@ -903,40 +1014,40 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
             const result = await client.query<CommitRow & { parent_shas: string[] }>(
               `WITH RECURSIVE lineage(id) AS (
                  SELECT r.commit_id
-                 FROM afs_refs r
+                 FROM tuddo_refs r
                  WHERE r.tenant = $1 AND r.name = $2
                  UNION
                  SELECT parent_id
                  FROM lineage current
-                 JOIN afs_commits c ON c.id = current.id
+                 JOIN tuddo_commits c ON c.id = current.id
                  CROSS JOIN LATERAL unnest(c.parents) AS parent_id
                )
                SELECT c.id::text, c.commit_sha, c.parents, c.op, c.author_user, c.agent_kind, c.thread_id, c.run_id, c.created_at,
                       COALESCE(
                         (SELECT array_agg(p.commit_sha ORDER BY array_position(c.parents, p.id))
-                         FROM afs_commits p WHERE p.id = ANY(c.parents)),
+                         FROM tuddo_commits p WHERE p.id = ANY(c.parents)),
                         '{}'
                       ) AS parent_shas
-               FROM lineage JOIN afs_commits c ON c.id = lineage.id
+               FROM lineage JOIN tuddo_commits c ON c.id = lineage.id
                WHERE c.tenant = $1
                  AND (
                    (
                      cardinality(c.parents) = 0
                      AND EXISTS (
-                       SELECT 1 FROM afs_tree_entries current_entry
+                       SELECT 1 FROM tuddo_tree_entries current_entry
                        WHERE current_entry.tree_id = c.tree_id AND current_entry.path = $3
                      )
                    )
                    OR EXISTS (
                      SELECT 1
                      FROM unnest(c.parents) AS parent_id
-                     LEFT JOIN afs_commits parent ON parent.id = parent_id
-                     LEFT JOIN afs_tree_entries current_entry
+                     LEFT JOIN tuddo_commits parent ON parent.id = parent_id
+                     LEFT JOIN tuddo_tree_entries current_entry
                        ON current_entry.tree_id = c.tree_id AND current_entry.path = $3
-                     LEFT JOIN afs_blobs current_blob ON current_blob.id = current_entry.blob_id
-                     LEFT JOIN afs_tree_entries parent_entry
+                     LEFT JOIN tuddo_blobs current_blob ON current_blob.id = current_entry.blob_id
+                     LEFT JOIN tuddo_tree_entries parent_entry
                        ON parent_entry.tree_id = parent.tree_id AND parent_entry.path = $3
-                     LEFT JOIN afs_blobs parent_blob ON parent_blob.id = parent_entry.blob_id
+                     LEFT JOIN tuddo_blobs parent_blob ON parent_blob.id = parent_entry.blob_id
                     WHERE (current_entry.path = $3 OR parent_entry.path = $3)
                       AND (
                         current_blob.sha256 IS DISTINCT FROM parent_blob.sha256
@@ -973,7 +1084,7 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
               const ref = refFor(mount)
               const tip = await client.query<{ commit_sha: string }>(
                 `SELECT c.commit_sha
-                 FROM afs_refs r JOIN afs_commits c ON c.id = r.commit_id
+                 FROM tuddo_refs r JOIN tuddo_commits c ON c.id = r.commit_id
                  WHERE r.tenant = $1 AND r.name = $2`,
                 [input.actor.tenant, ref],
               )
@@ -983,21 +1094,21 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
               const result = await client.query<CommitRow & { parent_shas: string[] }>(
                 `WITH RECURSIVE lineage(id) AS (
                    SELECT r.commit_id
-                   FROM afs_refs r
+                   FROM tuddo_refs r
                    WHERE r.tenant = $1 AND r.name = $2
                    UNION
                    SELECT parent_id
                    FROM lineage current
-                   JOIN afs_commits c ON c.id = current.id
+                   JOIN tuddo_commits c ON c.id = current.id
                    CROSS JOIN LATERAL unnest(c.parents) AS parent_id
                  )
                  SELECT c.id::text, c.commit_sha, c.parents, c.op, c.author_user, c.agent_kind, c.thread_id, c.run_id, c.created_at,
                         COALESCE(
                           (SELECT array_agg(p.commit_sha ORDER BY array_position(c.parents, p.id))
-                           FROM afs_commits p WHERE p.id = ANY(c.parents)),
+                           FROM tuddo_commits p WHERE p.id = ANY(c.parents)),
                           '{}'
                         ) AS parent_shas
-                 FROM lineage JOIN afs_commits c ON c.id = lineage.id
+                 FROM lineage JOIN tuddo_commits c ON c.id = lineage.id
                  WHERE c.tenant = $1
                    AND ($3::text IS NULL OR c.run_id = $3)
                    AND ($4::text IS NULL OR c.agent_kind = $4)
@@ -1078,7 +1189,10 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
         async resolveMerge(mountKey: string, mergeOptions = {}) {
           const mount = mounts.get(mountKey)
           if (!mount)
-            throw new NotFoundError(`Mount not found: ${mountKey}`, { tenant: input.actor.tenant, mount: mountKey })
+            throw new NotFoundError(`Mount not found: ${mountKey}`, {
+              tenant: input.actor.tenant,
+              mount: mountKey,
+            })
           if ('virtual' in mount) return unsupportedVirtual(mount.key)
           if (mount.mode !== 'follow')
             throw new PermissionDeniedError('Pinned mount is read-only', {
@@ -1090,7 +1204,10 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
         async restore(mountKey: string, at: string) {
           const mount = mounts.get(mountKey)
           if (!mount)
-            throw new NotFoundError(`Mount not found: ${mountKey}`, { tenant: input.actor.tenant, mount: mountKey })
+            throw new NotFoundError(`Mount not found: ${mountKey}`, {
+              tenant: input.actor.tenant,
+              mount: mountKey,
+            })
           if ('virtual' in mount) return unsupportedVirtual(mount.key)
           if (mount.mode !== 'follow')
             throw new PermissionDeniedError('Pinned mount is read-only', {
@@ -1103,7 +1220,9 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
               tenant: input.actor.tenant,
               mount: mount.key,
             })
-          const commit = await resolveCommit(at, mount.key, { checkRead: false })
+          const commit = await resolveCommit(at, mount.key, {
+            checkRead: false,
+          })
           return kernel.restore({
             tenant: input.actor.tenant,
             mount: mount.key,
@@ -1118,7 +1237,10 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
         async tag(mountKey: string, label: string) {
           const mount = mounts.get(mountKey)
           if (!mount)
-            throw new NotFoundError(`Mount not found: ${mountKey}`, { tenant: input.actor.tenant, mount: mountKey })
+            throw new NotFoundError(`Mount not found: ${mountKey}`, {
+              tenant: input.actor.tenant,
+              mount: mountKey,
+            })
           if ('virtual' in mount) return unsupportedVirtual(mount.key)
           if (mount.mode !== 'follow')
             throw new PermissionDeniedError('Pinned mount is read-only', {
@@ -1139,21 +1261,31 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
           const client = await options.pool.connect()
           try {
             await client.query('BEGIN')
-            const result = await client.query<{ commit_id: string; commit_sha: string; state: string }>(
+            const result = await client.query<{
+              commit_id: string
+              commit_sha: string
+              state: string
+            }>(
               `SELECT r.commit_id::text, c.commit_sha, r.state
-               FROM afs_refs r JOIN afs_commits c ON c.id = r.commit_id
+               FROM tuddo_refs r JOIN tuddo_commits c ON c.id = r.commit_id
                WHERE r.tenant = $1 AND r.name = $2 FOR UPDATE`,
               [input.actor.tenant, refFor(mount)],
             )
             const row = result.rows[0]
             if (!row)
-              throw new NotFoundError(`Mount not found: ${mount.key}`, { tenant: input.actor.tenant, mount: mount.key })
+              throw new NotFoundError(`Mount not found: ${mount.key}`, {
+                tenant: input.actor.tenant,
+                mount: mount.key,
+              })
             if (row.state !== 'open')
-              throw new BranchSettledError(row.state, { tenant: input.actor.tenant, mount: mount.key })
+              throw new BranchSettledError(row.state, {
+                tenant: input.actor.tenant,
+                mount: mount.key,
+              })
             const tagName = `tag/${mount.key}/${label}`
             const existing = await client.query<{ commit_sha: string }>(
               `SELECT c.commit_sha
-               FROM afs_refs r JOIN afs_commits c ON c.id = r.commit_id
+               FROM tuddo_refs r JOIN tuddo_commits c ON c.id = r.commit_id
                WHERE r.tenant = $1 AND r.name = $2
                FOR UPDATE`,
               [input.actor.tenant, tagName],
@@ -1165,7 +1297,7 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
                 ref: tagName,
               })
             const inserted = await client.query(
-              `INSERT INTO afs_refs (tenant, name, kind, commit_id, state)
+              `INSERT INTO tuddo_refs (tenant, name, kind, commit_id, state)
                VALUES ($1, $2, 'tag', $3::bigint, 'tag')
                ON CONFLICT (tenant, name) DO NOTHING`,
               [input.actor.tenant, tagName, row.commit_id],
@@ -1173,7 +1305,7 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
             if ((inserted.rowCount ?? 0) === 0) {
               const concurrent = await client.query<{ commit_sha: string }>(
                 `SELECT c.commit_sha
-                 FROM afs_refs r JOIN afs_commits c ON c.id = r.commit_id
+                 FROM tuddo_refs r JOIN tuddo_commits c ON c.id = r.commit_id
                  WHERE r.tenant = $1 AND r.name = $2`,
                 [input.actor.tenant, tagName],
               )
@@ -1196,7 +1328,7 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
           const client = await options.pool.connect()
           try {
             await client.query(
-              `UPDATE afs_refs SET state = 'abandoned', settled_at = now() WHERE tenant = $1 AND name = ANY($2::text[]) AND kind = 'branch' AND state = 'open'`,
+              `UPDATE tuddo_refs SET state = 'abandoned', settled_at = now() WHERE tenant = $1 AND name = ANY($2::text[]) AND kind = 'branch' AND state = 'open'`,
               [
                 input.actor.tenant,
                 [...mounts.values()]
@@ -1254,12 +1386,15 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
             commit_sha: string
             state: string
           }>(
-            'SELECT r.commit_id::text, r.base_commit::text, c.commit_sha, r.state FROM afs_refs r JOIN afs_commits c ON c.id = r.commit_id WHERE r.tenant = $1 AND r.name = $2 FOR UPDATE',
+            'SELECT r.commit_id::text, r.base_commit::text, c.commit_sha, r.state FROM tuddo_refs r JOIN tuddo_commits c ON c.id = r.commit_id WHERE r.tenant = $1 AND r.name = $2 FOR UPDATE',
             [input.actor.tenant, mount.ref],
           )
           const branch = refResult.rows[0]
           if (!branch)
-            throw new NotFoundError(`Branch not found: ${mount.ref}`, { tenant: input.actor.tenant, mount: mount.key })
+            throw new NotFoundError(`Branch not found: ${mount.ref}`, {
+              tenant: input.actor.tenant,
+              mount: mount.key,
+            })
           if (branch.state === 'merged') {
             await client.query('ROLLBACK')
             return 'merged'
@@ -1269,7 +1404,11 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
             return 'unauthorized'
           }
           if (branch.state !== 'open')
-            throw new BranchSettledError(branch.state, { tenant: input.actor.tenant, mount: mount.key, ref: mount.ref })
+            throw new BranchSettledError(branch.state, {
+              tenant: input.actor.tenant,
+              mount: mount.key,
+              ref: mount.ref,
+            })
           if (actorGrant.write === 'staged') {
             if (!mergeOptions.approver) {
               await client.query('ROLLBACK')
@@ -1282,7 +1421,7 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
           }
           if (actorGrant.write === 'none') {
             await client.query(
-              `UPDATE afs_refs SET state = 'unauthorized', settled_at = now()
+              `UPDATE tuddo_refs SET state = 'unauthorized', settled_at = now()
                WHERE tenant = $1 AND name = $2`,
               [input.actor.tenant, mount.ref],
             )
@@ -1290,17 +1429,28 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
             return 'unauthorized'
           }
 
-          const mountResult = await client.query<{ commit_id: string; commit_sha: string }>(
-            'SELECT r.commit_id::text, c.commit_sha FROM afs_refs r JOIN afs_commits c ON c.id = r.commit_id WHERE r.tenant = $1 AND r.name = $2 FOR UPDATE',
+          const mountResult = await client.query<{
+            commit_id: string
+            commit_sha: string
+          }>(
+            'SELECT r.commit_id::text, c.commit_sha FROM tuddo_refs r JOIN tuddo_commits c ON c.id = r.commit_id WHERE r.tenant = $1 AND r.name = $2 FOR UPDATE',
             [input.actor.tenant, `mount/${mount.key}`],
           )
           const theirs = mountResult.rows[0]
           if (!theirs)
-            throw new NotFoundError(`Mount not found: ${mount.key}`, { tenant: input.actor.tenant, mount: mount.key })
+            throw new NotFoundError(`Mount not found: ${mount.key}`, {
+              tenant: input.actor.tenant,
+              mount: mount.key,
+            })
           const base = await readTree(client, branch.base_commit)
           const ours = await readTree(client, branch.commit_id)
           const theirsTree = await readTree(client, theirs.commit_id)
-          const conflicts: { path: string; baseSha?: string; oursSha?: string; theirsSha?: string }[] = []
+          const conflicts: {
+            path: string
+            baseSha?: string
+            oursSha?: string
+            theirsSha?: string
+          }[] = []
           const merged = new Map(theirsTree)
           for (const path of new Set([...base.keys(), ...ours.keys(), ...theirsTree.keys()])) {
             const b = base.get(path)
@@ -1326,14 +1476,22 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
             return { conflicts }
           }
           const mergedTreeSha = hashTree(
-            [...merged.values()].map(entry => ({ path: entry.path, mode: entry.mode, blobSha: entry.sha256 })),
+            [...merged.values()].map(entry => ({
+              path: entry.path,
+              mode: entry.mode,
+              blobSha: entry.sha256,
+            })),
           )
           const theirsTreeSha = hashTree(
-            [...theirsTree.values()].map(entry => ({ path: entry.path, mode: entry.mode, blobSha: entry.sha256 })),
+            [...theirsTree.values()].map(entry => ({
+              path: entry.path,
+              mode: entry.mode,
+              blobSha: entry.sha256,
+            })),
           )
           if (mergedTreeSha === theirsTreeSha) {
             await client.query(
-              `UPDATE afs_refs SET state = 'merged', settled_at = now() WHERE tenant = $1 AND name = $2`,
+              `UPDATE tuddo_refs SET state = 'merged', settled_at = now() WHERE tenant = $1 AND name = $2`,
               [input.actor.tenant, mount.ref],
             )
             await client.query('COMMIT')
@@ -1348,13 +1506,13 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
             input,
             'merge',
           )
-          await client.query('UPDATE afs_refs SET commit_id = $3::bigint WHERE tenant = $1 AND name = $2', [
+          await client.query('UPDATE tuddo_refs SET commit_id = $3::bigint WHERE tenant = $1 AND name = $2', [
             input.actor.tenant,
             `mount/${mount.key}`,
             created.id.toString(),
           ])
           await client.query(
-            `UPDATE afs_refs SET state = 'merged', settled_at = now() WHERE tenant = $1 AND name = $2`,
+            `UPDATE tuddo_refs SET state = 'merged', settled_at = now() WHERE tenant = $1 AND name = $2`,
             [input.actor.tenant, mount.ref],
           )
           await replaceHeads(client, input.actor.tenant, `mount/${mount.key}`, merged)
@@ -1400,13 +1558,13 @@ async function insertTreeCommit(
   }))
   const treeSha = hashTree(treeEntries)
   const tree = await client.query<{ id: string }>(
-    'INSERT INTO afs_trees (tenant, tree_sha) VALUES ($1, $2) ON CONFLICT (tenant, tree_sha) DO UPDATE SET tree_sha = EXCLUDED.tree_sha RETURNING id::text',
+    'INSERT INTO tuddo_trees (tenant, tree_sha) VALUES ($1, $2) ON CONFLICT (tenant, tree_sha) DO UPDATE SET tree_sha = EXCLUDED.tree_sha RETURNING id::text',
     [tenant, treeSha],
   )
   const treeId = BigInt(tree.rows[0]?.id ?? '0')
   for (const entry of entries.values())
     await client.query(
-      'INSERT INTO afs_tree_entries (tree_id, path, blob_id, mode) VALUES ($1::bigint, $2, $3::bigint, $4) ON CONFLICT DO NOTHING',
+      'INSERT INTO tuddo_tree_entries (tree_id, path, blob_id, mode) VALUES ($1::bigint, $2, $3::bigint, $4) ON CONFLICT DO NOTHING',
       [treeId.toString(), entry.path, entry.blobId, entry.mode],
     )
   const createdAt = new Date()
@@ -1421,7 +1579,7 @@ async function insertTreeCommit(
     op,
   })
   const commit = await client.query<{ id: string }>(
-    'INSERT INTO afs_commits (tenant, commit_sha, tree_id, parents, author_user, agent_kind, thread_id, run_id, op, message, created_at) VALUES ($1, $2, $3::bigint, $4::bigint[], $5, $6, $7, $8, $9, NULL, $10) RETURNING id::text',
+    'INSERT INTO tuddo_commits (tenant, commit_sha, tree_id, parents, author_user, agent_kind, thread_id, run_id, op, message, created_at) VALUES ($1, $2, $3::bigint, $4::bigint[], $5, $6, $7, $8, $9, NULL, $10) RETURNING id::text',
     [
       tenant,
       commitSha,
@@ -1444,10 +1602,10 @@ async function replaceHeads(
   ref: string,
   entries: Map<string, Head>,
 ): Promise<void> {
-  await client.query('DELETE FROM afs_heads WHERE tenant = $1 AND ref_name = $2', [tenant, ref])
+  await client.query('DELETE FROM tuddo_heads WHERE tenant = $1 AND ref_name = $2', [tenant, ref])
   for (const entry of entries.values())
     await client.query(
-      'INSERT INTO afs_heads (tenant, ref_name, path, blob_id, sha256, size_bytes) VALUES ($1, $2, $3, $4::bigint, $5, $6)',
+      'INSERT INTO tuddo_heads (tenant, ref_name, path, blob_id, sha256, size_bytes) VALUES ($1, $2, $3, $4::bigint, $5, $6)',
       [tenant, ref, entry.path, entry.blobId, entry.sha256, entry.sizeBytes.toString()],
     )
 }

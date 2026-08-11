@@ -17,5 +17,5 @@
     "tsBuildInfoFile": "./node_modules/.cache/tsconfig.emit.tsbuildinfo"
   },
   "include": ["src"],
-  "exclude": ["dist", "node_modules", "src/**/__tests__/**"]
+  "exclude": ["dist", "node_modules", "src/**/__tests__/**", "src/integration/**"]
 }

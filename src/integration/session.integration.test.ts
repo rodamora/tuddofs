@@ -11,20 +11,23 @@ import {
   migrate,
 } from '../index.js'
 
-const pool = new Pool({ connectionString: process.env.AGENT_FS_DATABASE_URL })
+const pool = new Pool({ connectionString: process.env.TUDDOFS_DATABASE_URL })
 const tenant = 'session-integration'
 const actor = { id: 'user-session', tenant }
 
 before(async () => migrate(pool))
 beforeEach(async () => {
   await pool.query(
-    'TRUNCATE afs_heads, afs_refs, afs_commits, afs_tree_entries, afs_trees, afs_blobs RESTART IDENTITY CASCADE',
+    'TRUNCATE tuddo_heads, tuddo_refs, tuddo_commits, tuddo_tree_entries, tuddo_trees, tuddo_blobs RESTART IDENTITY CASCADE',
   )
 })
 after(async () => pool.end())
 
 test('session file API writes, edits, lists, globs, stats, deletes, and maps errors', async () => {
-  const fs = createAgentFs({ pool, grants: { resolve: async () => ({ read: true, write: 'direct' }) } })
+  const fs = createAgentFs({
+    pool,
+    grants: { resolve: async () => ({ read: true, write: 'direct' }) },
+  })
   const session = await fs.open({
     actor,
     sessionId: 'session-api',
@@ -67,7 +70,10 @@ test('session file API writes, edits, lists, globs, stats, deletes, and maps err
 })
 
 test('session merge skips virtual mounts and is idempotent after completion', async () => {
-  const fs = createAgentFs({ pool, grants: { resolve: async () => ({ read: true, write: 'direct' }) } })
+  const fs = createAgentFs({
+    pool,
+    grants: { resolve: async () => ({ read: true, write: 'direct' }) },
+  })
   const session = await fs.open({
     actor,
     sessionId: 'session-mixed-merge',
@@ -96,8 +102,15 @@ test('session merge skips virtual mounts and is idempotent after completion', as
   assert.deepEqual(second, first)
 })
 test('ref mount listings use UTF-16 code-unit ordering', async () => {
-  const fs = createAgentFs({ pool, grants: { resolve: async () => ({ read: true, write: 'direct' }) } })
-  const session = await fs.open({ actor, sessionId: 'session-ref-list-order', mounts: [{ key: 'project:docs' }] })
+  const fs = createAgentFs({
+    pool,
+    grants: { resolve: async () => ({ read: true, write: 'direct' }) },
+  })
+  const session = await fs.open({
+    actor,
+    sessionId: 'session-ref-list-order',
+    mounts: [{ key: 'project:docs' }],
+  })
   await session.write('project:docs:/😀', 'astral')
   await session.write('project:docs:/z', 'letter')
 
@@ -108,21 +121,24 @@ test('ref mount listings use UTF-16 code-unit ordering', async () => {
 })
 
 test('merge with no branch changes does not create an empty commit', async () => {
-  const fs = createAgentFs({ pool, grants: { resolve: async () => ({ read: true, write: 'direct' }) } })
+  const fs = createAgentFs({
+    pool,
+    grants: { resolve: async () => ({ read: true, write: 'direct' }) },
+  })
   const session = await fs.open({
     actor,
     sessionId: 'session-noop-merge',
     mounts: [{ key: 'project:docs' }],
   })
   const before = await pool.query<{ count: string }>(
-    'SELECT count(*)::text AS count FROM afs_commits WHERE tenant = $1',
+    'SELECT count(*)::text AS count FROM tuddo_commits WHERE tenant = $1',
     [tenant],
   )
 
   assert.deepEqual(await session.merge(), { 'project:docs': 'merged' })
 
   const after = await pool.query<{ count: string }>(
-    'SELECT count(*)::text AS count FROM afs_commits WHERE tenant = $1',
+    'SELECT count(*)::text AS count FROM tuddo_commits WHERE tenant = $1',
     [tenant],
   )
   assert.equal(after.rows[0]?.count, before.rows[0]?.count)
@@ -130,7 +146,10 @@ test('merge with no branch changes does not create an empty commit', async () =>
 
 test('virtual delete is rejected without fabricating an empty file', async () => {
   let writes = 0
-  const fs = createAgentFs({ pool, grants: { resolve: async () => ({ read: true, write: 'direct' }) } })
+  const fs = createAgentFs({
+    pool,
+    grants: { resolve: async () => ({ read: true, write: 'direct' }) },
+  })
   const session = await fs.open({
     actor,
     sessionId: 'session-virtual-delete',
@@ -158,7 +177,10 @@ test('virtual delete is rejected without fabricating an empty file', async () =>
 })
 
 test('timeline exposes commit-sha parents and path deltas including deletes', async () => {
-  const fs = createAgentFs({ pool, grants: { resolve: async () => ({ read: true, write: 'direct' }) } })
+  const fs = createAgentFs({
+    pool,
+    grants: { resolve: async () => ({ read: true, write: 'direct' }) },
+  })
   const session = await fs.open({
     actor,
     sessionId: 'session-timeline-delta',
@@ -176,7 +198,10 @@ test('timeline exposes commit-sha parents and path deltas including deletes', as
   assert.ok(deletion.parentShas.every(parent => /^[0-9a-f]{64}$/u.test(parent)))
 })
 test('restore returns a dedicated tree result for created and unchanged restores', async () => {
-  const fs = createAgentFs({ pool, grants: { resolve: async () => ({ read: true, write: 'direct' }) } })
+  const fs = createAgentFs({
+    pool,
+    grants: { resolve: async () => ({ read: true, write: 'direct' }) },
+  })
   const session = await fs.open({
     actor,
     sessionId: 'session-restore-result',
@@ -198,7 +223,10 @@ test('restore returns a dedicated tree result for created and unchanged restores
 })
 
 test('virtual glob walks nested handler directories', async () => {
-  const fs = createAgentFs({ pool, grants: { resolve: async () => ({ read: true, write: 'direct' }) } })
+  const fs = createAgentFs({
+    pool,
+    grants: { resolve: async () => ({ read: true, write: 'direct' }) },
+  })
   const session = await fs.open({
     actor,
     sessionId: 'session-virtual-glob',
@@ -208,7 +236,15 @@ test('virtual glob walks nested handler directories', async () => {
         virtual: {
           async list(dir) {
             if (dir === '/') return [{ path: '/nested', type: 'directory' }]
-            if (dir === '/nested') return [{ path: '/nested/alice.md', type: 'file', sizeBytes: 5, mode: 420 }]
+            if (dir === '/nested')
+              return [
+                {
+                  path: '/nested/alice.md',
+                  type: 'file',
+                  sizeBytes: 5,
+                  mode: 420,
+                },
+              ]
             return []
           },
           async read() {

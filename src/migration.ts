@@ -19,7 +19,7 @@ export interface AgentFsPool {
 type SchemaColumn = { table_name: string; column_name: string }
 type MigrationRow = { version: number; name: string }
 
-const LEDGER_DDL = `CREATE TABLE IF NOT EXISTS afs_migrations (
+const LEDGER_DDL = `CREATE TABLE IF NOT EXISTS tuddo_migrations (
   version     INTEGER PRIMARY KEY,
   name        TEXT NOT NULL,
   applied_at  TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -31,7 +31,7 @@ const LEDGER_DDL = `CREATE TABLE IF NOT EXISTS afs_migrations (
  * @see spec §15.7
  */
 const DDL = [
-  `CREATE TABLE IF NOT EXISTS afs_blobs (
+  `CREATE TABLE IF NOT EXISTS tuddo_blobs (
   id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   tenant      TEXT NOT NULL,
   sha256      TEXT NOT NULL,
@@ -42,25 +42,25 @@ const DDL = [
   UNIQUE (tenant, sha256),
   CHECK ((inline IS NULL) <> (object_key IS NULL))
 )`,
-  `CREATE TABLE IF NOT EXISTS afs_trees (
+  `CREATE TABLE IF NOT EXISTS tuddo_trees (
   id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   tenant      TEXT NOT NULL,
   tree_sha    TEXT NOT NULL,
   created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
   UNIQUE (tenant, tree_sha)
 )`,
-  `CREATE TABLE IF NOT EXISTS afs_tree_entries (
-  tree_id     BIGINT NOT NULL REFERENCES afs_trees(id) ON DELETE CASCADE,
+  `CREATE TABLE IF NOT EXISTS tuddo_tree_entries (
+  tree_id     BIGINT NOT NULL REFERENCES tuddo_trees(id) ON DELETE CASCADE,
   path        TEXT NOT NULL,
-  blob_id     BIGINT NOT NULL REFERENCES afs_blobs(id) ON DELETE RESTRICT,
+  blob_id     BIGINT NOT NULL REFERENCES tuddo_blobs(id) ON DELETE RESTRICT,
   mode        INT NOT NULL DEFAULT 420,
   PRIMARY KEY (tree_id, path)
 )`,
-  `CREATE TABLE IF NOT EXISTS afs_commits (
+  `CREATE TABLE IF NOT EXISTS tuddo_commits (
   id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   tenant      TEXT NOT NULL,
   commit_sha  TEXT NOT NULL,
-  tree_id     BIGINT NOT NULL REFERENCES afs_trees(id) ON DELETE RESTRICT,
+  tree_id     BIGINT NOT NULL REFERENCES tuddo_trees(id) ON DELETE RESTRICT,
   parents     BIGINT[] NOT NULL DEFAULT '{}',
   author_user TEXT NOT NULL,
   agent_kind  TEXT,
@@ -71,20 +71,20 @@ const DDL = [
   created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
   UNIQUE (tenant, commit_sha)
 )`,
-  'CREATE INDEX IF NOT EXISTS afs_commits_run ON afs_commits (tenant, run_id) WHERE run_id IS NOT NULL',
-  'CREATE INDEX IF NOT EXISTS afs_commits_thread ON afs_commits (tenant, thread_id) WHERE thread_id IS NOT NULL',
-  `CREATE TABLE IF NOT EXISTS afs_refs (
+  'CREATE INDEX IF NOT EXISTS tuddo_commits_run ON tuddo_commits (tenant, run_id) WHERE run_id IS NOT NULL',
+  'CREATE INDEX IF NOT EXISTS tuddo_commits_thread ON tuddo_commits (tenant, thread_id) WHERE thread_id IS NOT NULL',
+  `CREATE TABLE IF NOT EXISTS tuddo_refs (
   tenant       TEXT NOT NULL,
   name         TEXT NOT NULL,
   kind         TEXT NOT NULL,
-  commit_id    BIGINT NOT NULL REFERENCES afs_commits(id) ON DELETE RESTRICT,
-  base_commit  BIGINT REFERENCES afs_commits(id) ON DELETE RESTRICT,
+  commit_id    BIGINT NOT NULL REFERENCES tuddo_commits(id) ON DELETE RESTRICT,
+  base_commit  BIGINT REFERENCES tuddo_commits(id) ON DELETE RESTRICT,
   state        TEXT NOT NULL DEFAULT 'open',
   created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
   settled_at   TIMESTAMPTZ,
   PRIMARY KEY (tenant, name)
 )`,
-  `CREATE TABLE IF NOT EXISTS afs_heads (
+  `CREATE TABLE IF NOT EXISTS tuddo_heads (
   tenant      TEXT NOT NULL,
   ref_name    TEXT NOT NULL,
   path        TEXT NOT NULL,
@@ -96,47 +96,47 @@ const DDL = [
 ] as const
 
 const EXPECTED_COLUMNS: readonly SchemaColumn[] = [
-  ['afs_blobs', 'id'],
-  ['afs_blobs', 'tenant'],
-  ['afs_blobs', 'sha256'],
-  ['afs_blobs', 'size_bytes'],
-  ['afs_blobs', 'inline'],
-  ['afs_blobs', 'object_key'],
-  ['afs_blobs', 'created_at'],
-  ['afs_trees', 'id'],
-  ['afs_trees', 'tenant'],
-  ['afs_trees', 'tree_sha'],
-  ['afs_trees', 'created_at'],
-  ['afs_tree_entries', 'tree_id'],
-  ['afs_tree_entries', 'path'],
-  ['afs_tree_entries', 'blob_id'],
-  ['afs_tree_entries', 'mode'],
-  ['afs_commits', 'id'],
-  ['afs_commits', 'tenant'],
-  ['afs_commits', 'commit_sha'],
-  ['afs_commits', 'tree_id'],
-  ['afs_commits', 'parents'],
-  ['afs_commits', 'author_user'],
-  ['afs_commits', 'agent_kind'],
-  ['afs_commits', 'thread_id'],
-  ['afs_commits', 'run_id'],
-  ['afs_commits', 'op'],
-  ['afs_commits', 'message'],
-  ['afs_commits', 'created_at'],
-  ['afs_refs', 'tenant'],
-  ['afs_refs', 'name'],
-  ['afs_refs', 'kind'],
-  ['afs_refs', 'commit_id'],
-  ['afs_refs', 'base_commit'],
-  ['afs_refs', 'state'],
-  ['afs_refs', 'created_at'],
-  ['afs_refs', 'settled_at'],
-  ['afs_heads', 'tenant'],
-  ['afs_heads', 'ref_name'],
-  ['afs_heads', 'path'],
-  ['afs_heads', 'blob_id'],
-  ['afs_heads', 'sha256'],
-  ['afs_heads', 'size_bytes'],
+  ['tuddo_blobs', 'id'],
+  ['tuddo_blobs', 'tenant'],
+  ['tuddo_blobs', 'sha256'],
+  ['tuddo_blobs', 'size_bytes'],
+  ['tuddo_blobs', 'inline'],
+  ['tuddo_blobs', 'object_key'],
+  ['tuddo_blobs', 'created_at'],
+  ['tuddo_trees', 'id'],
+  ['tuddo_trees', 'tenant'],
+  ['tuddo_trees', 'tree_sha'],
+  ['tuddo_trees', 'created_at'],
+  ['tuddo_tree_entries', 'tree_id'],
+  ['tuddo_tree_entries', 'path'],
+  ['tuddo_tree_entries', 'blob_id'],
+  ['tuddo_tree_entries', 'mode'],
+  ['tuddo_commits', 'id'],
+  ['tuddo_commits', 'tenant'],
+  ['tuddo_commits', 'commit_sha'],
+  ['tuddo_commits', 'tree_id'],
+  ['tuddo_commits', 'parents'],
+  ['tuddo_commits', 'author_user'],
+  ['tuddo_commits', 'agent_kind'],
+  ['tuddo_commits', 'thread_id'],
+  ['tuddo_commits', 'run_id'],
+  ['tuddo_commits', 'op'],
+  ['tuddo_commits', 'message'],
+  ['tuddo_commits', 'created_at'],
+  ['tuddo_refs', 'tenant'],
+  ['tuddo_refs', 'name'],
+  ['tuddo_refs', 'kind'],
+  ['tuddo_refs', 'commit_id'],
+  ['tuddo_refs', 'base_commit'],
+  ['tuddo_refs', 'state'],
+  ['tuddo_refs', 'created_at'],
+  ['tuddo_refs', 'settled_at'],
+  ['tuddo_heads', 'tenant'],
+  ['tuddo_heads', 'ref_name'],
+  ['tuddo_heads', 'path'],
+  ['tuddo_heads', 'blob_id'],
+  ['tuddo_heads', 'sha256'],
+  ['tuddo_heads', 'size_bytes'],
 ].map(([table_name, column_name]) => ({ table_name, column_name }))
 
 const MIGRATIONS = [{ version: 1, name: 'initial schema', statements: DDL }] as const
@@ -146,10 +146,10 @@ async function assertFrozenSchema(client: AgentFsClient): Promise<void> {
   const tables = await client.query<{ table_name: string }>(
     `SELECT table_name
      FROM information_schema.tables
-     WHERE table_schema = 'public' AND table_name LIKE 'afs\\_%'
+     WHERE table_schema = 'public' AND table_name LIKE 'tuddo\\_%'
      ORDER BY table_name`,
   )
-  const expectedTables = [...tableNames, 'afs_migrations'].sort()
+  const expectedTables = [...tableNames, 'tuddo_migrations'].sort()
   const actualTables = tables.rows.map(row => row.table_name).sort()
   if (
     actualTables.length !== expectedTables.length ||
@@ -185,9 +185,9 @@ export async function migrate(pool: AgentFsPool): Promise<void> {
   let committed = false
   try {
     await client.query('BEGIN')
-    await client.query(`SELECT pg_advisory_xact_lock(hashtext('agent-fs:migrations'))`)
+    await client.query(`SELECT pg_advisory_xact_lock(hashtext('tuddofs:migrations'))`)
     await client.query(LEDGER_DDL)
-    const applied = await client.query<MigrationRow>('SELECT version, name FROM afs_migrations ORDER BY version')
+    const applied = await client.query<MigrationRow>('SELECT version, name FROM tuddo_migrations ORDER BY version')
     for (const migration of MIGRATIONS) {
       const row = applied.rows.find(candidate => candidate.version === migration.version)
       if (row) {
@@ -198,7 +198,7 @@ export async function migrate(pool: AgentFsPool): Promise<void> {
       }
       for (const statement of migration.statements) await client.query(statement)
       await client.query(
-        `INSERT INTO afs_migrations (version, name)
+        `INSERT INTO tuddo_migrations (version, name)
          VALUES ($1, $2)
          ON CONFLICT (version) DO NOTHING`,
         [migration.version, migration.name],

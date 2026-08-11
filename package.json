@@ -1,33 +1,59 @@
 {
-  "name": "@cowork/agent-fs",
+  "name": "tuddofs",
   "version": "0.1.0",
-  "private": true,
   "type": "module",
-  "description": "Canonical primitives for the Cowork agent filesystem",
+  "description": "A multi-tenant, permission-confined, branchable filesystem for AI agents, built on Postgres and object storage.",
+  "license": "MIT",
+  "author": "Rod Amora",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/rodamora/tuddofs.git"
+  },
+  "bugs": {
+    "url": "https://github.com/rodamora/tuddofs/issues"
+  },
+  "homepage": "https://github.com/rodamora/tuddofs#readme",
+  "keywords": [
+    "ai-agents",
+    "filesystem",
+    "multi-tenant",
+    "postgres",
+    "object-storage",
+    "branching",
+    "content-addressed-storage"
+  ],
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
     }
   },
+  "types": "./dist/index.d.ts",
   "engines": {
     "node": ">=20"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json --incremental false",
     "test": "NODE_ENV=test node --import tsx --test 'src/**/__tests__/**/*.test.ts'",
-    "test:integration": "AGENT_FS_DATABASE_URL=${AGENT_FS_DATABASE_URL:-postgresql://agentfs:agentfs@127.0.0.1:55434/agentfs_it} node --import tsx --test --test-concurrency=1 'src/integration/**/*.integration.test.ts'",
+    "test:integration": "TUDDOFS_DATABASE_URL=${TUDDOFS_DATABASE_URL:-postgresql://tuddofs:tuddofs@127.0.0.1:55434/tuddofs_it} node --import tsx --test --test-concurrency=1 'src/integration/**/*.integration.test.ts'",
     "demo": "node --import tsx scripts/demo.ts",
-    "typecheck": "tsgo --noEmit -p tsconfig.typecheck.json",
+    "typecheck": "tsc --noEmit -p tsconfig.typecheck.json",
     "typecheck:tsc": "tsc --noEmit -p tsconfig.typecheck.json",
-    "format": "prettier --write 'src/**/*.ts' 'scripts/**/*.ts' 'README.md' 'package.json'",
-    "format:check": "prettier --check 'src/**/*.ts' 'scripts/**/*.ts' 'README.md' 'package.json'",
-    "lint": "eslint ."
+    "format": "prettier --write 'src/**/*.ts' 'scripts/**/*.ts' 'fixtures/**/*.mjs' '*.mjs' '*.json' '*.md'",
+    "format:check": "prettier --check 'src/**/*.ts' 'scripts/**/*.ts' 'fixtures/**/*.mjs' '*.mjs' '*.json' '*.md'",
+    "lint": "eslint .",
+    "prepublishOnly": "npm run build && npm test"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
     "@types/pg": "^8.20.0",
     "eslint": "^9.39.2",
+    "prettier": "^3.6.2",
     "tsx": "^4.21.0",
     "typescript": "^5.6.0",
     "typescript-eslint": "^8.55.0"

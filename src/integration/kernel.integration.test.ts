@@ -13,7 +13,7 @@ import {
   migrate,
 } from '../index.js'
 
-const pool = new Pool({ connectionString: process.env.AGENT_FS_DATABASE_URL })
+const pool = new Pool({ connectionString: process.env.TUDDOFS_DATABASE_URL })
 const tenant = 'integration-tenant'
 const mount = 'project:kernel'
 const actor = 'user-1'
@@ -32,7 +32,7 @@ before(async () => {
 
 beforeEach(async () => {
   await pool.query(
-    'TRUNCATE afs_heads, afs_refs, afs_commits, afs_tree_entries, afs_trees, afs_blobs RESTART IDENTITY CASCADE',
+    'TRUNCATE tuddo_heads, tuddo_refs, tuddo_commits, tuddo_tree_entries, tuddo_trees, tuddo_blobs RESTART IDENTITY CASCADE',
   )
 })
 
@@ -46,31 +46,49 @@ test('migrate is idempotent, records migration 001, and preserves the frozen sch
   const tables = await pool.query<{ table_name: string }>(
     `SELECT table_name
      FROM information_schema.tables
-     WHERE table_schema = 'public' AND table_name LIKE 'afs_%'
+     WHERE table_schema = 'public' AND table_name LIKE 'tuddo_%'
      ORDER BY table_name`,
   )
   assert.deepEqual(
     tables.rows.map(row => row.table_name),
-    ['afs_blobs', 'afs_commits', 'afs_heads', 'afs_migrations', 'afs_refs', 'afs_tree_entries', 'afs_trees'],
+    [
+      'tuddo_blobs',
+      'tuddo_commits',
+      'tuddo_heads',
+      'tuddo_migrations',
+      'tuddo_refs',
+      'tuddo_tree_entries',
+      'tuddo_trees',
+    ],
   )
   const columns = await pool.query<{ table_name: string; column_name: string }>(
     `SELECT table_name, column_name
      FROM information_schema.columns
      WHERE table_schema = 'public' AND table_name IN
-       ('afs_blobs', 'afs_commits', 'afs_heads', 'afs_refs', 'afs_tree_entries', 'afs_trees')
+       ('tuddo_blobs', 'tuddo_commits', 'tuddo_heads', 'tuddo_refs', 'tuddo_tree_entries', 'tuddo_trees')
      ORDER BY table_name, ordinal_position`,
   )
   assert.equal(columns.rows.length, 41)
   const ledger = await pool.query<{ version: number; name: string }>(
-    'SELECT version, name FROM afs_migrations ORDER BY version',
+    'SELECT version, name FROM tuddo_migrations ORDER BY version',
   )
   assert.deepEqual(ledger.rows, [{ version: 1, name: 'initial schema' }])
 })
 
 test('fork creates genesis, seeds heads, and re-fork is idempotent', async () => {
   const fs = createAgentFs({ pool })
-  const first = await fs.fork({ tenant, mount, sessionId: 'session-1', authorUser: actor })
-  const second = await fs.fork({ tenant, mount, sessionId: 'session-1', authorUser: actor })
+  const first = await fs.fork({
+    tenant,
+    mount,
+    sessionId: 'session-1',
+    authorUser: actor,
+  })
+  const second = await fs.fork({
+    tenant,
+    mount,
+    sessionId: 'session-1',
+    authorUser: actor,
+  })
   assert.ok(first)
   assert.ok(second)
   assert.equal(typeof first.commitId, 'bigint')
@@ -83,8 +101,8 @@ test('fork creates genesis, seeds heads, and re-fork is idempotent', async () =>
 
   const counts = await pool.query<{ refs: string; commits: string }>(
     `SELECT
-       (SELECT count(*) FROM afs_refs WHERE tenant = $1)::text AS refs,
-       (SELECT count(*) FROM afs_commits WHERE tenant = $1)::text AS commits`,
+       (SELECT count(*) FROM tuddo_refs WHERE tenant = $1)::text AS refs,
+       (SELECT count(*) FROM tuddo_commits WHERE tenant = $1)::text AS commits`,
     [tenant],
   )
   assert.deepEqual(counts.rows[0], { refs: '2', commits: '1' })
@@ -100,7 +118,7 @@ test('concurrent first touches adopt one genesis commit', async () => {
   assert.ok(second)
   assert.equal(first.commitId, second.commitId)
   const commits = await pool.query<{ count: string }>(
-    'SELECT count(*)::text AS count FROM afs_commits WHERE tenant = $1',
+    'SELECT count(*)::text AS count FROM tuddo_commits WHERE tenant = $1',
     [tenant],
   )
   assert.equal(commits.rows[0]?.count, '1')
@@ -109,10 +127,15 @@ test('concurrent first touches adopt one genesis commit', async () => {
 test('fork does not wait for the tenant GC lock', async () => {
   const fs = createAgentFs({ pool })
   const holder = await pool.connect()
-  const lockKey = `afs:gc:${tenant}`
+  const lockKey = `tuddo:gc:${tenant}`
   await holder.query('SELECT pg_advisory_lock(hashtext($1))', [lockKey])
   try {
-    const result = await fs.fork({ tenant, mount, sessionId: 'fork-with-gc-busy', authorUser: actor })
+    const result = await fs.fork({
+      tenant,
+      mount,
+      sessionId: 'fork-with-gc-busy',
+      authorUser: actor,
+    })
     assert.ok(result)
   } finally {
     await holder.query('SELECT pg_advisory_unlock(hashtext($1))', [lockKey])
@@ -131,20 +154,35 @@ test('fork seeds existing mount heads idempotently', async () => {
     bytes: Buffer.from('seed'),
     authorUser: actor,
   })
-  const first = await fs.fork({ tenant, mount, sessionId: 'seed-child', authorUser: actor })
-  const second = await fs.fork({ tenant, mount, sessionId: 'seed-child', authorUser: actor })
+  const first = await fs.fork({
+    tenant,
+    mount,
+    sessionId: 'seed-child',
+    authorUser: actor,
+  })
+  const second = await fs.fork({
+    tenant,
+    mount,
+    sessionId: 'seed-child',
+    authorUser: actor,
+  })
   assert.ok(first)
   assert.ok(second)
   assert.equal((await fs.read({ tenant, mount, ref: first.ref, path: '/seed.txt' })).bytes.toString(), 'seed')
   const heads = await pool.query<{ count: string }>(
-    'SELECT count(*)::text AS count FROM afs_heads WHERE tenant = $1 AND ref_name = $2',
+    'SELECT count(*)::text AS count FROM tuddo_heads WHERE tenant = $1 AND ref_name = $2',
     [tenant, first.ref],
   )
   assert.equal(heads.rows[0]?.count, '1')
 })
 test('re-fork does not reseed heads beyond the existing branch tip', async () => {
   const fs = createAgentFs({ pool })
-  const first = await fs.fork({ tenant, mount, sessionId: 're-fork', authorUser: actor })
+  const first = await fs.fork({
+    tenant,
+    mount,
+    sessionId: 're-fork',
+    authorUser: actor,
+  })
   assert.ok(first)
   await fs.write({
     tenant,
@@ -165,14 +203,14 @@ test('re-fork does not reseed heads beyond the existing branch tip', async () =>
   await fs.fork({ tenant, mount, sessionId: 're-fork', authorUser: actor })
 
   const heads = await pool.query<{ path: string }>(
-    'SELECT path FROM afs_heads WHERE tenant = $1 AND ref_name = $2 ORDER BY path',
+    'SELECT path FROM tuddo_heads WHERE tenant = $1 AND ref_name = $2 ORDER BY path',
     [tenant, first.ref],
   )
   const tipTree = await pool.query<{ path: string }>(
     `SELECT e.path
-     FROM afs_refs r
-     JOIN afs_commits c ON c.id = r.commit_id
-     JOIN afs_tree_entries e ON e.tree_id = c.tree_id
+     FROM tuddo_refs r
+     JOIN tuddo_commits c ON c.id = r.commit_id
+     JOIN tuddo_tree_entries e ON e.tree_id = c.tree_id
      WHERE r.tenant = $1 AND r.name = $2
      ORDER BY e.path`,
     [tenant, first.ref],
@@ -182,7 +220,12 @@ test('re-fork does not reseed heads beyond the existing branch tip', async () =>
 
 test('first fork seeds heads from the captured tip tree, not live mount heads', async () => {
   const fs = createAgentFs({ pool })
-  await fs.fork({ tenant, mount, sessionId: 'seed-source-tree', authorUser: actor })
+  await fs.fork({
+    tenant,
+    mount,
+    sessionId: 'seed-source-tree',
+    authorUser: actor,
+  })
   await fs.write({
     tenant,
     mount,
@@ -191,12 +234,17 @@ test('first fork seeds heads from the captured tip tree, not live mount heads', 
     bytes: Buffer.from('tree'),
     authorUser: actor,
   })
-  await pool.query('DELETE FROM afs_heads WHERE tenant = $1 AND ref_name = $2', [tenant, `mount/${mount}`])
+  await pool.query('DELETE FROM tuddo_heads WHERE tenant = $1 AND ref_name = $2', [tenant, `mount/${mount}`])
 
-  const child = await fs.fork({ tenant, mount, sessionId: 'seed-tree-child', authorUser: actor })
+  const child = await fs.fork({
+    tenant,
+    mount,
+    sessionId: 'seed-tree-child',
+    authorUser: actor,
+  })
   assert.ok(child)
   const heads = await pool.query<{ path: string }>(
-    'SELECT path FROM afs_heads WHERE tenant = $1 AND ref_name = $2 ORDER BY path',
+    'SELECT path FROM tuddo_heads WHERE tenant = $1 AND ref_name = $2 ORDER BY path',
     [tenant, child.ref],
   )
   assert.deepEqual(heads.rows, [{ path: '/from-tree.txt' }])
@@ -218,7 +266,12 @@ test('large writes use the injected object store before the transaction', async 
     async delete() {},
   }
   const fs = createAgentFs({ pool, storage, inlineMaxBytes: 3 })
-  const branch = await fs.fork({ tenant, mount, sessionId: 'large-write', authorUser: actor })
+  const branch = await fs.fork({
+    tenant,
+    mount,
+    sessionId: 'large-write',
+    authorUser: actor,
+  })
   assert.ok(branch)
   const result = await fs.write({
     tenant,
@@ -228,13 +281,18 @@ test('large writes use the injected object store before the transaction', async 
     bytes: Buffer.from('large'),
     authorUser: actor,
   })
-  assert.ok(objects.has(`afs/${tenant}/${result.sha256}`))
+  assert.ok(objects.has(`tuddo/${tenant}/${result.sha256}`))
   assert.equal((await fs.read({ tenant, mount, ref: branch.ref, path: '/large.bin' })).bytes.toString(), 'large')
 })
 
 test('write/read enforces preconditions, same-sha no-op, and settled branches', async () => {
   const fs = createAgentFs({ pool })
-  const branch = await fs.fork({ tenant, mount, sessionId: 'session-2', authorUser: actor })
+  const branch = await fs.fork({
+    tenant,
+    mount,
+    sessionId: 'session-2',
+    authorUser: actor,
+  })
   assert.ok(branch)
   const first = await fs.write({
     tenant,
@@ -247,7 +305,7 @@ test('write/read enforces preconditions, same-sha no-op, and settled branches', 
   assert.equal((await fs.read({ tenant, ref: branch.ref, path: '/notes.txt' })).bytes.toString(), 'one')
 
   const before = await pool.query<{ commits: string }>(
-    'SELECT count(*)::text AS commits FROM afs_commits WHERE tenant = $1',
+    'SELECT count(*)::text AS commits FROM tuddo_commits WHERE tenant = $1',
     [tenant],
   )
   const same = await fs.write({
@@ -259,7 +317,7 @@ test('write/read enforces preconditions, same-sha no-op, and settled branches', 
     authorUser: actor,
   })
   const after = await pool.query<{ commits: string }>(
-    'SELECT count(*)::text AS commits FROM afs_commits WHERE tenant = $1',
+    'SELECT count(*)::text AS commits FROM tuddo_commits WHERE tenant = $1',
     [tenant],
   )
   assert.equal(same.commitSha, first.commitSha)
@@ -278,19 +336,31 @@ test('write/read enforces preconditions, same-sha no-op, and settled branches', 
     error => error instanceof PreconditionFailedError,
   )
 
-  await pool.query("UPDATE afs_refs SET state = 'merged', settled_at = now() WHERE tenant = $1 AND name = $2", [
+  await pool.query("UPDATE tuddo_refs SET state = 'merged', settled_at = now() WHERE tenant = $1 AND name = $2", [
     tenant,
     branch.ref,
   ])
   await assert.rejects(
-    fs.write({ tenant, mount, ref: branch.ref, path: '/new.txt', bytes: Buffer.from('x'), authorUser: actor }),
+    fs.write({
+      tenant,
+      mount,
+      ref: branch.ref,
+      path: '/new.txt',
+      bytes: Buffer.from('x'),
+      authorUser: actor,
+    }),
     error => error instanceof BranchSettledError,
   )
 })
 
 test('CAS retries and reports RefConflictError after three failed compares', async () => {
   const fs = createAgentFs({ pool, maxCasRetries: 3 })
-  const branch = await fs.fork({ tenant, mount, sessionId: 'session-3', authorUser: actor })
+  const branch = await fs.fork({
+    tenant,
+    mount,
+    sessionId: 'session-3',
+    authorUser: actor,
+  })
   assert.ok(branch)
   const realPool = pool
   let forcedConflicts = 0
@@ -300,7 +370,7 @@ test('CAS retries and reports RefConflictError after three failed compares', asy
       const query = client.query.bind(client)
       return {
         query: async (text: string, values?: readonly unknown[]) => {
-          if (text.includes('UPDATE afs_refs SET commit_id') && forcedConflicts < 3) {
+          if (text.includes('UPDATE tuddo_refs SET commit_id') && forcedConflicts < 3) {
             forcedConflicts += 1
             return { rows: [], rowCount: 0 }
           }
@@ -312,28 +382,47 @@ test('CAS retries and reports RefConflictError after three failed compares', asy
   }
   const conflictFs = createAgentFs({ pool: conflictPool })
   await assert.rejects(
-    conflictFs.write({ tenant, mount, ref: branch.ref, path: '/conflict', bytes: Buffer.from('x'), authorUser: actor }),
+    conflictFs.write({
+      tenant,
+      mount,
+      ref: branch.ref,
+      path: '/conflict',
+      bytes: Buffer.from('x'),
+      authorUser: actor,
+    }),
     error => error instanceof RefConflictError,
   )
   assert.equal(forcedConflicts, 3)
 })
 test('concurrent writers retry and leave heads equal to the resulting tip tree', async () => {
   const fs = createAgentFs({ pool })
-  const branch = await fs.fork({ tenant, mount, sessionId: 'cas-recovery', authorUser: actor })
+  const branch = await fs.fork({
+    tenant,
+    mount,
+    sessionId: 'cas-recovery',
+    authorUser: actor,
+  })
   assert.ok(branch)
 
   const results = await Promise.all(
     ['/one.txt', '/two.txt'].map(path =>
-      fs.write({ tenant, mount, ref: branch.ref, path, bytes: Buffer.from(path), authorUser: actor }),
+      fs.write({
+        tenant,
+        mount,
+        ref: branch.ref,
+        path,
+        bytes: Buffer.from(path),
+        authorUser: actor,
+      }),
     ),
   )
   assert.equal(results.length, 2)
   const state = await pool.query<{ path: string; in_tree: boolean }>(
     `SELECT h.path, (e.path IS NOT NULL) AS in_tree
-     FROM afs_heads h
-     LEFT JOIN afs_refs r ON r.tenant = h.tenant AND r.name = h.ref_name
-     LEFT JOIN afs_commits c ON c.id = r.commit_id
-     LEFT JOIN afs_tree_entries e ON e.tree_id = c.tree_id AND e.path = h.path
+     FROM tuddo_heads h
+     LEFT JOIN tuddo_refs r ON r.tenant = h.tenant AND r.name = h.ref_name
+     LEFT JOIN tuddo_commits c ON c.id = r.commit_id
+     LEFT JOIN tuddo_tree_entries e ON e.tree_id = c.tree_id AND e.path = h.path
      WHERE h.tenant = $1 AND h.ref_name = $2
      ORDER BY h.path`,
     [tenant, branch.ref],
@@ -396,7 +485,12 @@ test('onCommit starts only after write cleanup and caller settlement', async () 
       },
     },
   })
-  const branch = await fs.fork({ tenant, mount, sessionId: 'hook', authorUser: actor })
+  const branch = await fs.fork({
+    tenant,
+    mount,
+    sessionId: 'hook',
+    authorUser: actor,
+  })
   assert.ok(branch)
   const writePromise = fs.write({
     tenant,
@@ -457,7 +551,12 @@ test('unlock failure destroys the client before the tenant can write again', asy
     },
   }
   const fs = createAgentFs({ pool: guardedPool, storage, inlineMaxBytes: 1 })
-  const branch = await fs.fork({ tenant, mount, sessionId: 'unlock-failure', authorUser: actor })
+  const branch = await fs.fork({
+    tenant,
+    mount,
+    sessionId: 'unlock-failure',
+    authorUser: actor,
+  })
   assert.ok(branch)
   backendPids.length = 0
   releaseErrors.length = 0
@@ -503,7 +602,12 @@ test('read validates a supplied mount key before resolving grants', async () => 
 
 test('restore rejects unknown and cross-tenant source commits without changing refs or heads', async () => {
   const fs = createAgentFs({ pool })
-  const branch = await fs.fork({ tenant, mount, sessionId: 'restore-source-check', authorUser: actor })
+  const branch = await fs.fork({
+    tenant,
+    mount,
+    sessionId: 'restore-source-check',
+    authorUser: actor,
+  })
   assert.ok(branch)
   await fs.write({
     tenant,
@@ -522,11 +626,11 @@ test('restore rejects unknown and cross-tenant source commits without changing r
     authorUser: actor,
   })
   const beforeRef = await pool.query<{ commit_id: string }>(
-    'SELECT commit_id::text FROM afs_refs WHERE tenant = $1 AND name = $2',
+    'SELECT commit_id::text FROM tuddo_refs WHERE tenant = $1 AND name = $2',
     [tenant, branch.ref],
   )
   const beforeHeads = await pool.query<{ path: string; sha256: string }>(
-    'SELECT path, sha256 FROM afs_heads WHERE tenant = $1 AND ref_name = $2 ORDER BY path',
+    'SELECT path, sha256 FROM tuddo_heads WHERE tenant = $1 AND ref_name = $2 ORDER BY path',
     [tenant, branch.ref],
   )
   await assert.rejects(
@@ -558,11 +662,11 @@ test('restore rejects unknown and cross-tenant source commits without changing r
     NotFoundError,
   )
   const afterRef = await pool.query<{ commit_id: string }>(
-    'SELECT commit_id::text FROM afs_refs WHERE tenant = $1 AND name = $2',
+    'SELECT commit_id::text FROM tuddo_refs WHERE tenant = $1 AND name = $2',
     [tenant, branch.ref],
   )
   const afterHeads = await pool.query<{ path: string; sha256: string }>(
-    'SELECT path, sha256 FROM afs_heads WHERE tenant = $1 AND ref_name = $2 ORDER BY path',
+    'SELECT path, sha256 FROM tuddo_heads WHERE tenant = $1 AND ref_name = $2 ORDER BY path',
     [tenant, branch.ref],
   )
   assert.deepEqual(afterRef.rows, beforeRef.rows)

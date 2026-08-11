@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: Node ${{ matrix.node }} checks
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['20', '22']
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Check formatting
+        run: npm run format:check
+      - name: Lint
+        run: npm run lint
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Unit tests
+        run: npm test
+
+  integration:
+    name: PostgreSQL integration tests
+    runs-on: ubuntu-latest
+    container: node:22-bookworm
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: tuddofs
+          POSTGRES_PASSWORD: tuddofs
+          POSTGRES_DB: tuddofs_it
+        options: >-
+          --health-cmd "pg_isready -U tuddofs -d tuddofs_it"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      TUDDOFS_DATABASE_URL: postgresql://tuddofs:tuddofs@postgres:5432/tuddofs_it
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Install dependencies
+        run: npm ci
+      - name: PostgreSQL integration tests
+        run: npm run test:integration
