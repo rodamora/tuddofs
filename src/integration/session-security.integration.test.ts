@@ -2,14 +2,8 @@ import assert from 'node:assert/strict'
 import test, { after, before, beforeEach } from 'node:test'
 
 import { Pool } from 'pg'
-import {
-  BranchSettledError,
-  NotFoundError,
-  PermissionDeniedError,
-  PreconditionFailedError,
-  createTuddoFs,
-} from '../index.js'
-import { GrantController, InvalidPathError, migrate } from '../internal.js'
+import { BranchSettledError, NotFoundError, PermissionDeniedError, PreconditionFailedError } from '../index.js'
+import { GrantController, InvalidPathError, createTuddoFs, migrate } from '../internal.js'
 
 const pool = new Pool({ connectionString: process.env.TUDDOFS_DATABASE_URL })
 const tenant = 'session-security-integration'

@@ -75,7 +75,7 @@ export interface SessionEntry {
   readonly mode?: number
 }
 
-/** A literal text replacement. */
+/** A literal text replacement governed by architecture §6.2. */
 export interface TextEdit {
   readonly oldText: string
   readonly newText: string
@@ -133,22 +133,37 @@ export interface DiffRecord {
   readonly afterMode?: number
 }
 
-/** Per-mount merge outcome; conflicts are data, not thrown exceptions. */
-export type MergeResult = {
-  readonly status: 'merged' | 'unauthorized' | 'pendingApproval' | 'conflicts'
-  readonly conflicts?: readonly {
-    path: string
-    baseSha?: string
-    oursSha?: string
-    theirsSha?: string
-  }[]
+/** Per-mount merge outcome governed by architecture §6.2. */
+export type MergeResult =
+  | { readonly status: 'merged' | 'unauthorized' | 'pendingApproval' }
+  | {
+      readonly status: 'conflicts'
+      readonly conflicts: readonly {
+        path: string
+        baseSha?: string
+        oursSha?: string
+        theirsSha?: string
+      }[]
+    }
+
+/** File operations bound to one mount and accepting plain absolute paths (§6.2). */
+export interface MountFileSystem {
+  read(path: string): Promise<string>
+  readBytes(path: string): Promise<Buffer>
+  write(path: string, bytes: Buffer | Uint8Array | string, options?: WriteOptions): Promise<WriteResult>
+  edit(path: string, edits: readonly TextEdit[], options?: EditOptions): Promise<WriteResult>
+  list(dir: string): Promise<readonly SessionEntry[]>
+  glob(pattern: string): Promise<readonly SessionEntry[]>
+  stat(path: string): Promise<SessionStat>
+  delete(path: string, options?: { ifSha?: string | null }): Promise<DeleteResult>
+  history(path: string): Promise<readonly HistoryRecord[]>
 }
 
 /** File and history operations exposed by an opened session. */
 export interface SessionFileSystem {
   readonly actor: Actor
   readonly sessionId: string
-  mount(key: string): SessionFileSystem
+  mount(key: string): MountFileSystem
   read(path: string): Promise<string>
   readBytes(path: string): Promise<Buffer>
   write(path: string, bytes: Buffer | Uint8Array | string, options?: WriteOptions): Promise<WriteResult>
@@ -830,22 +845,24 @@ export function createSessionApi(kernel: SessionKernel, options: TuddoFsOptions)
         actor: input.actor,
         sessionId: input.sessionId,
         mount(key: string) {
-          validateMountKey(key)
-          const prefix = (path: string) => `${key}:${path.startsWith('/') ? path : `/${path}`}`
+          validateMountKey(key, { tenant: input.actor.tenant, mount: key })
+          if (!mounts.has(key))
+            throw new NotFoundError(`Mount not found: ${key}`, {
+              tenant: input.actor.tenant,
+              mount: key,
+            })
+          const prefix = (path: string) => `${key}:${path}`
           return {
-            ...session,
-            mount: () => {
-              throw new InvalidPathError('nested mount', 'mount handles cannot be nested')
-            },
             read: (path: string) => session.read(prefix(path)),
             readBytes: (path: string) => session.readBytes(prefix(path)),
-            write: (path, value, options) => session.write(prefix(path), value, options),
-            edit: (path, edits, options) => session.edit(prefix(path), edits, options),
+            write: (path, value, writeOptions) => session.write(prefix(path), value, writeOptions),
+            edit: (path, edits, editOptions) => session.edit(prefix(path), edits, editOptions),
             list: (path: string) => session.list(prefix(path)),
             glob: (pattern: string) => session.glob(prefix(pattern)),
             stat: (path: string) => session.stat(prefix(path)),
-            delete: (path, options) => session.delete(prefix(path), options),
-          } as SessionFileSystem
+            delete: (path, deleteOptions) => session.delete(prefix(path), deleteOptions),
+            history: (path: string) => session.history(prefix(path)),
+          }
         },
         async read(address: string) {
           return (await readBytes(address)).toString('utf8')

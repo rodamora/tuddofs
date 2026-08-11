@@ -16,7 +16,7 @@ export interface DirectAdapter {
   delete_file(input: { path: string; ifSha?: string | null }): Promise<DeleteResult>
 }
 
-/** Direct in-process adapter: agent tools call the session without a mirror. */
+/** Direct in-process adapter retaining compound mount addressing at the tool boundary (§6.2). */
 export function createDirectAdapter(
   session: Pick<SessionFileSystem, 'read' | 'readBytes' | 'write' | 'edit' | 'list' | 'glob' | 'stat' | 'delete'>,
 ): DirectAdapter {

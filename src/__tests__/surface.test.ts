@@ -34,9 +34,8 @@ function createFs() {
     grants: { resolve: async () => ({ read: false, write: 'none' }) },
   })
 }
-
 async function openVirtualSession(initial: string) {
-  let contents = Buffer.from(initial)
+  let contents: Buffer<ArrayBufferLike> = Buffer.from(initial)
   const paths: string[] = []
   const session = await createFs().open({
     actor: { id: 'surface-user', tenant: 'surface-tenant' },

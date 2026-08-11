@@ -122,7 +122,7 @@ export class StorageError extends TuddoFsError {
     super(reason, context, 'StorageError')
   }
 }
-/** A string replacement matched zero or multiple occurrences without replaceAll. */
+/** A string replacement matched zero or multiple occurrences without replaceAll (§6.2, §9). */
 export class EditMatchError extends TuddoFsError {
   readonly matchCount: number
 
@@ -147,3 +147,4 @@ export type KernelError =
   | StorageError
   | SchemaDriftError
   | InvariantError
+  | EditMatchError
