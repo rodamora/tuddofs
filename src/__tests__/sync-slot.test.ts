@@ -82,6 +82,40 @@ test('a non-Error rejection still reaches the failure callback as an Error', asy
   assert.match(String(failures[0]?.message), /target vanished/u)
 })
 
+test('a throwing failure handler is contained instead of rejecting the fire-and-forget chain', async () => {
+  // trigger() never awaits what it starts. A handler throw that escaped #drain
+  // would surface as an unhandled rejection and, under Node's defaults, kill
+  // the host process — this test file failing IS that assertion.
+  const errors: unknown[] = []
+  const original = console.error
+  console.error = (...args: unknown[]) => errors.push(args)
+  let runs = 0
+  const slot = new CaptureSlot(
+    () => {
+      runs += 1
+      return runs === 1 ? Promise.reject(new Error('scan 1')) : Promise.resolve()
+    },
+    () => {
+      throw new Error('host failure handler exploded')
+    },
+  )
+
+  try {
+    slot.trigger()
+    await slot.settle()
+    assert.equal(slot.consecutiveFailures, 1)
+    assert.equal(errors.length, 1)
+
+    // The slot is released, not wedged: the next capture runs and succeeds.
+    slot.trigger()
+    await slot.settle()
+  } finally {
+    console.error = original
+  }
+  assert.equal(runs, 2)
+  assert.equal(slot.consecutiveFailures, 0)
+})
+
 test('exclusive work never overlaps a capture and propagates its own errors', async () => {
   const running: string[] = []
   const gate = deferred()

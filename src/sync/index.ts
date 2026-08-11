@@ -24,6 +24,7 @@ export {
   resolveUnderRoot,
   scanCommand,
   stampCommand,
+  HYDRATION_MARKER_FILENAME,
   SCAN_LIST_FILENAME,
   STAMP_FILENAME,
   STATE_DIRNAME,

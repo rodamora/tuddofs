@@ -27,6 +27,8 @@ export const STAMP_FILENAME = '.tuddofs-stamp'
 export const STATE_DIRNAME = '.tuddofs'
 /** Scratch list produced by `find` and consumed by `xargs` in the same exec. */
 export const SCAN_LIST_FILENAME = `${STATE_DIRNAME}/scan`
+/** Per-mount hydration marker, written LAST so a crash mid-acquire re-hydrates only what never finished. */
+export const HYDRATION_MARKER_FILENAME = `${STATE_DIRNAME}/hydrated`
 
 /** A single `sha256sum --zero` record resolved back to its mount and kernel path. */
 export interface ScanRecord {
@@ -111,9 +113,15 @@ export function chmodReadOnlyCommand(root: string, mirrorDir: string): string {
 /**
  * Unfreeze a read-only mirror before re-hydrating it; the same root guard runs
  * first, because this is destructive to whatever it points at (§7.4).
+ *
+ * `a-w,u+w` is the exact inverse of {@link chmodReadOnlyCommand} over the two
+ * states the mirror is allowed to be in: frozen (no write bit anywhere) and
+ * writable (owner only). A bare `u+w` would not undo `a-w`, and a bare `a+w`
+ * would hand write access to group and other, which the engine never granted
+ * — the mirror is engine-owned and the agent runs as its owner.
  */
 export function chmodWritableCommand(root: string, mirrorDir: string): string {
-  return `chmod -R u+w ${quoteShellArg(resolveUnderRoot(root, mirrorDir))}`
+  return `chmod -R a-w,u+w ${quoteShellArg(resolveUnderRoot(root, mirrorDir))}`
 }
 
 /**
@@ -129,7 +137,7 @@ export function hydrationManifestCommand(root: string): string {
   return (
     `mkdir -p ${quoteShellArg(`${root}/${STATE_DIRNAME}`)} && cd ${quotedRoot} && ` +
     `{ [ -f ${quoteShellArg(STAMP_FILENAME)} ] && echo ${quoteShellArg(STAMP_FILENAME)}; ` +
-    `[ -f ${quoteShellArg(`${STATE_DIRNAME}/hydrated`)} ] && cat ${quoteShellArg(`${STATE_DIRNAME}/hydrated`)}; ` +
+    `[ -f ${quoteShellArg(HYDRATION_MARKER_FILENAME)} ] && cat ${quoteShellArg(HYDRATION_MARKER_FILENAME)}; ` +
     `true; }`
   )
 }
@@ -155,7 +163,8 @@ export function scanCommand(input: ScanCommandInput): string {
 /**
  * Move the stamp back to the instant the scan started, so files written during
  * the scan re-appear next cycle and sha-diffing makes the re-capture a no-op
- * (§7.3 phase 3 step 6).
+ * (§7.3 phase 3 step 6). The same command sets the acquire watermark at the end
+ * of Phase 1.
  *
  * The stamp is set one {@link STAMP_GRANULARITY_MARGIN_MS} EARLIER than the
  * scan start. §7.4 requires under-capture to be impossible and accepts
@@ -165,6 +174,16 @@ export function scanCommand(input: ScanCommandInput): string {
  * fine-grained, so a write that happens AFTER an exact stamp can still record
  * an mtime BEFORE it and vanish from `find -newer`. The margin covers every
  * such clock, including 1s-granularity filesystems.
+ *
+ * The margin also puts the acquire watermark before the files hydration just
+ * wrote, so the first incremental scan re-hashes the workspace once. That waste
+ * is deliberate. Stamping from the hydration marker's own mtime instead removes
+ * it and breaks capture: `find -newer` is STRICTLY newer, the marker and the
+ * agent's first writes land in the same coarse tick, and those writes then
+ * never appear in a Phase-3 scan. It was measured — three kill-matrix cases
+ * (post-acquire shell write, directory-over-file capture, revoked-grant
+ * capture) go silent. Over-capture costs one hash pass and commits nothing;
+ * under-capture loses the agent's work until turn end.
  */
 export function stampCommand(root: string, scanStartEpochMs: number): string {
   const stampEpochMs = scanStartEpochMs - STAMP_GRANULARITY_MARGIN_MS

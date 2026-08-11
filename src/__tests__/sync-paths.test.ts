@@ -3,6 +3,7 @@ import test from 'node:test'
 
 import {
   chmodReadOnlyCommand,
+  chmodWritableCommand,
   mirrorDirName,
   mountKeyForMirrorDir,
   parseScanRecords,
@@ -51,8 +52,14 @@ test('root guard resolves strictly under the workspace root', () => {
 
 test('destructive execs refuse a mirror directory that does not resolve under the root', () => {
   assert.equal(chmodReadOnlyCommand('/work', 'notes'), "chmod -R a-w '/work/notes'")
+  // The unfreeze is the exact inverse of the freeze over the two states the
+  // mirror is allowed to be in: no write bit at all, or owner-write only. A
+  // bare `u+w` would not undo `a-w`, and `a+w` would grant group and other a
+  // write bit the engine never handed out.
+  assert.equal(chmodWritableCommand('/work', 'notes'), "chmod -R a-w,u+w '/work/notes'")
   assert.throws(() => chmodReadOnlyCommand('/work', '../etc'), InvalidPathError)
   assert.throws(() => chmodReadOnlyCommand('/work', '/etc'), InvalidPathError)
+  assert.throws(() => chmodWritableCommand('/work', '../etc'), InvalidPathError)
 })
 
 test('scan and stamp commands quote every interpolated value and gate on find success', () => {

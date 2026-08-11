@@ -468,6 +468,144 @@ test('reconcile never deletes a committed file whose mirror write was silently l
   await assert.rejects(session.mount('project:docs').read('/fresh.md'))
 })
 
+test('a confirming scan retires the straggler guard so a later revert is captured', async () => {
+  const { session, engine, root } = await setup('engine-guard-retired')
+  await session.mount('project:docs').write('/a.md', 'v1')
+  await engine.materialize()
+
+  await engine.write('project:docs', '/a.md', 'v2')
+  await engine.settle()
+  // This scan observes v2 on disk, which closes the straggler window: the
+  // mirror write demonstrably landed (§7.3 phase 4).
+  await engine.exec('true')
+  await engine.settle()
+  assert.equal(await readFile(join(docsDir(root), 'a.md'), 'utf8'), 'v2')
+
+  // A tool now puts the pre-write bytes back — a checkout, a formatter, an
+  // undo. That is the agent's work, not a lost mirror write, and a guard that
+  // never retired would overwrite it from the branch and commit nothing.
+  await engine.exec("printf v1 > 'project%3Adocs/a.md'")
+  await engine.settle()
+
+  assert.equal(await session.mount('project:docs').read('/a.md'), 'v1')
+  assert.equal(await readFile(join(docsDir(root), 'a.md'), 'utf8'), 'v1')
+  await engine.reconcile()
+  assert.equal(await session.mount('project:docs').read('/a.md'), 'v1')
+  assert.equal(await readFile(join(docsDir(root), 'a.md'), 'utf8'), 'v1')
+  assert.deepEqual(failures, [])
+})
+
+test('a resumed engine restages a tool write the crashed process never mirrored', async () => {
+  const { session, engine, root, controls, target } = await setup('engine-resume-straggler')
+  await session.mount('project:docs').write('/a.md', 'v1')
+  await session.mount('project:docs').write('/b.md', 'b1')
+  await engine.materialize()
+
+  // The process dies between the durable commit and the mirror write, taking
+  // previousSha256/unconfirmed with it. A shell edit to another file is still
+  // on disk and uncaptured (§7.5 lines 1 and 2).
+  controls.swallowWrites.add(join(docsDir(root), 'a.md'))
+  await engine.write('project:docs', '/a.md', 'v2')
+  await engine.settle()
+  await writeFile(join(docsDir(root), 'b.md'), 'b2 from the shell')
+  assert.equal(await readFile(join(docsDir(root), 'a.md'), 'utf8'), 'v1')
+  controls.swallowWrites.clear()
+
+  const resumed = createSyncEngine({
+    session: await openSession('engine-resume-straggler'),
+    target,
+    root,
+    events: { onCapture: event => captures.push(event), onCaptureFailed: event => failures.push(event) },
+  })
+  await resumed.materialize()
+  await resumed.reconcile()
+
+  // Rebuilt from history: stale disk bytes never overwrite the durable commit…
+  assert.equal(await session.mount('project:docs').read('/a.md'), 'v2')
+  assert.equal(await readFile(join(docsDir(root), 'a.md'), 'utf8'), 'v2')
+  // …and a genuine uncaptured shell change is still committed, not reverted.
+  assert.equal(await session.mount('project:docs').read('/b.md'), 'b2 from the shell')
+  assert.deepEqual(failures, [])
+
+  // The guard is retired by that authoritative scan; ordinary edits follow the
+  // ordinary path.
+  await resumed.exec("printf v3 > 'project%3Adocs/a.md'")
+  await resumed.settle()
+  assert.equal(await session.mount('project:docs').read('/a.md'), 'v3')
+})
+
+test('a resumed engine never deletes a committed file the crashed process never mirrored', async () => {
+  const { session, engine, root, controls, target } = await setup('engine-resume-lost-create')
+  await session.mount('project:docs').write('/a.md', 'v1')
+  await engine.materialize()
+
+  controls.swallowWrites.add(join(docsDir(root), 'fresh.md'))
+  await engine.write('project:docs', '/fresh.md', 'durable')
+  await engine.settle()
+  await assert.rejects(stat(join(docsDir(root), 'fresh.md')))
+  controls.swallowWrites.clear()
+
+  const resumed = createSyncEngine({
+    session: await openSession('engine-resume-lost-create'),
+    target,
+    root,
+    events: { onCapture: event => captures.push(event), onCaptureFailed: event => failures.push(event) },
+  })
+  await resumed.materialize()
+  await resumed.reconcile()
+
+  assert.equal(await session.mount('project:docs').read('/fresh.md'), 'durable')
+  assert.equal(await readFile(join(docsDir(root), 'fresh.md'), 'utf8'), 'durable')
+  assert.deepEqual(failures, [])
+
+  // A real removal after the guard retires still deletes at reconcile.
+  await resumed.exec("rm 'project%3Adocs/fresh.md'")
+  await resumed.settle()
+  await resumed.reconcile()
+  await assert.rejects(session.mount('project:docs').read('/fresh.md'))
+})
+
+test('a throwing host handler neither aborts a capture nor kills the process', async () => {
+  // Nothing awaits what trigger() starts. Before the fix a throwing handler
+  // rejected the capture chain, which Node reports as an unhandled rejection
+  // and, by default, exits on — this test file surviving IS that assertion.
+  const root = await freshRoot()
+  const session = await openSession('engine-throwing-handlers', false)
+  const wrapped = controlled(createLocalDirectoryTarget({ root }))
+  const logged: unknown[] = []
+  const engine = createSyncEngine({
+    session,
+    target: wrapped.target,
+    root,
+    logger: { error: error => logged.push(error) },
+    events: {
+      onCapture() {
+        throw new Error('host onCapture exploded')
+      },
+      onCaptureFailed() {
+        throw new Error('host onCaptureFailed exploded')
+      },
+    },
+  })
+  await session.mount('project:docs').write('/a.md', 'v1')
+  await engine.materialize()
+
+  wrapped.controls.failScans = 1
+  await engine.exec("printf v2 > 'project%3Adocs/a.md'")
+  await engine.settle()
+
+  // The slot was released despite the throwing failure handler, and the retry
+  // commits even though onCapture throws too.
+  engine.captureAfterExec()
+  await engine.settle()
+  assert.equal(await session.mount('project:docs').read('/a.md'), 'v2')
+  assert.equal(logged.length, 2)
+  assert.deepEqual(
+    logged.map(error => (error instanceof Error ? error.message : String(error))),
+    ['host onCaptureFailed exploded', 'host onCapture exploded'],
+  )
+})
+
 test('a capture blocked by a revoked grant names its mount in the failure event', async () => {
   const { session, engine } = await setup('engine-revoked')
   await session.mount('project:docs').write('/a.md', 'v1')

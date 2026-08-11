@@ -24,6 +24,15 @@
  * - Virtual mounts are skipped at materialize and rejected in mirror-path
  *   mapping (§6.1).
  * - The index is a CACHE, rebuildable from heads plus a full scan (§7.3 state).
+ * - The straggler guard is WINDOWED. It protects a Phase-2 write only between
+ *   the commit and the first scan that observes those bytes on disk; the
+ *   confirming scan retires it. Held open, it would misread every later revert
+ *   to the pre-write content — a checkout, a formatter, an undo — as a lost
+ *   mirror write and silently overwrite the agent's file (§7.3 phase 4).
+ * - Across a warm re-acquire the guard is rebuilt from durable history, because
+ *   the crashed process took its in-memory copy with it (§7.5).
+ * - Host callbacks are untrusted: a throwing handler never aborts a capture and
+ *   never rejects the fire-and-forget capture chain (§7.2).
  */
 import posix from 'node:path/posix'
 
@@ -31,11 +40,11 @@ import { sha256 } from '../hashing.js'
 import { InvariantError, NotFoundError } from '../errors.js'
 import { InvalidPathError, validateMountKey, validatePath } from '../validation.js'
 import type { SessionFileSystem, SessionMount, WriteOptions } from '../session.js'
-import type { CaptureWrite, WriteResult } from '../kernel.js'
+import type { CaptureWrite, TuddoFsLogger, WriteResult } from '../kernel.js'
 import { SyncTargetError } from './errors.js'
 import {
+  HYDRATION_MARKER_FILENAME,
   STAMP_FILENAME,
-  STATE_DIRNAME,
   chmodReadOnlyCommand,
   chmodWritableCommand,
   hydrationManifestCommand,
@@ -67,6 +76,8 @@ export interface SyncEngineOptions {
   readonly now?: () => number
   /** Files re-read and re-hashed after materialize to prove the transfer (§7.3 phase 1 step 2). */
   readonly verifySampleSize?: number
+  /** Receives host-callback failures; without one they go to `console.error`, exactly as the kernel's `onCommit` hook does. */
+  readonly logger?: TuddoFsLogger
 }
 
 /** The disk-level runtime for one session against one target. */
@@ -98,7 +109,13 @@ const DEFAULT_VERIFY_SAMPLE_SIZE = 3
 type IndexEntry = {
   /** Sha the engine believes the mirror holds. */
   sha256: string
-  /** Sha the mirror held before the last Phase-2 write; drives the straggler guard. */
+  /**
+   * Sha a scan last CONFIRMED on the mirror, carried only while `unconfirmed`
+   * is set. It drives the straggler guard and is retired the moment a scan
+   * observes the Phase-2 write on disk: after that, disk content equal to the
+   * pre-write bytes is a real change (a checkout, a formatter, a revert), not a
+   * lost mirror write, and re-materializing it would destroy the agent's work.
+   */
   previousSha256?: string
   /** The Phase-2 mirror write failed; re-materialize before the next touch. */
   dirty?: boolean
@@ -116,16 +133,44 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
   const index = new Map<string, Map<string, IndexEntry>>()
   const pendingMirrorWrites = new Set<Promise<void>>()
   const hydrated = new Set<string>()
+  /**
+   * Mounts seeded from heads by a warm re-acquire. Their straggler guard lives
+   * only in the previous process's memory, so until the first authoritative
+   * scan retires it, divergence is checked against durable history instead
+   * (§7.3 phase 4, §7.5 line 1 across a crash-resume).
+   */
+  const resumeGuard = new Set<string>()
   let table: readonly SessionMount[] = []
   let mirrorDirs = new Map<string, string>()
   // Set while one mount is being captured so a thrown failure can name it in
   // onCaptureFailed. Safe because capture runs single-threaded inside the slot.
   let capturingMount: string | undefined
 
+  /**
+   * Deliver one §7.2 event. Host callbacks are outside the engine's trust
+   * boundary: a throwing handler must neither abort a capture cycle nor reject
+   * the fire-and-forget capture chain, which Node turns into an unhandled
+   * rejection and, by default, a dead process.
+   */
+  const emit = (name: keyof SyncEngineEvents, deliver: () => void): void => {
+    try {
+      deliver()
+    } catch (error: unknown) {
+      try {
+        if (options.logger) options.logger.error(error, { event: name })
+        else console.error(`TuddoFs sync ${name} handler failed`, error)
+      } catch (loggerError: unknown) {
+        console.error(`TuddoFs sync ${name} logger failed`, loggerError, { error })
+      }
+    }
+  }
+
   const slot = new CaptureSlot(
     () => capture(false),
     (attempt, error) =>
-      events.onCaptureFailed?.({ ...(capturingMount ? { mountKey: capturingMount } : {}), attempt, error }),
+      emit('onCaptureFailed', () =>
+        events.onCaptureFailed?.({ ...(capturingMount ? { mountKey: capturingMount } : {}), attempt, error }),
+      ),
   )
 
   const entriesFor = (mountKey: string): Map<string, IndexEntry> => {
@@ -217,12 +262,21 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
     // The hydration marker is written LAST, per mount, so a crash mid-acquire
     // re-hydrates only the mounts that never finished (§7.3 phase 1 step 2).
     await target.writeFile(
-      resolveUnderRoot(root, `${STATE_DIRNAME}/hydrated`),
+      resolveUnderRoot(root, HYDRATION_MARKER_FILENAME),
       Buffer.from(`${[...hydrated].sort().join('\n')}\n`),
     )
   }
 
-  /** Warm re-acquire: index check only, never a per-file probe (§7.3 phase 1 step 3). */
+  /**
+   * Warm re-acquire: index check only, never a per-file probe (§7.3 phase 1
+   * step 3).
+   *
+   * Heads carry no straggler state. A crash between a Phase-2 commit and its
+   * mirror write leaves the branch ahead of the disk, and a naive index seeded
+   * from heads would read the stale disk bytes back as a change and commit the
+   * durable write away. The mount is therefore marked for the history-backed
+   * guard until the first authoritative scan (§7.5 line 1 across resume).
+   */
   const seedIndexFromHeads = async (mount: SessionMount): Promise<void> => {
     const seeded = new Map<string, IndexEntry>()
     for (const entry of await session.mount(mount.key).glob('/**')) {
@@ -233,6 +287,7 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
     }
     index.set(mount.key, seeded)
     hydrated.add(mount.key)
+    resumeGuard.add(mount.key)
   }
 
   async function materialize(): Promise<void> {
@@ -257,7 +312,10 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
       await hydrate(mount)
     }
     // A missing stamp means the workspace contract is broken, so every mount was
-    // re-hydrated above and the watermark restarts from the end of acquire.
+    // re-hydrated above and the watermark restarts from the end of acquire. The
+    // watermark keeps its granularity margin here even though it makes the first
+    // scan re-hash the hydrated files: see stampCommand for why an
+    // acquire-tick watermark loses the writes that follow it.
     if (cold || !stampPresent) await runExec(stampCommand(root, now()), 'stamp initialization')
   }
 
@@ -271,6 +329,37 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
         if (entry.dirty) await materializePath(mountKey, path)
       }
     }
+  }
+
+  /**
+   * The sha a path held on the mirror before the Phase-2 write that last
+   * changed it, rebuilt from durable history for a warm-acquired mount.
+   *
+   * `undefined` means the guard does not apply: either the path has no history
+   * on this branch, or its newest commit is a `capture`, whose bytes were READ
+   * off the mirror and were therefore on disk by construction. `null` means
+   * that write created the path, so the mirror should hold it and absence is a
+   * lost write rather than a delete.
+   *
+   * Cost is one history query per divergent, already-committed path, once per
+   * resume — never per file and never on the write path.
+   */
+  const previousHeadSha = async (
+    mountKey: string,
+    path: string,
+    diffs: Map<string, Map<string, string | null>>,
+  ): Promise<string | null | undefined> => {
+    const [newest] = await session.mount(mountKey).history(path)
+    if (!newest || newest.op !== 'write') return undefined
+    const parent = newest.parentShas[0]
+    if (parent === undefined) return null
+    const pair = `${parent}..${newest.commitSha}`
+    let before = diffs.get(pair)
+    if (!before) {
+      before = new Map((await session.diff(parent, newest.commitSha)).map(record => [record.path, record.beforeSha]))
+      diffs.set(pair, before)
+    }
+    return before.get(path) ?? null
   }
 
   /**
@@ -295,6 +384,7 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
       }
       paths.set(record.path, record.sha256)
     }
+    const diffs = new Map<string, Map<string, string | null>>()
 
     // A failure below aborts the whole cycle without advancing the stamp, so the
     // untouched mounts are re-scanned next cycle rather than silently dropped.
@@ -303,19 +393,30 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
       capturingMount = mount.key
       const entries = entriesFor(mount.key)
       const seen = observed.get(mount.key) ?? new Map<string, string>()
+      const resuming = resumeGuard.has(mount.key)
       const changed: string[] = []
       const restage: string[] = []
       for (const [path, observedSha] of seen) {
         const entry = entries.get(path)
         if (entry?.sha256 === observedSha) {
+          // The scan proves the Phase-2 write reached disk. That CLOSES the
+          // straggler window: from here, disk content equal to the pre-write
+          // bytes is the agent reverting the file, not a lost mirror write.
           delete entry.unconfirmed
+          delete entry.previousSha256
+          continue
+        }
+        if (entry === undefined) {
+          changed.push(path)
           continue
         }
         // Straggler guard: disk still holds the sha this path had BEFORE the
         // last Phase-2 write, so the mirror write never landed. Committing it
         // would revert the agent's own tool write (§7.3 phase 4).
-        if (entry?.previousSha256 === observedSha) restage.push(path)
-        else changed.push(path)
+        if (entry.unconfirmed && entry.previousSha256 === observedSha) restage.push(path)
+        else if (resuming && !entry.unconfirmed && (await previousHeadSha(mount.key, path, diffs)) === observedSha) {
+          restage.push(path)
+        } else changed.push(path)
       }
       const deletes: string[] = []
       if (full) {
@@ -325,15 +426,23 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
           // was silently lost, so the file is absent rather than deleted.
           // Re-materialize it instead of committing away a durable write.
           if (entry.unconfirmed) restage.push(path)
+          else if (resuming && (await previousHeadSha(mount.key, path, diffs)) === null) restage.push(path)
           else deletes.push(path)
         }
       }
-      for (const path of restage) await materializePath(mount.key, path)
-      if (changed.length === 0 && deletes.length === 0) continue
+      // The read-only verdict comes first: a frozen mirror rejects the restage
+      // write, and nothing on it can be a straggler anyway — Phase 2 refuses a
+      // read-only mount before it commits (§5, §7.3 phase 3 step 5).
       if (mount.write === 'none') {
-        events.onReadOnlySkipped?.({ mountKey: mount.key, paths: [...changed, ...deletes].sort() })
+        if (changed.length > 0 || deletes.length > 0) {
+          emit('onReadOnlySkipped', () =>
+            events.onReadOnlySkipped?.({ mountKey: mount.key, paths: [...changed, ...deletes].sort() }),
+          )
+        }
         continue
       }
+      for (const path of restage) await materializePath(mount.key, path)
+      if (changed.length === 0 && deletes.length === 0) continue
 
       // Bytes are fetched and re-hashed by the kernel; the target-reported sha
       // is a diff prefilter only (§7.3 step 4, §7.4).
@@ -352,10 +461,15 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
       }
       for (const path of deletes) entries.delete(path)
       if (result.created) {
-        events.onCapture?.({ mountKey: mount.key, commitSha: result.commitSha, paths: result.changedPaths })
+        emit('onCapture', () =>
+          events.onCapture?.({ mountKey: mount.key, commitSha: result.commitSha, paths: result.changedPaths }),
+        )
       }
     }
     capturingMount = undefined
+    // The first authoritative scan has now classified every divergence with the
+    // durable history behind it; from here the in-memory guard is complete.
+    if (full) resumeGuard.clear()
 
     // Files written during the scan re-appear next cycle; sha-diffing makes the
     // re-capture a no-op (§7.3 phase 3 step 6).
@@ -374,10 +488,15 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
       const result = await session.mount(mountKey).write(path, bytes, writeOptions)
       const entries = entriesFor(mountKey)
       const previous = entries.get(path)
+      // The guard compares disk against the last sha a scan CONFIRMED, not
+      // against the sha of the previous write. Two writes before the first
+      // confirming scan leave the mirror on the older bytes, and forgetting
+      // them here would read those bytes back as an agent change.
+      const confirmed = previous?.unconfirmed === true ? previous.previousSha256 : previous?.sha256
       entries.set(path, {
         sha256: result.sha256,
         unconfirmed: true,
-        ...(previous?.sha256 === undefined ? {} : { previousSha256: previous.sha256 }),
+        ...(confirmed === undefined ? {} : { previousSha256: confirmed }),
       })
       const payload = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes)
       const mirrored = (async () => {
