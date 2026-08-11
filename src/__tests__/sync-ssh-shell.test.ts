@@ -141,7 +141,8 @@ test('guard exit codes become typed path errors, and nothing else does', () => {
   for (const code of Object.values(GUARD_EXIT)) {
     const error = guardFailure('/work/mnt/a.md', code, 'tuddofs: refused')
     assert.ok(error instanceof InvalidPathError, `exit ${code} must be an InvalidPathError`)
-    assert.match(error.message, /a\.md/u)
+    // §9: every error carries `{tenant, mount?, path?, ref?}` context.
+    assert.equal(error.path, '/work/mnt/a.md')
   }
   assert.match(String(guardFailure('/work/mnt/a.md', GUARD_EXIT.symlink, '')?.message), /symlink/iu)
   assert.match(String(guardFailure('/work/mnt/a.md', GUARD_EXIT.escapesRoot, '')?.message), /outside|escape/iu)

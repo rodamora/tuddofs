@@ -10,6 +10,23 @@ export { createSyncEngine } from './engine.js'
 export type { SyncEngine, SyncEngineEvents, SyncEngineOptions } from './engine.js'
 export { createLocalDirectoryTarget } from './local.js'
 export type { LocalDirectoryTarget, LocalDirectoryTargetOptions } from './local.js'
+export { createSshTarget } from './ssh.js'
+export type { SshTarget, SshTargetOptions } from './ssh.js'
+export {
+  guardFailure,
+  parseExecSentinel,
+  remoteExecScript,
+  remoteGuardScript,
+  remoteMkdirScript,
+  remoteReadScript,
+  remoteRootScript,
+  remoteWriteScript,
+  sshArgv,
+  sshDestination,
+  EXEC_SENTINEL_PREFIX,
+  GUARD_EXIT,
+} from './ssh-shell.js'
+export type { RemotePathScriptInput, SshConnectionOptions } from './ssh-shell.js'
 export { SyncTargetError } from './errors.js'
 export type { ExecOptions, ExecResult, SyncTarget } from './target.js'
 export {
