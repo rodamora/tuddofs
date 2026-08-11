@@ -1,6 +1,6 @@
 # s1-surface-diet — cut the consumer API to the §6.2 tiers
 
-Status: open
+Status: in-progress
 Stage: S1 pre-work (ships with s1-tree-coherence as one breaking release)
 Depends on: —
 Spec: `../architecture.md` §6.2 (all four items), §9 (EditMatchError), §13.7 (README same-PR rule)

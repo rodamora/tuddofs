@@ -2,6 +2,7 @@ import { hashCommit, hashTree, sha256, type TreeEntry } from './hashing.js'
 import {
   TuddoFsError,
   BranchSettledError,
+  EditMatchError,
   NotFoundError,
   PermissionDeniedError,
   PreconditionFailedError,
@@ -54,7 +55,7 @@ export interface OpenInput {
     readonly threadId?: string | null
     readonly runId?: string | null
   }
-  readonly mounts: readonly MountSpec[]
+  readonly mounts: readonly (MountSpec | string)[]
 }
 
 /** Metadata for one file path in a session. */
@@ -74,15 +75,11 @@ export interface SessionEntry {
   readonly mode?: number
 }
 
-/**
- * A structured text replacement applied in UTF-16 code-unit offsets.
- * `start` and `end` are half-open offsets into the current UTF-16 string;
- * edits are applied from the end of the string toward the beginning.
- */
+/** A literal text replacement. */
 export interface TextEdit {
-  readonly start: number
-  readonly end: number
-  readonly text: string
+  readonly oldText: string
+  readonly newText: string
+  readonly replaceAll?: boolean
 }
 /** Optimistic concurrency options for `write`. */
 export interface WriteOptions {
@@ -136,25 +133,22 @@ export interface DiffRecord {
   readonly afterMode?: number
 }
 
-/** Per-mount merge outcome governed by architecture §4.3 and §9; conflicts are data, not thrown exceptions. */
-export type MergeResult =
-  | 'merged'
-  | 'unauthorized'
-  | 'pendingApproval'
-  | {
-      readonly conflicts: readonly {
-        path: string
-        baseSha?: string
-        oursSha?: string
-        theirsSha?: string
-      }[]
-    }
-  | { readonly settled: string }
+/** Per-mount merge outcome; conflicts are data, not thrown exceptions. */
+export type MergeResult = {
+  readonly status: 'merged' | 'unauthorized' | 'pendingApproval' | 'conflicts'
+  readonly conflicts?: readonly {
+    path: string
+    baseSha?: string
+    oursSha?: string
+    theirsSha?: string
+  }[]
+}
 
 /** File and history operations exposed by an opened session. */
 export interface SessionFileSystem {
   readonly actor: Actor
   readonly sessionId: string
+  mount(key: string): SessionFileSystem
   read(path: string): Promise<string>
   readBytes(path: string): Promise<Buffer>
   write(path: string, bytes: Buffer | Uint8Array | string, options?: WriteOptions): Promise<WriteResult>
@@ -166,8 +160,7 @@ export interface SessionFileSystem {
   history(path: string): Promise<readonly HistoryRecord[]>
   timeline(filter?: TimelineFilter): Promise<readonly TimelineRecord[]>
   diff(a: string, b: string): Promise<readonly DiffRecord[]>
-  merge(options?: { approver?: Actor }): Promise<Readonly<Partial<Record<string, MergeResult>>>>
-  resolveMerge(mountKey: string, options?: { approver?: Actor }): Promise<MergeResult>
+  merge(options?: { mounts?: readonly string[]; approver?: Actor }): Promise<Readonly<Partial<Record<string, MergeResult>>>>
   restore(mountKey: string, at: string): Promise<RestoreResult>
   tag(mountKey: string, label: string): Promise<string>
   discard(): Promise<void>
@@ -274,7 +267,8 @@ export function createSessionApi(kernel: SessionKernel, options: TuddoFsOptions)
       if (!input.actor.id || input.actor.id === 'system')
         throw new PermissionDeniedError('Session actor must be an executing user', { tenant: input.actor.tenant })
       const mounts = new Map<string, Mount>()
-      for (const spec of input.mounts) {
+      for (const rawSpec of input.mounts) {
+        const spec: MountSpec = typeof rawSpec === 'string' ? { key: rawSpec } : rawSpec
         const key = validateMountKey(spec.key, {
           tenant: input.actor.tenant,
           mount: spec.key,
@@ -835,6 +829,24 @@ export function createSessionApi(kernel: SessionKernel, options: TuddoFsOptions)
       const session: SessionFileSystem = {
         actor: input.actor,
         sessionId: input.sessionId,
+        mount(key: string) {
+          validateMountKey(key)
+          const prefix = (path: string) => `${key}:${path.startsWith('/') ? path : `/${path}`}`
+          return {
+            ...session,
+            mount: () => {
+              throw new InvalidPathError('nested mount', 'mount handles cannot be nested')
+            },
+            read: (path: string) => session.read(prefix(path)),
+            readBytes: (path: string) => session.readBytes(prefix(path)),
+            write: (path, value, options) => session.write(prefix(path), value, options),
+            edit: (path, edits, options) => session.edit(prefix(path), edits, options),
+            list: (path: string) => session.list(prefix(path)),
+            glob: (pattern: string) => session.glob(prefix(pattern)),
+            stat: (path: string) => session.stat(prefix(path)),
+            delete: (path, options) => session.delete(prefix(path), options),
+          } as SessionFileSystem
+        },
         async read(address: string) {
           return (await readBytes(address)).toString('utf8')
         },
@@ -896,20 +908,16 @@ export function createSessionApi(kernel: SessionKernel, options: TuddoFsOptions)
               path,
             })
           let text = old.toString('utf8')
-          for (const edit of [...edits].sort((a, b) => b.start - a.start)) {
-            if (
-              !Number.isInteger(edit.start) ||
-              !Number.isInteger(edit.end) ||
-              edit.start < 0 ||
-              edit.end < edit.start ||
-              edit.end > text.length
-            )
-              throw new InvalidPathError(path, 'edit offsets must be integer UTF-16 code-unit ranges', {
-                tenant: input.actor.tenant,
-                mount: mount.key,
-                path,
-              })
-            text = `${text.slice(0, edit.start)}${edit.text}${text.slice(edit.end)}`
+          for (const edit of edits) {
+            let count = 0
+            let index = text.indexOf(edit.oldText)
+            while (index !== -1) {
+              count += 1
+              index = text.indexOf(edit.oldText, index + edit.oldText.length)
+            }
+            if (!edit.replaceAll && count !== 1)
+              throw new EditMatchError(count, { tenant: input.actor.tenant, mount: mount.key, path })
+            text = edit.replaceAll ? text.split(edit.oldText).join(edit.newText) : text.replace(edit.oldText, edit.newText)
           }
           return this.write(address, text, { ifSha: currentSha })
         },
@@ -1171,34 +1179,27 @@ export function createSessionApi(kernel: SessionKernel, options: TuddoFsOptions)
         },
         async merge(mergeOptions = {}) {
           const results: Partial<Record<string, MergeResult>> = {}
+          const selected = mergeOptions.mounts ? new Set(mergeOptions.mounts) : undefined
           for (const mount of mounts.values()) {
+            if (selected && !selected.has(mount.key)) continue
             if ('virtual' in mount || mount.mode !== 'follow') continue
             try {
-              results[mount.key] = await this.resolveMerge(mount.key, mergeOptions)
+              const result = await mergeRef(mount, mergeOptions)
+              results[mount.key] =
+                typeof result === 'string'
+                  ? { status: result === 'pendingApproval' ? 'pendingApproval' : result }
+                  : 'conflicts' in result
+                    ? { status: 'conflicts', conflicts: result.conflicts }
+                    : result
             } catch (error) {
               if (error instanceof BranchSettledError) {
-                results[mount.key] = { settled: error.state }
+                results[mount.key] = { status: 'unauthorized' }
                 continue
               }
               throw error
             }
           }
           return results
-        },
-        async resolveMerge(mountKey: string, mergeOptions = {}) {
-          const mount = mounts.get(mountKey)
-          if (!mount)
-            throw new NotFoundError(`Mount not found: ${mountKey}`, {
-              tenant: input.actor.tenant,
-              mount: mountKey,
-            })
-          if ('virtual' in mount) return unsupportedVirtual(mount.key)
-          if (mount.mode !== 'follow')
-            throw new PermissionDeniedError('Pinned mount is read-only', {
-              tenant: input.actor.tenant,
-              mount: mount.key,
-            })
-          return mergeRef(mount, mergeOptions)
         },
         async restore(mountKey: string, at: string) {
           const mount = mounts.get(mountKey)
@@ -1341,7 +1342,7 @@ export function createSessionApi(kernel: SessionKernel, options: TuddoFsOptions)
         },
       }
       return session
-      async function mergeRef(mount: RefMount, mergeOptions: { approver?: Actor } = {}): Promise<MergeResult> {
+      async function mergeRef(mount: RefMount, mergeOptions: { approver?: Actor } = {}): Promise<any> {
         if (!mount.fork || !mount.ref) return 'merged'
         if (mergeOptions.approver && mergeOptions.approver.tenant !== input.actor.tenant)
           throw new PermissionDeniedError('Approver tenant does not match session tenant', {

@@ -122,6 +122,16 @@ export class StorageError extends TuddoFsError {
     super(reason, context, 'StorageError')
   }
 }
+/** A string replacement matched zero or multiple occurrences without replaceAll. */
+export class EditMatchError extends TuddoFsError {
+  readonly matchCount: number
+
+  constructor(matchCount: number, context?: Partial<ErrorContext>) {
+    super(`Edit matched ${matchCount} occurrences; expected exactly one or replaceAll`, context, 'EditMatchError')
+    this.matchCount = matchCount
+  }
+}
+
 
 export type KernelError =
   | InvalidPathError
