@@ -431,7 +431,9 @@ test('the straggler guard re-materializes a lost mirror write instead of reverti
   await engine.materialize()
 
   // The mirror write reports success and silently loses the bytes: disk still
-  // holds the previous head, which reconcile must not commit back (§7.3 phase 4).
+  // holds the previous head, which reconcile must not commit back (§7.3 phase
+  // 4). No exec has run since the commit, so nothing on the target could have
+  // produced those bytes — the divergence can only be the lost mirror write.
   controls.swallowWrites.add(join(docsDir(root), 'a.md'))
   await engine.write('project:docs', '/a.md', 'v2')
   await engine.settle()
@@ -466,6 +468,73 @@ test('reconcile never deletes a committed file whose mirror write was silently l
   await engine.settle()
   await engine.reconcile()
   await assert.rejects(session.mount('project:docs').read('/fresh.md'))
+})
+
+test('an exec that reverts a tool write in the same turn is captured, never re-materialized', async () => {
+  const { session, engine, root } = await setup('engine-exec-revert')
+  await session.mount('project:docs').write('/a.md', 'v1')
+  await engine.materialize()
+
+  // Phase 2 puts v2 on the mirror. No scan has confirmed it yet, so the
+  // straggler window is open on the pre-write sha.
+  await engine.write('project:docs', '/a.md', 'v2')
+  await engine.settle()
+  assert.equal(await readFile(join(docsDir(root), 'a.md'), 'utf8'), 'v2')
+
+  // Same turn, before any confirming scan: an exec puts v1 back. Disk now
+  // holds exactly the sha a lost mirror write would have left, and only the
+  // exec tells the two apart. Re-materializing here would discard the agent's
+  // revert, commit nothing and fire no event (§7.3 phase 4).
+  await engine.exec("printf v1 > 'project%3Adocs/a.md'")
+  await engine.settle()
+
+  assert.equal(await session.mount('project:docs').read('/a.md'), 'v1')
+  assert.equal(await readFile(join(docsDir(root), 'a.md'), 'utf8'), 'v1')
+  assert.deepEqual(
+    captures.flatMap(event => event.paths),
+    ['/a.md'],
+  )
+  assert.deepEqual(failures, [])
+
+  // Reconcile agrees: the revert is the durable head, on disk and on the branch.
+  await engine.reconcile()
+  assert.equal(await session.mount('project:docs').read('/a.md'), 'v1')
+  assert.equal(await readFile(join(docsDir(root), 'a.md'), 'utf8'), 'v1')
+})
+
+test('an exec that overwrites an unconfirmed tool write with new bytes is captured', async () => {
+  const { session, engine, root } = await setup('engine-exec-overwrite')
+  await session.mount('project:docs').write('/a.md', 'v1')
+  await engine.materialize()
+
+  await engine.write('project:docs', '/a.md', 'v2')
+  await engine.settle()
+  await engine.exec("printf v3 > 'project%3Adocs/a.md'")
+  await engine.settle()
+
+  assert.equal(await session.mount('project:docs').read('/a.md'), 'v3')
+  assert.equal(await readFile(join(docsDir(root), 'a.md'), 'utf8'), 'v3')
+  assert.deepEqual(failures, [])
+})
+
+test('an exec that deletes an unconfirmed tool write is a delete, not a straggler', async () => {
+  const { session, engine, root } = await setup('engine-exec-delete')
+  await engine.materialize()
+
+  await engine.write('project:docs', '/fresh.md', 'durable')
+  await engine.settle()
+  assert.equal(await readFile(join(docsDir(root), 'fresh.md'), 'utf8'), 'durable')
+
+  // The absent-on-disk half of the same window. No scan has confirmed the
+  // mirror write, so absence still looks like a lost write — but the exec is
+  // what removed the file, and resurrecting it would undo the agent's work.
+  await engine.exec("rm 'project%3Adocs/fresh.md'")
+  await engine.settle()
+  await engine.reconcile()
+
+  await assert.rejects(session.mount('project:docs').read('/fresh.md'))
+  await assert.rejects(stat(join(docsDir(root), 'fresh.md')))
+  assert.deepEqual(failures, [])
 })
 
 test('a confirming scan retires the straggler guard so a later revert is captured', async () => {
@@ -563,6 +632,42 @@ test('a resumed engine never deletes a committed file the crashed process never 
   await resumed.settle()
   await resumed.reconcile()
   await assert.rejects(session.mount('project:docs').read('/fresh.md'))
+})
+
+test('a resumed engine weighs divergence against the whole durable lineage, not the newest write', async () => {
+  const { session, engine, root, controls, target } = await setup('engine-resume-lineage')
+  await session.mount('project:docs').write('/a.md', 'v0')
+  await engine.materialize()
+
+  // Two consecutive Phase-2 writes whose mirror writes are both silently lost.
+  // Disk is stuck two versions back, on a sha the NEWEST write's parent never
+  // held, so a rebuild that only knows that parent reads v0 as an agent change
+  // and commits the durable v2 away (§7.3 phase 4 across resume).
+  controls.swallowWrites.add(join(docsDir(root), 'a.md'))
+  await engine.write('project:docs', '/a.md', 'v1')
+  await engine.write('project:docs', '/a.md', 'v2')
+  await engine.settle()
+  assert.equal(await readFile(join(docsDir(root), 'a.md'), 'utf8'), 'v0')
+  controls.swallowWrites.clear()
+
+  const resumed = createSyncEngine({
+    session: await openSession('engine-resume-lineage'),
+    target,
+    root,
+    events: { onCapture: event => captures.push(event), onCaptureFailed: event => failures.push(event) },
+  })
+  await resumed.materialize()
+  await resumed.reconcile()
+
+  assert.equal(await session.mount('project:docs').read('/a.md'), 'v2')
+  assert.equal(await readFile(join(docsDir(root), 'a.md'), 'utf8'), 'v2')
+  assert.deepEqual(captures, [])
+  assert.deepEqual(failures, [])
+
+  // Disk content from outside the lineage is still an uncaptured exec change.
+  await writeFile(join(docsDir(root), 'a.md'), 'from the shell')
+  await resumed.reconcile()
+  assert.equal(await session.mount('project:docs').read('/a.md'), 'from the shell')
 })
 
 test('a throwing host handler neither aborts a capture nor kills the process', async () => {
