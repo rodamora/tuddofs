@@ -5,12 +5,15 @@ import test, { after, afterEach, before, describe } from 'node:test'
 
 /** The required BlobStore surface exercised by the reusable conformance suite. */
 export interface ConformanceBlobStore {
-  put(key: string, bytes: Buffer): Promise<void>
+  put(key: string, bytes: Buffer | Readable): Promise<void>
   head(key: string): Promise<{ sizeBytes: number } | null>
   get(key: string): Promise<Readable>
   delete(key: string): Promise<void>
   list(prefix: string): Promise<readonly { key: string }[]>
-  presignPut(key: string, opts: { ttlSeconds: number; checksumSha256: string }): Promise<string>
+  presignPut(
+    key: string,
+    opts: { ttlSeconds: number; checksumSha256: string },
+  ): Promise<{ checksumEnforced: true; url: string; headers: Readonly<Record<'x-amz-checksum-sha256', string>> }>
   presignGet(key: string, opts: { ttlSeconds: number }): Promise<string>
 }
 export type ConformanceRequest = (
@@ -107,8 +110,9 @@ export function defineBlobStoreConformanceSuite(options: BlobStoreConformanceOpt
       const expected = Buffer.from('expected bytes')
       const wrong = Buffer.from('wrong bytes')
       const checksum = createHash('sha256').update(expected).digest('base64')
-      const url = await store.presignPut(key, { ttlSeconds: 300, checksumSha256: checksum })
-
+      const presigned = await store.presignPut(key, { ttlSeconds: 300, checksumSha256: checksum })
+      assert.equal(presigned.checksumEnforced, true)
+      const url = presigned.url
       const wrongResponse = await request(url, { method: 'PUT', body: wrong }, checksum).catch(() => undefined)
       assert.ok(wrongResponse === undefined || !wrongResponse.ok)
       assert.equal(await store.head(key), null)

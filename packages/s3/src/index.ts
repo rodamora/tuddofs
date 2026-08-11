@@ -18,13 +18,19 @@ export interface BlobObject {
 }
 
 /** Structural five-verb BlobStore SPI plus its optional capabilities (§8.4). */
+export interface ChecksumEnforcedPresignedPut {
+  readonly checksumEnforced: true
+  readonly url: string
+  readonly headers: Readonly<Record<'x-amz-checksum-sha256', string>>
+}
+
 export interface BlobStore {
-  put(key: string, bytes: Buffer): Promise<void>
+  put(key: string, bytes: Buffer | Readable): Promise<void>
   head(key: string): Promise<{ sizeBytes: number } | null>
   get(key: string): Promise<Readable>
   delete(key: string): Promise<void>
   list?(prefix: string): Promise<readonly BlobObject[]>
-  presignPut?(key: string, opts: { ttlSeconds: number; checksumSha256: string }): Promise<string>
+  presignPut?(key: string, opts: { ttlSeconds: number; checksumSha256: string }): Promise<ChecksumEnforcedPresignedPut>
   presignGet?(key: string, opts: { ttlSeconds: number }): Promise<string>
 }
 
@@ -88,15 +94,15 @@ export class S3BlobStore implements BlobStore {
     if (this.ownsClient) this.client.destroy()
   }
 
-  /** Upload bytes to an object key. */
-  async put(key: string, bytes: Buffer): Promise<void> {
+  /** Upload bytes or a stream to an object key. */
+  async put(key: string, bytes: Buffer | Readable): Promise<void> {
     try {
       await this.client.send(
         new PutObjectCommand({
           Bucket: this.bucket,
           Key: key,
           Body: bytes,
-          ContentLength: bytes.length,
+          ...(Buffer.isBuffer(bytes) && { ContentLength: bytes.length }),
         }),
       )
     } catch (error) {
@@ -174,10 +180,13 @@ export class S3BlobStore implements BlobStore {
    * Issue a SigV4 PUT URL with x-amz-checksum-sha256 as a required signed
    * header, so the object store rejects bytes with a different checksum.
    */
-  async presignPut(key: string, opts: { ttlSeconds: number; checksumSha256: string }): Promise<string> {
+  async presignPut(
+    key: string,
+    opts: { ttlSeconds: number; checksumSha256: string },
+  ): Promise<ChecksumEnforcedPresignedPut> {
     const expiresIn = validateTtl(opts.ttlSeconds)
     try {
-      return await getSignedUrl(
+      const url = await getSignedUrl(
         this.client,
         new PutObjectCommand({
           Bucket: this.bucket,
@@ -189,11 +198,15 @@ export class S3BlobStore implements BlobStore {
           unhoistableHeaders: new Set(['x-amz-checksum-sha256']),
         },
       )
+      return {
+        checksumEnforced: true,
+        url,
+        headers: { 'x-amz-checksum-sha256': opts.checksumSha256 },
+      }
     } catch (error) {
       throw toStorageError('presignPut', key, error)
     }
   }
-
   /** Issue a SigV4 GET URL for an object. */
   async presignGet(key: string, opts: { ttlSeconds: number }): Promise<string> {
     const expiresIn = validateTtl(opts.ttlSeconds)

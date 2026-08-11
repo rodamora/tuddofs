@@ -28,12 +28,16 @@ if (!endpoint) {
     try {
       const bytes = Buffer.from('signed checksum')
       const checksum = createHash('sha256').update(bytes).digest('base64')
-      const url = await store.presignPut(`tuddo/specific-${process.pid}`, {
+      const presigned = await store.presignPut(`tuddo/specific-${process.pid}`, {
         ttlSeconds: 300,
         checksumSha256: checksum,
       })
 
-      assert.match(new URL(url).searchParams.get('X-Amz-SignedHeaders') ?? '', /(?:^|;)x-amz-checksum-sha256(?:;|$)/)
+      assert.equal(presigned.checksumEnforced, true)
+      assert.match(
+        new URL(presigned.url).searchParams.get('X-Amz-SignedHeaders') ?? '',
+        /(?:^|;)x-amz-checksum-sha256(?:;|$)/,
+      )
     } finally {
       store.destroy()
     }
@@ -52,10 +56,12 @@ if (!endpoint) {
       const key = `tuddo/specific-checksum-${process.pid}-${Date.now()}`
       const expected = Buffer.from('signed checksum body')
       const checksum = createHash('sha256').update(expected).digest('base64')
-      const url = await store.presignPut(key, {
+      const presigned = await store.presignPut(key, {
         ttlSeconds: 300,
         checksumSha256: checksum,
       })
+      assert.equal(presigned.checksumEnforced, true)
+      const url = presigned.url
 
       const wrongResponse = await fetch(url, {
         method: 'PUT',

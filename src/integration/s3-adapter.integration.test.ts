@@ -5,7 +5,7 @@ import { CreateBucketCommand, S3Client } from '@aws-sdk/client-s3'
 import { Pool } from 'pg'
 
 import { S3BlobStore } from '../../packages/s3/src/index.js'
-import { createTuddoFs, migrate } from '../index.js'
+import { createTuddoFs, migrate } from '../internal.js'
 
 const endpoint = process.env.TUDDOFS_S3_ENDPOINT
 const databaseUrl = process.env.TUDDOFS_DATABASE_URL
