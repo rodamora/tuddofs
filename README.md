@@ -6,11 +6,11 @@
 
 The kernel and session layers are implemented and covered by unit and PostgreSQL integration tests. This release includes governed mounts, branch and commit history, merge and merge resolution, restore, tags, pinning, garbage collection, verification, and object-storage streaming.
 
-A sync engine that materializes governed mounts into a real directory, and a local-directory target for it, are implemented and exercised by the kill-matrix integration suite. They are published through the explicit `tuddofs/internal` subpath rather than the main entry point, because the main entry point is a deliberately fixed Tier-1 surface; see [Sync engine](#sync-engine).
+A sync engine that materializes governed mounts into a real directory, plus a local-directory target and an SSH target for it, are implemented and exercised by the kill-matrix acceptance suite — the same suite, run against both targets. They are published through the explicit `tuddofs/internal` subpath rather than the main entry point, because the main entry point is a deliberately fixed Tier-1 surface; see [Sync engine](#sync-engine).
 
 The following are intentionally not promised features of this release:
 
-- SSH and sandbox-provider sync targets;
+- sandbox-provider sync targets (E2B, Blaxel, and the like);
 - multipart object-storage upload.
 
 The mount-handle streaming methods require a `BlobStore` with stream-capable `put`, server-side `copy`, and the relevant presign method. `session.mount(key).readStream(path)` returns a Node `Readable`; `writeStream(path, source)` hashes into a quarantine key while holding the same tenant GC lease as kernel writes, promotes to `tuddo/<tenant>/<sha256>`, then commits. `presign(path, { method: 'GET' })` returns a read URL. PUT requires a lowercase hexadecimal `{ method: 'PUT', sha256 }` and returns `{ url, headers, checksumEnforced: true }`; clients must send the returned `x-amz-checksum-sha256` header. Core converts the CAS hash to S3's base64 checksum format and rejects adapters whose result does not sign that header or whose store cannot enforce uploaded-byte checksums. Missing or non-enforcing storage capabilities fail with `StorageError`.
@@ -23,6 +23,7 @@ These boundaries are reflected in the exported API; do not build a production wo
 - PostgreSQL 13 or newer
 - A PostgreSQL-compatible driver and pool supplied by the host application. The examples use `pg`, but `tuddofs` keeps it out of its runtime dependencies so hosts can use another structurally compatible pool.
 - Optional object storage implementing the exported `BlobStore` interface
+- An `ssh` client binary, only for the SSH sync target; it is spawned, never bundled
 
 The reference S3-compatible implementation is published separately:
 
@@ -221,9 +222,38 @@ Event handlers are host code and are treated as such: a handler that throws is c
 
 A tool write is protected from a mirror write that silently fails, but only until the next scan confirms the file on disk. That window is deliberate: once a scan has seen the committed bytes in the workspace, content matching the previous version is treated as a real change — a checkout, a formatter, an undo — and captured, not overwritten. The same protection is rebuilt from commit history when an engine re-attaches to an existing workspace, so a process that dies between a commit and its mirror write does not lose the write on the next `reconcile()`.
 
-A target is the four-verb `SyncTarget` seam — `exec`, `readFile`, `writeFile`, `mkdir` — and the engine imports no target implementation and no provider SDK. Targets must provide GNU coreutils; `materialize()` probes for them and fails immediately if they are missing. Only the local-directory target ships today.
+A target is the four-verb `SyncTarget` seam — `exec`, `readFile`, `writeFile`, `mkdir` — and the engine imports no target implementation and no provider SDK. Targets must provide GNU coreutils; `materialize()` probes for them and fails immediately if they are missing. Two targets ship: the local directory and SSH.
 
-**The local-directory target confines the filesystem, not the host.** Its `readFile`, `writeFile`, and `mkdir` refuse any path outside the workspace root and never follow a symlink out of it, so a governed mount cannot be used to read or overwrite host files. `exec` has no such protection: it runs a real shell as the host process user, with that user's environment, filesystem, and network. Anything that user can do, a command run through this target can do. Use it for agents and code you already trust on a machine you already trust; run untrusted code in a sandbox and give it its own target.
+**Both targets confine the filesystem, not the host.** `readFile`, `writeFile`, and `mkdir` refuse any path outside the workspace root and never follow a symlink out of it, so a governed mount cannot be used to read or overwrite files elsewhere on the machine. `exec` has no such protection: it runs a real shell as the target's user, with that user's environment, filesystem, and network. Anything that user can do, a command run through the target can do. For the local target that user is your own host process; run untrusted code in a sandbox and give it its own target.
+
+### SSH target
+
+```ts
+import { createSshTarget, createSyncEngine, type SessionFileSystem } from 'tuddofs/internal'
+
+declare const session: SessionFileSystem
+
+const root = '/srv/agents/run-1'
+const target = createSshTarget({
+  root,
+  host: 'build-01.internal',
+  user: 'agent',
+  port: 22,
+  identityFile: '/etc/tuddofs/agent_ed25519',
+  knownHostsFile: '/etc/tuddofs/known_hosts',
+})
+const engine = createSyncEngine({ session, target, root })
+```
+
+Requirements, none of them a package dependency:
+
+- An `ssh` client binary on the machine running `tuddofs` (`sshBinary` selects a specific one). The package spawns it rather than bundling a protocol implementation, which is how the core keeps zero runtime dependencies.
+- Key-based, non-interactive authentication. `BatchMode=yes`, `PasswordAuthentication=no`, and `KbdInteractiveAuthentication=no` are fixed and cannot be overridden: an agent runtime that can block on a password prompt is a hung agent runtime. Host-key checking defaults to `StrictHostKeyChecking=yes`.
+- A POSIX `sh` login shell and GNU coreutils on the remote host. A busybox host fails at `materialize()`, loudly, rather than silently capturing nothing later.
+
+Every interpolated value — path, filename, command — is single-quoted for the remote shell, and paths are checked twice: lexically before anything reaches the network, and again on the host with `pwd -P`, which is what catches a symlinked directory pointing out of the workspace. The remote exit status is reported by the remote itself behind a per-exec nonce, because OpenSSH reports both "the command was killed by a signal" and "the transport failed" as exit 255; a command that never reported its status is a target error, never a plausible exit code. `exec` is bounded on the remote side with `timeout -s KILL`, since killing the local client leaves the remote command running.
+
+There is no connection pooling: one ssh invocation per verb. A host that wants multiplexing passes it through as ordinary ssh configuration, for example `sshOptions: ['ControlMaster=auto', 'ControlPath=/tmp/tuddofs-%C', 'ControlPersist=60']`.
 
 ## Integration tests
 
@@ -269,6 +299,15 @@ TUDDOFS_DATABASE_URL="postgresql://tuddofs:tuddofs@127.0.0.1:${TUDDOFS_IT_PORT:-
 Set `TUDDOFS_MINIO_STREAM_BYTES` to a positive byte count only for a smaller CI smoke run; the acceptance default remains exactly 2,147,483,648 bytes. The suite fails loudly rather than skipping when PostgreSQL or Docker is unavailable.
 
 SigV4 presigned URLs embed their endpoint host. Client-direct I/O therefore requires the blob endpoint to be reachable from the client's network; otherwise the host must use the server-relay streaming path.
+
+The SSH acceptance suite runs the same kill matrix as the local target over a real network. By default it builds `fixtures/sshd`, generates a throwaway ed25519 keypair, and starts and disposes its own uniquely named sshd container — twice: a GNU host for the matrix and a busybox host to prove the coreutils probe fails at acquire. It kills the real sshd where the matrix calls for a dead target.
+
+```bash
+TUDDOFS_DATABASE_URL="postgresql://tuddofs:tuddofs@127.0.0.1:${TUDDOFS_IT_PORT:-55771}/tuddofs_it" \
+  npm run test:ssh
+```
+
+To run it against a machine you already have instead, set `TUDDOFS_SSH_HOST` and, as needed, `TUDDOFS_SSH_USER`, `TUDDOFS_SSH_PORT`, `TUDDOFS_SSH_IDENTITY`, `TUDDOFS_SSH_KNOWN_HOSTS`, and `TUDDOFS_SSH_ROOT` (default `/tmp/tuddofs-acceptance`). Workspaces are created and removed per case; the suite never kills a daemon it did not start. Like the MinIO suite, it fails loudly rather than skipping when its prerequisites are missing.
 
 Never point these commands at a shared development or production database.
 
