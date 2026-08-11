@@ -102,6 +102,8 @@ type IndexEntry = {
   previousSha256?: string
   /** The Phase-2 mirror write failed; re-materialize before the next touch. */
   dirty?: boolean
+  /** No scan has yet observed this Phase-2 write on disk; absence means a lost mirror write, not a delete. */
+  unconfirmed?: boolean
 }
 
 export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
@@ -277,6 +279,7 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
    * unmodified file simply does not appear.
    */
   async function capture(full: boolean): Promise<void> {
+    capturingMount = undefined
     if (mirrorDirs.size === 0) return
     const scanStart = now()
     const scan = await runExec(
@@ -293,50 +296,66 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
       paths.set(record.path, record.sha256)
     }
 
+    // A failure below aborts the whole cycle without advancing the stamp, so the
+    // untouched mounts are re-scanned next cycle rather than silently dropped.
     for (const mount of table) {
       if (mount.virtual) continue
       capturingMount = mount.key
-      try {
-        const entries = entriesFor(mount.key)
-        const seen = observed.get(mount.key) ?? new Map<string, string>()
-        const changed: string[] = []
-        const stragglers: string[] = []
-        for (const [path, observedSha] of seen) {
-          const entry = entries.get(path)
-          if (entry?.sha256 === observedSha) continue
-          // Straggler guard: disk still holds the sha this path had BEFORE the
-          // last Phase-2 write, so the mirror write never landed. Committing it
-          // would revert the agent's own tool write (§7.3 phase 4).
-          if (entry?.previousSha256 === observedSha) stragglers.push(path)
-          else changed.push(path)
-        }
-        const deletes = full ? [...entries.keys()].filter(path => !seen.has(path)) : []
-        for (const path of stragglers) await materializePath(mount.key, path)
-        if (changed.length === 0 && deletes.length === 0) continue
-        if (mount.write === 'none') {
-          events.onReadOnlySkipped?.({ mountKey: mount.key, paths: [...changed, ...deletes].sort() })
+      const entries = entriesFor(mount.key)
+      const seen = observed.get(mount.key) ?? new Map<string, string>()
+      const changed: string[] = []
+      const restage: string[] = []
+      for (const [path, observedSha] of seen) {
+        const entry = entries.get(path)
+        if (entry?.sha256 === observedSha) {
+          delete entry.unconfirmed
           continue
         }
+        // Straggler guard: disk still holds the sha this path had BEFORE the
+        // last Phase-2 write, so the mirror write never landed. Committing it
+        // would revert the agent's own tool write (§7.3 phase 4).
+        if (entry?.previousSha256 === observedSha) restage.push(path)
+        else changed.push(path)
+      }
+      const deletes: string[] = []
+      if (full) {
+        for (const [path, entry] of entries) {
+          if (seen.has(path)) continue
+          // Same guard, for a path the branch view never had: the mirror write
+          // was silently lost, so the file is absent rather than deleted.
+          // Re-materialize it instead of committing away a durable write.
+          if (entry.unconfirmed) restage.push(path)
+          else deletes.push(path)
+        }
+      }
+      for (const path of restage) await materializePath(mount.key, path)
+      if (changed.length === 0 && deletes.length === 0) continue
+      if (mount.write === 'none') {
+        events.onReadOnlySkipped?.({ mountKey: mount.key, paths: [...changed, ...deletes].sort() })
+        continue
+      }
 
-        // Bytes are fetched and re-hashed by the kernel; the target-reported sha
-        // is a diff prefilter only (§7.3 step 4, §7.4).
-        const writes: CaptureWrite[] = []
-        for (const path of changed) writes.push({ path, bytes: await target.readFile(mirrorPath(mount.key, path)) })
-        const result = await session.mount(mount.key).capture({ writes, deletes })
-        const written = new Map(writes.map(entry => [entry.path, sha256(entry.bytes as Buffer)] as const))
-        for (const path of result.changedPaths) {
-          const observedSha = written.get(path)
-          if (observedSha === undefined) entries.delete(path)
-          else entries.set(path, { sha256: observedSha })
-        }
-        for (const path of deletes) entries.delete(path)
-        if (result.created) {
-          events.onCapture?.({ mountKey: mount.key, commitSha: result.commitSha, paths: result.changedPaths })
-        }
-      } finally {
-        capturingMount = undefined
+      // Bytes are fetched and re-hashed by the kernel; the target-reported sha
+      // is a diff prefilter only (§7.3 step 4, §7.4).
+      const writes: CaptureWrite[] = []
+      const capturedShas = new Map<string, string>()
+      for (const path of changed) {
+        const bytes = await target.readFile(mirrorPath(mount.key, path))
+        writes.push({ path, bytes })
+        capturedShas.set(path, sha256(bytes))
+      }
+      const result = await session.mount(mount.key).capture({ writes, deletes })
+      for (const path of result.changedPaths) {
+        const capturedSha = capturedShas.get(path)
+        if (capturedSha === undefined) entries.delete(path)
+        else entries.set(path, { sha256: capturedSha })
+      }
+      for (const path of deletes) entries.delete(path)
+      if (result.created) {
+        events.onCapture?.({ mountKey: mount.key, commitSha: result.commitSha, paths: result.changedPaths })
       }
     }
+    capturingMount = undefined
 
     // Files written during the scan re-appear next cycle; sha-diffing makes the
     // re-capture a no-op (§7.3 phase 3 step 6).
@@ -357,6 +376,7 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
       const previous = entries.get(path)
       entries.set(path, {
         sha256: result.sha256,
+        unconfirmed: true,
         ...(previous?.sha256 === undefined ? {} : { previousSha256: previous.sha256 }),
       })
       const payload = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes)

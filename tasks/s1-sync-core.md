@@ -1,6 +1,6 @@
 # s1-sync-core — sync engine + local-directory target
 
-Status: open
+Status: done
 Stage: S1
 Depends on: s1-surface-diet, s1-tree-coherence (both merged first; build on the narrow surface)
 Spec: `../architecture.md` §7 ENTIRE (7.1 SyncTarget, 7.2 events, 7.3 four phases, 7.4 gotchas, 7.5 kill matrix), §4.3 point 2 (capture coherence rule), §12 budgets
@@ -28,3 +28,11 @@ Kill matrix (§7.5) green in CI with zero external infrastructure:
 - Capture failure re-triggers, surfaces via `onCaptureFailed`, never wedges the slot.
 - Hostile-input suite: path escapes in scan output, quoting collapse, symlink exfiltration attempt.
 - Filenames with spaces/newlines/astral-plane chars round-trip.
+
+## Evidence
+
+- Engine: `src/sync/` (`paths.ts` mirror/quoting/scan rules, `slot.ts` capture slot, `target.ts` the §7.1 seam, `local.ts` local-directory target, `engine.ts` the four phases). Exported from `tuddofs/internal`; §6.2 enumerates the Tier-1 entry exhaustively, so promoting `createSyncEngine` needs a spec amendment.
+- Batch capture commit: `kernel.captureBatch` + `session.mount(key).capture()` + `session.mounts()`, applying the §4.3 point-2 capture rule inside the commit transaction.
+- Kill matrix and hostile-input suite: `src/integration/sync-engine.integration.test.ts` (15 tests, zero external infrastructure beyond the package's existing PostgreSQL container). Batch-commit semantics: `src/integration/sync-capture.integration.test.ts`. Pure rules: `src/__tests__/sync-paths.test.ts`, `src/__tests__/sync-slot.test.ts`, `src/__tests__/sync-local-target.test.ts`.
+- Spec correction found by the suite: the §7.3 stamp must trail the scan start by a granularity margin. Filesystem timestamps come from a coarse clock, so a stamp set to the exact scan instant can be newer than a write that follows it, and `find -newer` then silently under-captures — which §7.4 forbids. `stampCommand` subtracts 1s; over-capture stays a sha no-op.
+- Spec deviation, same reason: the scan runs `find … -print0 > .tuddofs/scan && xargs -0 -r sha256sum --zero < .tuddofs/scan` instead of the illustrative pipeline, because a pipe reports `xargs`' exit status and would turn a failed `find` into an empty diff (§7.2).

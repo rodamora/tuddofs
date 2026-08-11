@@ -6,13 +6,13 @@ import { fileURLToPath } from 'node:url'
 
 import ts from 'typescript'
 
-test('README TypeScript quickstart compiles against the public entry', async () => {
+async function compileReadmeBlock(marker: RegExp, filename: string): Promise<void> {
   const root = dirname(dirname(dirname(fileURLToPath(import.meta.url))))
   const readme = await readFile(join(root, 'README.md'), 'utf8')
-  const match = /For an application[\s\S]*?```ts\n([\s\S]*?)\n```/u.exec(readme)
-  assert.ok(match?.[1], 'README application quickstart block is missing')
+  const match = marker.exec(readme)
+  assert.ok(match?.[1], `README block for ${marker.source} is missing`)
 
-  const sourcePath = join(root, '.readme-quickstart.ts')
+  const sourcePath = join(root, filename)
   await writeFile(sourcePath, match[1])
   try {
     const program = ts.createProgram([sourcePath], {
@@ -25,7 +25,7 @@ test('README TypeScript quickstart compiles against the public entry', async () 
       esModuleInterop: true,
       types: ['node'],
       baseUrl: root,
-      paths: { tuddofs: ['./src/index.ts'] },
+      paths: { tuddofs: ['./src/index.ts'], 'tuddofs/internal': ['./src/internal.ts'] },
     })
     const diagnostics = ts
       .getPreEmitDiagnostics(program)
@@ -34,4 +34,12 @@ test('README TypeScript quickstart compiles against the public entry', async () 
   } finally {
     await rm(sourcePath, { force: true })
   }
+}
+
+test('README TypeScript quickstart compiles against the public entry', async () => {
+  await compileReadmeBlock(/For an application[\s\S]*?```ts\n([\s\S]*?)\n```/u, '.readme-quickstart.ts')
+})
+
+test('README sync-engine example compiles against the internal entry', async () => {
+  await compileReadmeBlock(/## Sync engine[\s\S]*?```ts\n([\s\S]*?)\n```/u, '.readme-sync.ts')
 })

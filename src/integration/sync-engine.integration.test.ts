@@ -99,12 +99,12 @@ type Controls = {
   swallowWrites: Set<string>
   /** Scan output substituted for the target's, to inject hostile records. */
   scanOutput: string | null
-  /** Fail the next exec whose command matches. */
-  failExecMatching: RegExp | null
+  /** Number of upcoming capture scans to fail. */
+  failScans: number
 }
 
 function controlled(target: SyncTarget): { target: SyncTarget; controls: Controls } {
-  const controls: Controls = { killed: false, swallowWrites: new Set(), scanOutput: null, failExecMatching: null }
+  const controls: Controls = { killed: false, swallowWrites: new Set(), scanOutput: null, failScans: 0 }
   const alive = () => {
     if (controls.killed) throw new Error('target killed')
   }
@@ -113,12 +113,13 @@ function controlled(target: SyncTarget): { target: SyncTarget; controls: Control
     target: {
       async exec(cmd, opts) {
         alive()
-        if (controls.failExecMatching?.test(cmd)) {
-          controls.failExecMatching = null
+        const isScan = cmd.includes('sha256sum --zero')
+        if (isScan && controls.failScans > 0) {
+          controls.failScans -= 1
           return { exitCode: 1, output: 'simulated scan failure' }
         }
         const result = await target.exec(cmd, opts)
-        if (controls.scanOutput !== null && cmd.includes('sha256sum --zero')) {
+        if (controls.scanOutput !== null && isScan) {
           const output = controls.scanOutput
           controls.scanOutput = null
           return { exitCode: result.exitCode, output }
@@ -281,25 +282,48 @@ test('exec capture commits shell-written files and coalesces repeated triggers',
   assert.equal(await readFile(join(docsDir(root), 'a.md'), 'utf8'), 'v2')
 })
 
-test('a failed scan is an error event and the next capture recovers the change', async () => {
+test('repeated scan failures surface as error events and never wedge the capture slot', async () => {
   const { session, engine, controls } = await setup('engine-scan-failure')
   await session.mount('project:docs').write('/a.md', 'v1')
   await engine.materialize()
 
-  controls.failExecMatching = /sha256sum --zero/u
+  controls.failScans = 3
   await engine.exec("printf v2 > 'project%3Adocs/a.md'")
   await engine.settle()
+  for (let attempt = 2; attempt <= 3; attempt += 1) {
+    engine.captureAfterExec()
+    await engine.settle()
+  }
 
-  assert.equal(failures.length, 1)
-  assert.equal(failures[0]?.attempt, 1)
-  assert.ok(failures[0]?.error instanceof SyncTargetError)
-  // The stamp was never advanced, so nothing was lost.
+  assert.deepEqual(
+    failures.map(event => event.attempt),
+    [1, 2, 3],
+  )
+  for (const failure of failures) assert.ok(failure.error instanceof SyncTargetError)
+  assert.equal(failures[0]?.mountKey, undefined)
+  // The stamp was never advanced, so three failures lost nothing.
   assert.equal(await session.mount('project:docs').read('/a.md'), 'v1')
 
   engine.captureAfterExec()
   await engine.settle()
   assert.equal(await session.mount('project:docs').read('/a.md'), 'v2')
-  assert.equal(failures.length, 1)
+  assert.equal(failures.length, 3)
+})
+
+test('an mtime-only change is a prefilter hit, never a commit', async () => {
+  const { session, engine } = await setup('engine-mtime-prefilter')
+  await session.mount('project:docs').write('/a.md', 'v1')
+  await engine.materialize()
+  const before = await session.mount('project:docs').stat('/a.md')
+
+  await engine.exec("touch 'project%3Adocs/a.md'")
+  await engine.settle()
+  await engine.reconcile()
+
+  // Transfer decisions are ALWAYS sha-vs-index; mtime only narrows the scan (§7.4).
+  assert.deepEqual(captures, [])
+  assert.deepEqual(failures, [])
+  assert.equal((await session.mount('project:docs').stat('/a.md')).sha256, before.sha256)
 })
 
 test('capture refuses hostile scan output instead of committing outside the mount', async () => {
@@ -419,4 +443,42 @@ test('the straggler guard re-materializes a lost mirror write instead of reverti
   assert.equal(await session.mount('project:docs').read('/a.md'), 'v2')
   assert.equal(await readFile(join(docsDir(root), 'a.md'), 'utf8'), 'v2')
   assert.deepEqual(captures, [])
+})
+
+test('reconcile never deletes a committed file whose mirror write was silently lost', async () => {
+  const { session, engine, root, controls } = await setup('engine-lost-new-file')
+  await engine.materialize()
+
+  controls.swallowWrites.add(join(docsDir(root), 'fresh.md'))
+  await engine.write('project:docs', '/fresh.md', 'durable')
+  await engine.settle()
+  await assert.rejects(stat(join(docsDir(root), 'fresh.md')))
+
+  controls.swallowWrites.clear()
+  await engine.reconcile()
+
+  // Absent-on-disk means "delete" only for paths a scan has actually seen.
+  assert.equal(await session.mount('project:docs').read('/fresh.md'), 'durable')
+  assert.equal(await readFile(join(docsDir(root), 'fresh.md'), 'utf8'), 'durable')
+
+  // Once the mirror is confirmed, a real removal does delete at reconcile.
+  await engine.exec("rm 'project%3Adocs/fresh.md'")
+  await engine.settle()
+  await engine.reconcile()
+  await assert.rejects(session.mount('project:docs').read('/fresh.md'))
+})
+
+test('a capture blocked by a revoked grant names its mount in the failure event', async () => {
+  const { session, engine } = await setup('engine-revoked')
+  await session.mount('project:docs').write('/a.md', 'v1')
+  await engine.materialize()
+
+  grants['project:docs'] = 'none'
+  await engine.exec("printf v2 > 'project%3Adocs/a.md'")
+  await engine.settle()
+
+  assert.equal(failures.length, 1)
+  assert.equal(failures[0]?.mountKey, 'project:docs')
+  assert.ok(failures[0]?.error instanceof PermissionDeniedError)
+  assert.equal(await session.mount('project:docs').read('/a.md'), 'v1')
 })

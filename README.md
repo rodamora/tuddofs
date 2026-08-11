@@ -6,9 +6,11 @@
 
 The kernel and session layers are implemented and covered by unit and PostgreSQL integration tests. This release includes governed mounts, branch and commit history, merge and merge resolution, restore, tags, pinning, garbage collection, verification, and object-storage streaming.
 
+A sync engine that materializes governed mounts into a real directory, and a local-directory target for it, are implemented and exercised by the kill-matrix integration suite. They are published through the explicit `tuddofs/internal` subpath rather than the main entry point, because the main entry point is a deliberately fixed Tier-1 surface; see [Sync engine](#sync-engine).
+
 The following are intentionally not promised features of this release:
 
-- a sync engine for external workspaces;
+- SSH and sandbox-provider sync targets;
 - multipart object-storage upload.
 
 The mount-handle streaming methods require a `BlobStore` with stream-capable `put`, server-side `copy`, and the relevant presign method. `session.mount(key).readStream(path)` returns a Node `Readable`; `writeStream(path, source)` hashes into a quarantine key while holding the same tenant GC lease as kernel writes, promotes to `tuddo/<tenant>/<sha256>`, then commits. `presign(path, { method: 'GET' })` returns a read URL. PUT requires a lowercase hexadecimal `{ method: 'PUT', sha256 }` and returns `{ url, headers, checksumEnforced: true }`; clients must send the returned `x-amz-checksum-sha256` header. Core converts the CAS hash to S3's base64 checksum format and rejects adapters whose result does not sign that header or whose store cannot enforce uploaded-byte checksums. Missing or non-enforcing storage capabilities fail with `StorageError`.
@@ -166,9 +168,50 @@ The main `tuddofs` entry point exports only the Tier-1 consumer surface:
 - Public option, session, mount-handle, result, grant, storage, and maintenance types.
 - The typed error taxonomy: `InvalidPathError`, `InvalidMountKeyError`, `InvalidCommitTimestampError`, `PermissionDeniedError`, `PreconditionFailedError`, `RefConflictError`, `NotFoundError`, `BranchSettledError`, `MergePendingApprovalError`, `GrantResolverError`, `SchemaDriftError`, `StorageError`, `InvariantError`, and `EditMatchError`.
 
-Low-level ref operations, deterministic hashing helpers, `GrantController`, migrations, and validation functions live under the explicit `tuddofs/internal` subpath. `session.mount(key)` owns plain-path file operations, including `readStream`, `writeStream`, and `presign`. Session `edit()` uses `{ oldText, newText, replaceAll? }`; `merge({ mounts?, approver? })` returns a discriminated status for each selected ref-backed mount.
+Low-level ref operations, deterministic hashing helpers, `GrantController`, migrations, validation functions, and the sync engine live under the explicit `tuddofs/internal` subpath. `session.mount(key)` owns plain-path file operations, including `readStream`, `writeStream`, and `presign`. Session `edit()` uses `{ oldText, newText, replaceAll? }`; `merge({ mounts?, approver? })` returns a discriminated status for each selected ref-backed mount. `session.mounts()` enumerates the session's mounts with their kind, pin state, and live write mode, and `session.mount(key).capture({ writes, deletes })` commits one workspace scan of that mount as a single commit — both exist for the sync engine and are not tool verbs.
 
 The TypeScript declarations in `dist/index.d.ts` are the authoritative details for option and result shapes.
+
+## Sync engine
+
+The sync engine materializes a session's governed mounts into a real directory so shell tools work natively, and commits what they change back to the kernel. It is exported from `tuddofs/internal`:
+
+```ts
+import { createTuddoFs, type GrantResolver, type TuddoFsPool } from 'tuddofs'
+import { createLocalDirectoryTarget, createSyncEngine } from 'tuddofs/internal'
+
+declare const pool: TuddoFsPool
+declare const grants: GrantResolver
+
+const root = '/tmp/agent-workspace'
+const fs = createTuddoFs({ pool, grants })
+const session = await fs.open({
+  actor: { id: 'agent-1', tenant: 'acme' },
+  sessionId: 'run-1',
+  mounts: ['project:notes'],
+})
+const engine = createSyncEngine({
+  session,
+  target: createLocalDirectoryTarget({ root }),
+  root,
+  events: {
+    onCapture: event => console.log('committed', event.commitSha, event.paths),
+    onCaptureFailed: event => console.error('capture attempt', event.attempt, event.error),
+    onReadOnlySkipped: event => console.warn('read-only mount changed', event.mountKey, event.paths),
+  },
+})
+
+await engine.materialize() // write the branch view into the workspace
+await engine.write('project:notes', '/today.md', 'Ship safely.\n') // commits, then mirrors
+await engine.exec('grep -r TODO .') // runs a real shell, then captures what it changed
+await engine.reconcile() // authoritative end-of-turn scan, including deletions
+```
+
+The kernel stays the source of truth. A file tool commits before it touches the workspace, so a workspace that dies loses nothing already committed. Shell steps are captured asynchronously, one scan in flight at a time; the scan reports paths and mtimes, but every transfer decision is made on a server-side sha, and every captured path is re-validated against its mount's mirror directory. A scan that fails is reported through `onCaptureFailed`, never as "no changes". Deletions are applied only by `reconcile()`. Virtual mounts are never mirrored or captured.
+
+A target is the four-verb `SyncTarget` seam — `exec`, `readFile`, `writeFile`, `mkdir` — and the engine imports no target implementation and no provider SDK. Targets must provide GNU coreutils; `materialize()` probes for them and fails immediately if they are missing. Only the local-directory target ships today.
+
+**The local-directory target confines the filesystem, not the host.** Its `readFile`, `writeFile`, and `mkdir` refuse any path outside the workspace root and never follow a symlink out of it, so a governed mount cannot be used to read or overwrite host files. `exec` has no such protection: it runs a real shell as the host process user, with that user's environment, filesystem, and network. Anything that user can do, a command run through this target can do. Use it for agents and code you already trust on a machine you already trust; run untrusted code in a sandbox and give it its own target.
 
 ## Integration tests
 
