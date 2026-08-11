@@ -95,7 +95,7 @@ export interface EditOptions {
   readonly ifSha?: string | null
 }
 
-/** Presign method and checksum options for object-backed session blobs (§8.1). */
+/** Presign method and checksum options for object-backed session blobs; behavior and endpoint reachability acceptance are defined by architecture §8.1 and §8.3. */
 export interface PresignOptions {
   readonly method?: 'GET' | 'PUT'
   readonly ttlSeconds?: number
@@ -167,12 +167,12 @@ type MergeAttemptResult =
 export interface MountFileSystem {
   read(path: string): Promise<string>
   readBytes(path: string): Promise<Buffer>
-  /** Stream a blob without buffering CAS bytes (architecture §8.1). */
+  /** Stream a blob without buffering CAS bytes (architecture §8.1); the 2 GiB round-trip and flat-RSS acceptance is defined by §8.3. */
   readStream(path: string): Promise<Readable>
   write(path: string, bytes: Buffer | Uint8Array | string, options?: WriteOptions): Promise<WriteResult>
-  /** Hash, quarantine, promote, and durably commit a byte stream under §8.1 and §4.5. */
+  /** Hash, quarantine, promote, and durably commit a byte stream under §8.1 and §4.5; the 2 GiB round-trip and flat-RSS acceptance is defined by §8.3. */
   writeStream(path: string, source: Readable): Promise<WriteResult>
-  /** Issue a GET URL or checksum-enforced PUT request under architecture §8.1. */
+  /** Issue a GET URL or checksum-enforced PUT request under architecture §8.1; SigV4 endpoint-host reachability and acceptance are defined by §8.3. */
   presign(path: string, options?: PresignOptions): Promise<string | ChecksumEnforcedPresignedPut>
   edit(path: string, edits: readonly TextEdit[], options?: EditOptions): Promise<WriteResult>
   list(dir: string): Promise<readonly SessionEntry[]>

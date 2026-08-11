@@ -35,24 +35,24 @@ export interface BlobObject {
   readonly lastModified: Date | string
 }
 
-/** Checksum-enforced SigV4 PUT request issued under architecture §8.1 and §8.2. */
+/** Checksum-enforced SigV4 PUT request issued under architecture §8.1 and §8.2; endpoint-host reachability and acceptance are defined by §8.3. */
 export interface ChecksumEnforcedPresignedPut {
   readonly checksumEnforced: true
   readonly url: string
   readonly headers: Readonly<Record<'x-amz-checksum-sha256', string>>
 }
 
-/** Honest capability result for stores that cannot enforce uploaded-byte checksums (§8.2). */
+/** Honest capability result for stores that cannot enforce uploaded-byte checksums (§8.2); the direct-I/O host caveat is defined by §8.3. */
 export interface ChecksumUnsupportedPresignedPut {
   readonly checksumEnforced: false
   readonly reason?: string
 }
 
-/** Store-level PUT-presign result; callers reject the unsupported arm rather than trusting bytes (§8.2). */
+/** Store-level PUT-presign result; callers reject the unsupported arm rather than trusting bytes (§8.2), with endpoint reachability governed by §8.3. */
 export type BlobStorePresignedPut = ChecksumEnforcedPresignedPut | ChecksumUnsupportedPresignedPut
 
 /**
- * Object-storage SPI governed by architecture §8.4. Function properties keep
+ * Object-storage SPI governed by architecture §8.1, §8.3, and §8.4. Function properties keep
  * streaming parameters contravariant, so buffer-only adapters cannot satisfy
  * the interface and then receive a `Readable` from §8.1.
  */
