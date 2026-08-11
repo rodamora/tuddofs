@@ -37,10 +37,12 @@ export class GrantController {
   async resolve(actor: Actor, mount: { key: string }, options: { bypassCache?: boolean } = {}): Promise<Grant> {
     const key = `${actor.tenant}\u0000${actor.id}\u0000${mount.key}`
     const now = this.now()
+    for (const [cachedKey, cached] of this.cache) {
+      if (cached.expiresAt <= now) this.cache.delete(cachedKey)
+    }
     if (!options.bypassCache) {
       const cached = this.cache.get(key)
-      if (cached && cached.expiresAt > now) return cached.grant
-      if (cached) this.cache.delete(key)
+      if (cached) return cached.grant
     }
     let result: Grant
     try {
@@ -77,18 +79,12 @@ export class GrantController {
   }
 
   private async withTimeout<T>(promise: Promise<T>): Promise<T> {
-    const promiseConstructor = Promise as typeof Promise & {
-      withResolvers<T>(): { promise: Promise<T>; resolve(value: T): void }
-    }
-    const { promise: timeout, resolve } = promiseConstructor.withResolvers<never>()
-    const timer = setTimeout(() => resolve(undefined as never), this.timeoutMs)
+    let timer: NodeJS.Timeout | undefined
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`Grant resolver timed out after ${this.timeoutMs}ms`)), this.timeoutMs)
+    })
     try {
-      return await Promise.race([
-        promise,
-        timeout.then(() => {
-          throw new Error(`Grant resolver timed out after ${this.timeoutMs}ms`)
-        }),
-      ])
+      return await Promise.race([promise, timeout])
     } finally {
       clearTimeout(timer)
     }

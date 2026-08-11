@@ -120,7 +120,8 @@ const w = await fs.write('project:crm:/notes/plan.md', 'v2', {
 // w: { path, sha256, sizeBytes, commitSha }
 
 // edit = read head → apply structured edits → write with ifSha of what was read (§6)
-await fs.edit('project:crm:/notes/plan.md', edits)
+// TextEdit is { start, end, text }; start/end are half-open UTF-16 code-unit offsets.
+await fs.edit('project:crm:/notes/plan.md', [{ start: 0, end: 2, text: 'V2' }])
 
 await fs.delete('project:crm:/old.md')
 ```
@@ -149,6 +150,7 @@ for (const [mountKey, r] of Object.entries(results)) {
 ```
 
 - Merges are **per mount, all-or-nothing per mount**; a conflict in mount P never blocks mount Q (§4.7).
+- Session-wide `merge()` skips virtual mounts because they have no branches; addressing one directly with `resolveMerge()` still throws `NotFoundError` (§6.1).
 - Conflict resolution: an authorized actor writes the resolved content to the mount, then `fs.resolveMerge(mountKey)` — which literally re-runs the merge; converged rows classify clean (§4.7).
 - Merge is idempotent: re-running a completed merge produces no new commit.
 - `fs.discard()` abandons all of the session's branches — nothing touches the mounts, GC reclaims later.
@@ -164,10 +166,12 @@ await fs.timeline({ runId: 'r_8842' }) // everything one run did — audit view
 await fs.diff(commitA, commitB) // per-path changes
 
 await fs.tag('project:crm', 'before-cleanup') // durable label; never auto-GC'd
-await fs.restore('project:crm', 'before-cleanup') // NEW commit with the old tree — undo without rewriting
+const restored = await fs.restore('project:crm', 'before-cleanup')
+// restored: { commitSha, treeSha, created }; treeSha is the restored tree hash.
+// Repeating restore on the same tree returns created:false and creates no commit.
 ```
 
-"Restore the project to before the run" = `timeline({ runId })` → first commit → `restore(mountKey, thatCommit.parent)`.
+"Restore the project to before the run" = `timeline({ runId })` → choose the run's first commit → `restore(mountKey, first.parentShas[0])`.
 
 ## Authorization (GrantResolver SPI)
 
@@ -186,7 +190,7 @@ resolver runs.
 The contract (§5, each rule is a test in the package):
 
 1. **Fail closed.** Resolver throws or times out (5s) → treated as no access, surfaced as `GrantResolverError`. Never fail open.
-2. **Live resolution.** Cached ≤30s per `(actorId, mountKey)`; call `agentFs.invalidate(actorId, mountKey?)` on permission changes. Merge and fork always bypass the cache.
+2. **Live resolution.** Cached ≤30s per `(tenant, actorId, mountKey)`; call `agentFs.invalidate(actorId, mountKey?, tenant?)` on permission changes. Merge and fork always bypass the cache.
 3. **Permission never travels through time.** Fork checks read at fork time; writes check write at write time; merge re-resolves _inside_ the merge transaction — mid-run revocation takes effect immediately.
 4. **`staged` never escalates.** A staged writer's merge returns `'pendingApproval'`; landing it requires an approver whose live grant is `'direct'`.
 5. **Multi-worker:** `invalidate()` is per-process. Unless you transport invalidation (pub/sub), correctness rests on the 30s TTL — never lengthen it to reduce resolver load.
@@ -211,7 +215,7 @@ const rosterHandler: VirtualMountHandler = {
 }
 ```
 
-Virtual mounts have **no history, no branches, no merge** — those calls throw `NotFoundError`-family, never silently return empty. They are tool-level only: never materialized into sandboxes (§6.1.2). Authorization is the handler's job, invoked with the executing actor; fail closed.
+Virtual mounts have **no history, no branches, or direct merge** — `history/diff/restore/tag/resolveMerge` throw `NotFoundError`-family, while session-wide `merge()` skips virtual mounts. Virtual deletes are rejected because the handler SPI cannot fabricate absence from a write. They are tool-level only: never materialized into sandboxes (§6.1.2). Authorization is the handler's job, invoked with the executing actor; fail closed.
 
 ## Consumer recipes
 

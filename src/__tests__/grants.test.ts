@@ -59,3 +59,17 @@ test('grant cache expires, invalidation clears one mount, and bypass always reso
   await grants.resolve(actor, mount, { bypassCache: true })
   assert.equal(calls, 4)
 })
+test('grant cache reaps expired entries when resolving a new grant', async () => {
+  let now = 0
+  const grants = new GrantController({
+    now: () => now,
+    resolve: async () => ({ read: true, write: 'direct' }),
+  })
+  for (let index = 0; index < 25; index += 1)
+    await grants.resolve({ id: `u${index}`, tenant: 't1' }, { key: 'project:one' })
+
+  assert.equal((grants as unknown as { cache: Map<string, unknown> }).cache.size, 25)
+  now = 30_001
+  await grants.resolve({ id: 'fresh', tenant: 't1' }, { key: 'project:one' })
+  assert.equal((grants as unknown as { cache: Map<string, unknown> }).cache.size, 1)
+})

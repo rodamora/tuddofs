@@ -221,6 +221,12 @@ export interface DeleteResult {
   readonly path: string
   readonly commitSha: string
 }
+/** Result of restoring a prior tree; unchanged restores are explicit no-ops. @see spec §6 */
+export interface RestoreResult {
+  readonly commitSha: string
+  readonly treeSha: string
+  readonly created: boolean
+}
 
 export interface ReadResult {
   readonly path: string
@@ -260,7 +266,7 @@ export interface AgentFsKernel {
   write(input: WriteInput): Promise<WriteResult>
   read(input: ReadInput): Promise<ReadResult>
   delete(input: DeleteInput): Promise<DeleteResult>
-  restore(input: RestoreInput): Promise<WriteResult | null>
+  restore(input: RestoreInput): Promise<RestoreResult>
   resolveGrant(actor: Actor, mount: { key: string }, options?: GrantResolutionOptions): Promise<Grant>
   invalidate(actorId: string, mountKey?: string, tenant?: string): void
   open(input: OpenInput): Promise<SessionFileSystem>
@@ -281,6 +287,7 @@ type RefRow = {
   commit_id: string
   base_commit: string | null
   commit_sha: string
+  tree_sha: string
   kind: string
   state: string
 }
@@ -512,8 +519,8 @@ async function insertCommit(
 }
 async function loadRef(client: Queryable, tenant: string, ref: string, context: ErrorContext): Promise<RefRow> {
   const result = await client.query<RefRow>(
-    `SELECT r.commit_id::text, r.base_commit::text, c.commit_sha, r.kind, r.state
-     FROM afs_refs r JOIN afs_commits c ON c.id = r.commit_id
+    `SELECT r.commit_id::text, r.base_commit::text, c.commit_sha, t.tree_sha, r.kind, r.state
+     FROM afs_refs r JOIN afs_commits c ON c.id = r.commit_id JOIN afs_trees t ON t.id = c.tree_id
      WHERE r.tenant = $1 AND r.name = $2`,
     [tenant, ref],
   )
@@ -1510,7 +1517,7 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
     }
     throw new RefConflictError(context, maxCasRetries)
   }
-  async function restore(input: RestoreInput): Promise<WriteResult | null> {
+  async function restore(input: RestoreInput): Promise<RestoreResult> {
     const initialContext = contextFor({ tenant: input.tenant, mount: input.mount, ref: input.ref })
     validateMountKey(input.mount, initialContext)
     const context = initialContext
@@ -1531,7 +1538,7 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
         const restored = await loadTreeEntries(client, input.tenant, input.sourceCommitId, context)
         if (sameEntries(current, restored)) {
           await client.query('ROLLBACK')
-          return null
+          return { commitSha: ref.commit_sha, treeSha: ref.tree_sha, created: false }
         }
         const tree = await insertTree(client, input.tenant, restored, context)
         const createdAt = timestamp(now, context)
@@ -1561,12 +1568,7 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
         }
         await replaceHeads(client, input.tenant, input.ref, restored)
         await client.query('COMMIT')
-        return {
-          path: '/',
-          sha256: tree.sha,
-          sizeBytes: 0n,
-          commitSha: commit.sha,
-        }
+        return { commitSha: commit.sha, treeSha: tree.sha, created: true }
       } catch (error) {
         await client.query('ROLLBACK').catch(() => undefined)
         throw error

@@ -5,6 +5,7 @@ import {
   NotFoundError,
   PermissionDeniedError,
   PreconditionFailedError,
+  StorageError,
 } from './errors.js'
 import { InvalidPathError, validateMountKey, validatePath } from './validation.js'
 import type {
@@ -14,10 +15,13 @@ import type {
   DeleteResult,
   ForkResult,
   ReadResult,
+  RestoreResult,
   WriteResult,
 } from './kernel.js'
 import type { AgentFsClient } from './migration.js'
+import type { ErrorContext } from './errors.js'
 
+/** A file or directory returned by a virtual mount handler. @see spec §6.1 */
 export interface VirtualEntry {
   readonly path: string
   readonly type: 'file' | 'directory'
@@ -26,16 +30,19 @@ export interface VirtualEntry {
   readonly mode?: number
 }
 
+/** Handler SPI for live, non-versioned mount data. @see spec §6.1 */
 export interface VirtualMountHandler {
   list(dir: string, actor: Actor): Promise<readonly VirtualEntry[]>
   read(path: string, actor: Actor): Promise<Buffer | null>
   write?(path: string, bytes: Buffer, actor: Actor): Promise<void>
 }
 
+/** A ref-backed or virtual mount included in a session. @see spec §6 */
 export type MountSpec =
   | { readonly key: string; readonly mode?: 'follow' | { readonly pin: string } }
   | { readonly key: string; readonly virtual: VirtualMountHandler }
 
+/** Inputs used to open an executing actor's multi-mount session. @see spec §6 */
 export interface OpenInput {
   readonly actor: Actor
   readonly sessionId: string
@@ -47,6 +54,7 @@ export interface OpenInput {
   readonly mounts: readonly MountSpec[]
 }
 
+/** Metadata for one file path in a session. @see spec §6 */
 export interface SessionStat {
   readonly path: string
   readonly sha256: string
@@ -54,6 +62,7 @@ export interface SessionStat {
   readonly mode: number
 }
 
+/** A direct child returned by `list` or a glob match. @see spec §6 */
 export interface SessionEntry {
   readonly path: string
   readonly type: 'file' | 'directory'
@@ -62,22 +71,31 @@ export interface SessionEntry {
   readonly mode?: number
 }
 
+/**
+ * A structured text replacement applied in UTF-16 code-unit offsets.
+ * `start` and `end` are half-open offsets into the current UTF-16 string;
+ * edits are applied from the end of the string toward the beginning.
+ * @see spec §6
+ */
 export interface TextEdit {
   readonly start: number
   readonly end: number
   readonly text: string
 }
 
+/** Optimistic precondition options for `edit`. @see spec §6 */
 export interface EditOptions {
   readonly ifSha?: string | null
 }
 
+/** Optional provenance filters for timeline queries. @see spec §6 */
 export interface TimelineFilter {
   readonly runId?: string
   readonly agentKind?: string
   readonly threadId?: string
 }
 
+/** One commit that changed a requested path. @see spec §6 */
 export interface HistoryRecord {
   readonly commitSha: string
   readonly parentShas: readonly string[]
@@ -90,6 +108,7 @@ export interface HistoryRecord {
   readonly createdAt: Date
 }
 
+/** One commit and its actual tree delta. @see spec §6 */
 export interface TimelineRecord {
   readonly commitSha: string
   readonly parentShas: readonly string[]
@@ -102,6 +121,7 @@ export interface TimelineRecord {
   readonly createdAt: Date
 }
 
+/** Per-path difference between two commits. @see spec §6 */
 export interface DiffRecord {
   readonly path: string
   readonly beforeSha: string | null
@@ -110,12 +130,14 @@ export interface DiffRecord {
   readonly afterMode?: number
 }
 
+/** Per-mount merge outcome; conflicts are data, not thrown errors. @see spec §4.7 */
 export type MergeResult =
   | 'merged'
   | 'unauthorized'
   | 'pendingApproval'
   | { readonly conflicts: readonly { path: string; baseSha?: string; oursSha?: string; theirsSha?: string }[] }
 
+/** File and history operations exposed by an opened session. @see spec §6 */
 export interface SessionFileSystem {
   readonly actor: Actor
   readonly sessionId: string
@@ -132,7 +154,7 @@ export interface SessionFileSystem {
   diff(a: string, b: string): Promise<readonly DiffRecord[]>
   merge(options?: { approver?: Actor }): Promise<Readonly<Record<string, MergeResult>>>
   resolveMerge(mountKey: string, options?: { approver?: Actor }): Promise<MergeResult>
-  restore(mountKey: string, at: string): Promise<WriteResult | null>
+  restore(mountKey: string, at: string): Promise<RestoreResult>
   tag(mountKey: string, label: string): Promise<string>
   discard(): Promise<void>
 }
@@ -169,9 +191,9 @@ function bytesFor(value: Buffer | Uint8Array | string): Buffer {
   return Buffer.isBuffer(value) ? value : Buffer.from(value)
 }
 
-function pathForAddress(address: string): { mountKey: string; path: string } {
+function pathForAddress(address: string, context?: Partial<ErrorContext>): { mountKey: string; path: string } {
   const separator = address.indexOf(':/')
-  if (separator <= 0) throw new NotFoundError(`Invalid session path: ${address}`)
+  if (separator <= 0) throw new InvalidPathError(address, 'must be addressed as mount:/path', context)
   return { mountKey: address.slice(0, separator), path: address.slice(separator + 1) }
 }
 
@@ -205,8 +227,13 @@ function changedPaths(before: Map<string, Head>, after: Map<string, Head>): stri
     })
     .sort()
 }
+function sameHead(left: Head | undefined, right: Head | undefined): boolean {
+  if (!left || !right) return left === right
+  return left.sha256 === right.sha256 && left.mode === right.mode
+}
 
 type SessionKernel = Omit<AgentFsKernel, 'open'>
+/** Build the session API over a kernel and its host options. @see spec §6 */
 export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions) {
   return {
     invalidate(actorId: string, mountKey?: string, tenant?: string) {
@@ -246,7 +273,7 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
       }
 
       const mountFor = (address: string, allowRoot = false): { mount: Mount; path: string } => {
-        const parsed = pathForAddress(address)
+        const parsed = pathForAddress(address, { tenant: input.actor.tenant })
         const mount = mounts.get(parsed.mountKey)
         if (!mount)
           throw new NotFoundError(`Mount not found: ${parsed.mountKey}`, {
@@ -377,7 +404,8 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
             throw new NotFoundError(`Path not found: ${path}`, { tenant: input.actor.tenant, mount: mount.key, path })
           let bytes: Buffer
           if (row.inline) bytes = Buffer.from(row.inline)
-          else if (row.object_key && options.storage) bytes = await readAll(options, row.object_key)
+          else if (row.object_key && options.storage)
+            bytes = await readAll(options, row.object_key, { tenant: input.actor.tenant, mount: mount.key, path })
           else
             throw new NotFoundError(`Blob unavailable: ${path}`, { tenant: input.actor.tenant, mount: mount.key, path })
           return {
@@ -509,24 +537,47 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
           client.release()
         }
       }
+      const allVirtualEntries = async (mount: VirtualMount): Promise<SessionEntry[]> => {
+        const entries = new Map<string, SessionEntry>()
+        const pending = ['/']
+        const visited = new Set<string>()
+        while (pending.length > 0) {
+          const dir = pending.shift()!
+          if (visited.has(dir)) continue
+          visited.add(dir)
+          for (const entry of await mount.virtual.list(dir, input.actor)) {
+            entries.set(entry.path, entry)
+            if (entry.type === 'directory' && !visited.has(entry.path)) pending.push(entry.path)
+          }
+        }
+        return [...entries.values()].sort((a, b) => a.path.localeCompare(b.path))
+      }
 
       const resolveCommit = async (
         value: string,
         preferredMountKey?: string,
         optionsForResolution: { checkRead?: boolean } = {},
       ): Promise<{ id: string; sha: string; mountKey: string }> => {
-        const parsed = value.includes(':/') ? pathForAddress(value) : null
+        const parsed = value.includes(':/') ? pathForAddress(value, { tenant: input.actor.tenant }) : null
         if (parsed) {
           if (preferredMountKey !== undefined && preferredMountKey !== parsed.mountKey)
             throw new NotFoundError(`Commit not found in mount lineage: ${value}`, {
               tenant: input.actor.tenant,
               mount: preferredMountKey,
+              path: parsed.path,
             })
           const mount = mounts.get(parsed.mountKey)
-          if (!mount || 'virtual' in mount)
+          if (!mount)
+            throw new NotFoundError(`Mount not found: ${parsed.mountKey}`, {
+              tenant: input.actor.tenant,
+              mount: parsed.mountKey,
+              path: parsed.path,
+            })
+          if ('virtual' in mount)
             throw new NotFoundError('Virtual mount has no commits', {
               tenant: input.actor.tenant,
               mount: parsed.mountKey,
+              path: parsed.path,
             })
           if (optionsForResolution.checkRead !== false) await ensureRead(mount, { bypassCache: true })
           if (mount.mode !== 'follow') {
@@ -542,6 +593,7 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
                 throw new NotFoundError(`Commit not found: ${value}`, {
                   tenant: input.actor.tenant,
                   mount: parsed.mountKey,
+                  path: parsed.path,
                 })
               return { id: pinned.commitId, sha: row.commit_sha, mountKey: mount.key }
             } finally {
@@ -561,6 +613,7 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
               throw new NotFoundError(`Commit not found: ${value}`, {
                 tenant: input.actor.tenant,
                 mount: parsed.mountKey,
+                path: parsed.path,
               })
             const confined = await assertCommitInMountLineage(client, mount.key, row.commit_sha)
             return { id: confined.id, sha: confined.commit_sha, mountKey: mount.key }
@@ -630,13 +683,13 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
         )
       }
 
-      const unsupportedVirtual = (mountKey: string): never => {
+      const unsupportedVirtual = (mountKey: string, path?: string): never => {
         throw new NotFoundError('Virtual mount has no history or branches', {
           tenant: input.actor.tenant,
           mount: mountKey,
+          ...(path === undefined ? {} : { path }),
         })
       }
-
       return {
         actor: input.actor,
         sessionId: input.sessionId,
@@ -702,11 +755,11 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
               edit.end < edit.start ||
               edit.end > text.length
             )
-              throw new AgentFsError(
-                'Invalid edit range',
-                { tenant: input.actor.tenant, mount: mount.key, path },
-                'InvalidPathError',
-              )
+              throw new InvalidPathError(path, 'edit offsets must be integer UTF-16 code-unit ranges', {
+                tenant: input.actor.tenant,
+                mount: mount.key,
+                path,
+              })
             text = `${text.slice(0, edit.start)}${edit.text}${text.slice(edit.end)}`
           }
           return this.write(address, text, { ifSha: currentSha })
@@ -718,13 +771,13 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
           return listRef(mount, path)
         },
         async glob(address: string) {
-          const { mountKey, path } = pathForAddress(address)
+          const { mountKey, path } = pathForAddress(address, { tenant: input.actor.tenant })
           const mount = mounts.get(mountKey)
           if (!mount)
             throw new NotFoundError(`Mount not found: ${mountKey}`, { tenant: input.actor.tenant, mount: mountKey })
           if (!('virtual' in mount)) await ensureRead(mount)
           const matcher = globRegex(path)
-          const entries = 'virtual' in mount ? await mount.virtual.list('/', input.actor) : await allRefEntries(mount)
+          const entries = 'virtual' in mount ? await allVirtualEntries(mount) : await allRefEntries(mount)
           return entries.filter(entry => matcher.test(entry.path))
         },
         async stat(address: string) {
@@ -748,14 +801,11 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
         async delete(address: string, deleteOptions = {}) {
           const { mount, path } = mountFor(address)
           if ('virtual' in mount) {
-            if (!mount.virtual.write)
-              throw new PermissionDeniedError('Virtual mount is read-only', {
-                tenant: input.actor.tenant,
-                mount: mount.key,
-                path,
-              })
-            await mount.virtual.write(path, Buffer.alloc(0), input.actor)
-            return { path, commitSha: '' }
+            throw new PermissionDeniedError('Virtual mount does not support delete', {
+              tenant: input.actor.tenant,
+              mount: mount.key,
+              path,
+            })
           }
           if (mount.mode !== 'follow')
             throw new PermissionDeniedError('Pinned mount is read-only', {
@@ -777,7 +827,7 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
         },
         async history(address: string) {
           const { mount, path } = mountFor(address)
-          if ('virtual' in mount) return unsupportedVirtual(mount.key)
+          if ('virtual' in mount) return unsupportedVirtual(mount.key, path)
           await ensureRead(mount, { bypassCache: true })
           const client = await options.pool.connect()
           try {
@@ -821,8 +871,11 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
                    LEFT JOIN afs_tree_entries parent_entry
                      ON parent_entry.tree_id = parent.tree_id AND parent_entry.path = $3
                    LEFT JOIN afs_blobs parent_blob ON parent_blob.id = parent_entry.blob_id
-                   WHERE (current_entry.path = $3 OR parent_entry.path = $3)
-                     AND current_blob.sha256 IS DISTINCT FROM parent_blob.sha256
+                  WHERE (current_entry.path = $3 OR parent_entry.path = $3)
+                    AND (
+                      current_blob.sha256 IS DISTINCT FROM parent_blob.sha256
+                      OR current_entry.mode IS DISTINCT FROM parent_entry.mode
+                    )
                  )
                ORDER BY c.id DESC`,
               [input.actor.tenant, ref, path],
@@ -859,7 +912,7 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
               const tipRow = tip.rows[0]
               if (!tipRow) continue
               await assertCommitInMountLineage(client, mount.key, tipRow.commit_sha)
-              const result = await client.query<CommitRow & { changed_paths: string[] }>(
+              const result = await client.query<CommitRow & { parent_shas: string[] }>(
                 `WITH RECURSIVE lineage(id) AS (
                    SELECT r.commit_id
                    FROM afs_refs r
@@ -871,7 +924,7 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
                    CROSS JOIN LATERAL unnest(c.parents) AS parent_id
                  )
                  SELECT c.id::text, c.commit_sha, c.parents, c.op, c.author_user, c.agent_kind, c.thread_id, c.run_id, c.created_at,
-                        COALESCE((SELECT array_agg(e.path ORDER BY e.path) FROM afs_tree_entries e WHERE e.tree_id = c.tree_id), '{}') AS changed_paths
+                        COALESCE((SELECT array_agg(p.commit_sha ORDER BY p.id) FROM afs_commits p WHERE p.id = ANY(c.parents)), '{}') AS parent_shas
                  FROM lineage JOIN afs_commits c ON c.id = lineage.id
                  WHERE c.tenant = $1
                    AND ($3::text IS NULL OR c.run_id = $3)
@@ -881,10 +934,13 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
                 [input.actor.tenant, ref, filter.runId ?? null, filter.agentKind ?? null, filter.threadId ?? null],
               )
               for (const row of result.rows) {
+                const after = await readTree(client, row.id)
+                const parents = asParentArray(row.parents)
+                const before = parents[0] ? await readTree(client, parents[0]) : new Map<string, Head>()
                 records.set(row.commit_sha, {
                   commitSha: row.commit_sha,
-                  parentShas: asParentArray(row.parents),
-                  changedPaths: [...new Set(row.changed_paths ?? [])].sort(),
+                  parentShas: row.parent_shas ?? [],
+                  changedPaths: changedPaths(before, after),
                   op: row.op,
                   authorUser: row.author_user,
                   agentKind: row.agent_kind,
@@ -925,8 +981,8 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
         async merge(mergeOptions = {}) {
           const results: Record<string, MergeResult> = {}
           for (const mount of mounts.values()) {
-            if ('virtual' in mount) results[mount.key] = unsupportedVirtual(mount.key)
-            else results[mount.key] = await this.resolveMerge(mount.key, mergeOptions)
+            if ('virtual' in mount) continue
+            results[mount.key] = await this.resolveMerge(mount.key, mergeOptions)
           }
           return results
         },
@@ -1078,6 +1134,10 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
           const branch = refResult.rows[0]
           if (!branch)
             throw new NotFoundError(`Branch not found: ${mount.ref}`, { tenant: input.actor.tenant, mount: mount.key })
+          if (branch.state === 'merged') {
+            await client.query('ROLLBACK')
+            return 'merged'
+          }
           const actorGrant = await kernel.resolveGrant(input.actor, { key: mount.key }, { bypassCache: true })
           if (actorGrant.write === 'none') {
             if (branch.state === 'open') {
@@ -1123,27 +1183,41 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
           const conflicts: { path: string; baseSha?: string; oursSha?: string; theirsSha?: string }[] = []
           const merged = new Map(theirsTree)
           for (const path of new Set([...base.keys(), ...ours.keys(), ...theirsTree.keys()])) {
-            const b = base.get(path)?.sha256
-            const o = ours.get(path)?.sha256
-            const t = theirsTree.get(path)?.sha256
-            if (o === b) continue
-            if (t === b) {
+            const b = base.get(path)
+            const o = ours.get(path)
+            const t = theirsTree.get(path)
+            if (sameHead(o, b)) continue
+            if (sameHead(t, b)) {
               const value = ours.get(path)
               if (value) merged.set(path, value)
               else merged.delete(path)
               continue
             }
-            if (o === t) continue
+            if (sameHead(o, t)) continue
             conflicts.push({
               path,
-              ...(b ? { baseSha: b } : {}),
-              ...(o ? { oursSha: o } : {}),
-              ...(t ? { theirsSha: t } : {}),
+              ...(b ? { baseSha: b.sha256 } : {}),
+              ...(o ? { oursSha: o.sha256 } : {}),
+              ...(t ? { theirsSha: t.sha256 } : {}),
             })
           }
           if (conflicts.length) {
             await client.query('ROLLBACK')
             return { conflicts }
+          }
+          const mergedTreeSha = hashTree(
+            [...merged.values()].map(entry => ({ path: entry.path, mode: entry.mode, blobSha: entry.sha256 })),
+          )
+          const theirsTreeSha = hashTree(
+            [...theirsTree.values()].map(entry => ({ path: entry.path, mode: entry.mode, blobSha: entry.sha256 })),
+          )
+          if (mergedTreeSha === theirsTreeSha) {
+            await client.query(
+              `UPDATE afs_refs SET state = 'merged', settled_at = now() WHERE tenant = $1 AND name = $2`,
+              [input.actor.tenant, mount.ref],
+            )
+            await client.query('COMMIT')
+            return 'merged'
           }
           const created = await insertTreeCommit(
             client,
@@ -1177,12 +1251,17 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
   }
 }
 
-async function readAll(options: AgentFsOptions, objectKey: string): Promise<Buffer> {
-  if (!options.storage) throw new NotFoundError(`Blob unavailable: ${objectKey}`)
-  const chunks: Buffer[] = []
-  for await (const chunk of await options.storage.get(objectKey))
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
-  return Buffer.concat(chunks)
+async function readAll(options: AgentFsOptions, objectKey: string, context: ErrorContext): Promise<Buffer> {
+  if (!options.storage) throw new NotFoundError(`Blob unavailable: ${objectKey}`, context)
+  try {
+    const chunks: Buffer[] = []
+    for await (const chunk of await options.storage.get(objectKey))
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
+    return Buffer.concat(chunks)
+  } catch (error) {
+    if (error instanceof AgentFsError) throw error
+    throw new StorageError(error instanceof Error ? error.message : 'Object storage failed', context)
+  }
 }
 
 async function insertTreeCommit(

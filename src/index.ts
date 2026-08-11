@@ -27,6 +27,7 @@ export type {
   ForkInput,
   ForkResult,
   RestoreInput,
+  RestoreResult,
   GcOptions,
   GcReport,
   GrantResolutionOptions,

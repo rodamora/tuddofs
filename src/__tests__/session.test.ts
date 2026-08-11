@@ -69,5 +69,6 @@ test('virtual mounts are read-only when handler write is absent and have no hist
   await assert.rejects(session.diff('live:data:/x', 'live:data:/y'), NotFoundError)
   await assert.rejects(session.restore('live:data', 'tag/live'), NotFoundError)
   await assert.rejects(session.tag('live:data', 'snapshot'), NotFoundError)
-  await assert.rejects(session.merge(), NotFoundError)
+  assert.deepEqual(await session.merge(), {})
+  await assert.rejects(session.resolveMerge('live:data'), NotFoundError)
 })

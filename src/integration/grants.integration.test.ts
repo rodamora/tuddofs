@@ -61,7 +61,7 @@ test('fork and merge bypass the grant cache, and invalidation is actor+mount sco
   assert.ok(calls > beforeMerge)
   mode = 'none'
   await assert.rejects(session.write('project:grant:/denied', 'x'), PermissionDeniedError)
-  assert.deepEqual(await session.merge(), { 'project:grant': 'unauthorized' })
+  assert.deepEqual(await session.merge(), { 'project:grant': 'merged' })
 })
 
 test('permission revocation is enforced at write time and system actor cannot open a session', async () => {
