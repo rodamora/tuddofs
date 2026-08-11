@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { Readable, Transform } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 
-import { hashCommit, hashTree, sha256, type TreeEntry } from './hashing.js'
+import { CAS_SHA256, casObjectKey, hashCommit, hashTree, sha256, type TreeEntry } from './hashing.js'
 import {
   TuddoFsError,
   BranchSettledError,
@@ -174,6 +174,52 @@ export interface CaptureInput {
   readonly deletes: readonly string[]
 }
 
+/** What the target claims about one large changed file, before anything is bound to bytes (§8.2). */
+export interface CaptureUploadInput {
+  /** Sha the target reported for the file. A CLAIM until {@link CaptureUploadSlot.promote} binds it. */
+  readonly sha256: string
+  /** Size the target reported. A transport prefilter, exactly as mtime is a scan prefilter (§7.4). */
+  readonly sizeBytes: bigint
+  /** Presign lifetime; it has to outlast the whole transfer, which for a multi-gigabyte file is not seconds. */
+  readonly ttlSeconds?: number
+}
+
+/** The single PUT a target performs for one large captured file (§8.2). */
+export interface CaptureUploadRequest {
+  /** Presigned PUT URL. Single-quote it in any exec line: it contains `&` (§7.4). */
+  readonly url: string
+  /** Headers the presign signed; they go on the wire verbatim or the signature fails. */
+  readonly headers: Readonly<Record<string, string>>
+  /**
+   * The store itself rejects bytes whose sha differs, so the URL names the CAS
+   * key directly. When false the URL names a quarantine key and `promote`
+   * re-hashes the object server-side before it is allowed near the CAS (§8.2).
+   */
+  readonly checksumEnforced: boolean
+}
+
+/**
+ * One large captured blob's route into object storage, held open across the
+ * target-side transfer (§8.2).
+ *
+ * Existence and size are never the verification. Identity is bound either by
+ * the store refusing a mismatched signed checksum at PUT, or by the
+ * server-side re-hash `promote` runs over the quarantine object — otherwise a
+ * lying target poisons the CAS entry that every other branch dedupes against.
+ */
+export interface CaptureUploadSlot {
+  /** `null` when the CAS already holds these bytes: nothing to transfer (§4.5 HEAD-first idempotency). */
+  readonly request: CaptureUploadRequest | null
+  /**
+   * Bind the uploaded bytes to a sha and leave them at the CAS key. Returns
+   * what the STORE observed, never what the target claimed; a mismatch throws
+   * and discards the object rather than promoting it.
+   */
+  promote(): Promise<{ readonly sha256: string; readonly sizeBytes: bigint }>
+  /** Drop an abandoned, failed, or rejected upload. Never touches a CAS key. */
+  discard(): Promise<void>
+}
+
 /** Per-mount merge outcome governed by architecture §6.2. */
 export type MergeResult =
   | { readonly status: 'merged' | 'unauthorized' | 'pendingApproval' }
@@ -215,6 +261,12 @@ export interface MountFileSystem {
    * engine calls it with bytes it fetched and re-hashed itself.
    */
   capture(input: CaptureInput): Promise<CaptureResult>
+  /**
+   * Open a target-direct upload for one large captured file, so its bytes never
+   * pass through server memory (§8.2, §8.3). Not a tool verb: like
+   * {@link MountFileSystem.capture}, the sync engine is the caller.
+   */
+  beginCaptureUpload(input: CaptureUploadInput): Promise<CaptureUploadSlot>
 }
 
 /** Open-session metadata and history controls defined by architecture §6.2. */
@@ -275,8 +327,6 @@ function bytesFor(value: Buffer | Uint8Array | string): Buffer {
   return Buffer.isBuffer(value) ? value : Buffer.from(value)
 }
 
-const CAS_SHA256 = /^[a-f0-9]{64}$/u
-
 function checksumHeaderForCasSha(value: string, context: ErrorContext): string {
   if (!CAS_SHA256.test(value)) throw new StorageError('PUT presigns require a lowercase hexadecimal sha256', context)
   return Buffer.from(value, 'hex').toString('base64')
@@ -317,6 +367,14 @@ function escapeLike(value: string): string {
 /** Merge grants are refreshed after 100ms of pool wait to bound authorization staleness. */
 const MERGE_GRANT_FRESHNESS_MS = 100
 
+/**
+ * Default presign lifetime for a §8.2 capture upload. An hour, not the 15
+ * minutes a read presign gets: the URL has to outlive a multi-gigabyte transfer
+ * over whatever link the target happens to have, and an expiry mid-upload is a
+ * capture failure the engine can only answer by transferring it all again.
+ */
+const DEFAULT_CAPTURE_UPLOAD_TTL_SECONDS = 3_600
+
 function changedPaths(before: Map<string, Head>, after: Map<string, Head>): string[] {
   const paths = new Set([...before.keys(), ...after.keys()])
   return [...paths]
@@ -351,8 +409,13 @@ type SessionKernel = Omit<TuddoFsKernel, 'open'> & {
     work: (commit: (input: SessionStoredWriteInput) => Promise<WriteResult>) => Promise<T>,
   ): Promise<T>
 }
-/** Build the session API over a kernel and its host options. */
+/**
+ * Build the session API over a kernel and its host options. `inlineMaxBytes` is
+ * already resolved by {@link createTuddoFs}; the fallback here only covers a
+ * hand-built kernel in a test.
+ */
 export function createSessionApi(kernel: SessionKernel, options: TuddoFsOptions) {
+  const inlineMaxBytes = BigInt(options.inlineMaxBytes ?? 131_072)
   return {
     invalidate(actorId: string, mountKey?: string, tenant?: string) {
       kernel.invalidate(actorId, mountKey, tenant)
@@ -717,7 +780,7 @@ export function createSessionApi(kernel: SessionKernel, options: TuddoFsOptions)
               throw error
             }
             const contentSha = digest.digest('hex')
-            if (sizeBytes <= BigInt(options.inlineMaxBytes ?? 131_072)) {
+            if (sizeBytes <= inlineMaxBytes) {
               const chunks: Buffer[] = []
               for await (const chunk of await storage.get(quarantineKey))
                 chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array))
@@ -855,6 +918,159 @@ export function createSessionApi(kernel: SessionKernel, options: TuddoFsOptions)
           }
         } finally {
           client.release()
+        }
+      }
+
+      /**
+       * The §8.2 capture route for one large blob. Two arms, chosen by what the
+       * store can actually promise:
+       *
+       * - The store enforces the signed `x-amz-checksum-sha256`, so the PUT is
+       *   presigned against the CAS key itself and the store refuses any body
+       *   whose digest differs. Promotion is then a no-op and the transfer
+       *   happens exactly once.
+       * - The store cannot enforce anything, so the PUT is presigned against a
+       *   quarantine key and `promote` re-hashes the object from a GET stream
+       *   before a server-side copy places it in the CAS. A store that cannot
+       *   even presign an unverified PUT gets no third arm: the capture fails
+       *   loudly instead of quietly relaying bytes the host did not ask to pay
+       *   for (§8.3).
+       *
+       * The grant is re-resolved live, bypassing the ≤30s cache, for the same
+       * reason `capture` does it: the input came off an untrusted target.
+       */
+      const beginCaptureUpload = async (
+        mountKey: string,
+        uploadInput: CaptureUploadInput,
+      ): Promise<CaptureUploadSlot> => {
+        const mount = mounts.get(mountKey)
+        if (!mount)
+          throw new NotFoundError(`Mount not found: ${mountKey}`, { tenant: input.actor.tenant, mount: mountKey })
+        const context = { tenant: input.actor.tenant, mount: mount.key }
+        if ('virtual' in mount) throw new PermissionDeniedError('Virtual mounts are never captured', context)
+        if (mount.mode !== 'follow') throw new PermissionDeniedError('Pinned mount is read-only', context)
+        const grant = await kernel.resolveGrant(input.actor, { key: mount.key }, { bypassCache: true })
+        if (grant.write === 'none') throw new PermissionDeniedError('Write permission denied', context)
+        const storage = options.storage
+        if (!storage) throw new StorageError('Direct-upload capture requires an object storage backend', context)
+        const claimedSha = uploadInput.sha256
+        const checksumHeader = checksumHeaderForCasSha(claimedSha, context)
+        if (uploadInput.sizeBytes <= inlineMaxBytes) {
+          throw new StorageError(
+            `Direct-upload capture is for blobs above the ${inlineMaxBytes}-byte inline threshold`,
+            context,
+          )
+        }
+        const casKey = casObjectKey(input.actor.tenant, claimedSha)
+
+        const storageFailure = (error: unknown): never => {
+          if (error instanceof TuddoFsError) throw error
+          throw new StorageError(error instanceof Error ? error.message : 'Object storage failed', context)
+        }
+        /** Size straight from the store, so a target that lied about length cannot reach the tree. */
+        const observeCas = async (): Promise<{ sha256: string; sizeBytes: bigint }> => {
+          const head = await storage.head(casKey).catch(storageFailure)
+          if (!head) throw new StorageError(`Direct-upload capture found no object at ${casKey}`, context)
+          return { sha256: claimedSha, sizeBytes: BigInt(head.sizeBytes) }
+        }
+
+        if (await storage.head(casKey).catch(storageFailure)) {
+          // HEAD-first idempotency, exactly as the §4.5 write path: this sha is
+          // already in the CAS, so there is nothing to transfer and nothing to
+          // verify that was not verified when it was first stored.
+          return { request: null, promote: observeCas, discard: () => Promise.resolve() }
+        }
+        if (!storage.presignPut)
+          throw new StorageError('Direct-upload capture requires PUT presigning from object storage', context)
+
+        const ttlSeconds = uploadInput.ttlSeconds ?? DEFAULT_CAPTURE_UPLOAD_TTL_SECONDS
+        if (!Number.isInteger(ttlSeconds) || ttlSeconds <= 0)
+          throw new StorageError('Capture upload TTL must be a positive integer', context)
+        // Ask for the CAS key first: an enforcing store answers with a URL no
+        // wrong byte can satisfy, and that is one presign and one transfer. A
+        // store that answers "cannot enforce" gets its URL DROPPED here,
+        // unused and never handed to a target — an unverified PUT aimed at a
+        // CAS key is the poisoning primitive §8.2 exists to prevent — and the
+        // quarantine arm below takes over.
+        const enforced = await storage
+          .presignPut(casKey, { ttlSeconds, checksumSha256: checksumHeader })
+          .catch(storageFailure)
+        if (enforced.checksumEnforced) {
+          if (enforced.headers['x-amz-checksum-sha256'] !== checksumHeader || !signsChecksumHeader(enforced.url))
+            throw new StorageError('Object storage did not sign the required x-amz-checksum-sha256 header', context)
+          return {
+            request: { url: enforced.url, headers: enforced.headers, checksumEnforced: true },
+            // Nothing to promote: the store refused every body but this sha's,
+            // so the CAS key already holds bytes bound to it.
+            promote: observeCas,
+            // Never delete the CAS key on failure. A rejected PUT wrote nothing,
+            // and a concurrent capture of the same sha may legitimately own it.
+            discard: () => Promise.resolve(),
+          }
+        }
+
+        // Bound, not detached: a class-based adapter's `copy` needs its store.
+        const copyObject = storage.copy?.bind(storage)
+        if (!copyObject)
+          throw new StorageError('Quarantined capture upload requires server-side object copy support', context)
+        const quarantineKey = `tuddo/${input.actor.tenant}/quarantine/${randomUUID()}`
+        const unverified = await storage
+          .presignPut(quarantineKey, { ttlSeconds, checksumSha256: checksumHeader })
+          .catch(storageFailure)
+        // A store that enforces for one key and not another is incoherent, and
+        // one that cannot presign an unverified PUT has no fallback to offer.
+        if (unverified.checksumEnforced || !unverified.url) {
+          throw new StorageError(
+            `Object storage cannot presign a quarantined capture upload${
+              !unverified.checksumEnforced && unverified.reason ? `: ${unverified.reason}` : ''
+            }`,
+            context,
+          )
+        }
+        const discard = async (): Promise<void> => {
+          try {
+            await storage.delete(quarantineKey)
+          } catch (error) {
+            const cleanup = { ...context, objectKey: quarantineKey, operation: 'quarantine-cleanup' }
+            if (options.logger) options.logger.error(error, cleanup)
+            else console.error('TuddoFs quarantine cleanup failed', error, cleanup)
+          }
+        }
+        return {
+          request: { url: unverified.url, headers: {}, checksumEnforced: false },
+          async promote() {
+            const digest = createHash('sha256')
+            let sizeBytes = 0n
+            try {
+              for await (const chunk of await storage.get(quarantineKey)) {
+                const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array)
+                digest.update(bytes)
+                sizeBytes += BigInt(bytes.length)
+              }
+            } catch (error) {
+              await discard()
+              return storageFailure(error)
+            }
+            const observed = digest.digest('hex')
+            if (observed !== claimedSha) {
+              // §8.2's whole point: the target claimed one sha and uploaded
+              // other bytes. They never reach a CAS key.
+              await discard()
+              throw new StorageError(
+                `Quarantined capture upload hashed to ${observed}, not the claimed ${claimedSha}`,
+                context,
+              )
+            }
+            try {
+              await copyObject(quarantineKey, casKey)
+            } catch (error) {
+              await discard()
+              return storageFailure(error)
+            }
+            await discard()
+            return { sha256: observed, sizeBytes }
+          },
+          discard,
         }
       }
 
@@ -1128,6 +1344,7 @@ export function createSessionApi(kernel: SessionKernel, options: TuddoFsOptions)
         delete(mountKey: string, path: string, options?: { ifSha?: string | null }): Promise<DeleteResult>
         history(mountKey: string, path: string): Promise<readonly HistoryRecord[]>
         capture(mountKey: string, captureInput: CaptureInput): Promise<CaptureResult>
+        beginCaptureUpload(mountKey: string, uploadInput: CaptureUploadInput): Promise<CaptureUploadSlot>
       }
       const sessionOps: SessionOperations = {
         actor: input.actor,
@@ -1153,6 +1370,7 @@ export function createSessionApi(kernel: SessionKernel, options: TuddoFsOptions)
             delete: (path, deleteOptions) => sessionOps.delete(key, path, deleteOptions),
             history: (path: string) => sessionOps.history(key, path),
             capture: (captureInput: CaptureInput) => sessionOps.capture(key, captureInput),
+            beginCaptureUpload: (uploadInput: CaptureUploadInput) => sessionOps.beginCaptureUpload(key, uploadInput),
           }
         },
         async read(mountKey: string, path: string) {
@@ -1351,6 +1569,8 @@ export function createSessionApi(kernel: SessionKernel, options: TuddoFsOptions)
             runId: input.attribution?.runId,
           })
         },
+        beginCaptureUpload: (mountKey: string, uploadInput: CaptureUploadInput) =>
+          beginCaptureUpload(mountKey, uploadInput),
         async history(mountKey: string, rawPath: string) {
           const { mount, path } = mountFor(mountKey, rawPath)
           if ('virtual' in mount) return unsupportedVirtual(mount.key, path)

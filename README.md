@@ -255,6 +255,34 @@ Every interpolated value — path, filename, command — is single-quoted for th
 
 There is no connection pooling: one ssh invocation per verb. A host that wants multiplexing passes it through as ordinary ssh configuration, for example `sshOptions: ['ControlMaster=auto', 'ControlPath=/tmp/tuddofs-%C', 'ControlPersist=60']`.
 
+### Large blobs in capture
+
+By default every changed file is pulled back through the server with `readFile`. Set `largeBlobs.transport` to `'presigned'` and files at or above `largeBlobs.thresholdBytes` (8 MiB by default) instead go straight from the target to object storage, over a presigned PUT run by `curl` inside the target — the server only ever holds the sha:
+
+```ts
+import { createLocalDirectoryTarget, createSyncEngine } from 'tuddofs/internal'
+import type { SessionFileSystem } from 'tuddofs'
+
+declare const session: SessionFileSystem
+declare const root: string
+
+const engine = createSyncEngine({
+  session,
+  target: createLocalDirectoryTarget({ root }),
+  root,
+  largeBlobs: { transport: 'presigned', thresholdBytes: 8 * 1024 * 1024 },
+})
+
+await engine.materialize()
+await engine.exec('curl -sSL https://example.invalid/dataset.tar > dataset.tar')
+```
+
+The claimed sha is bound to the bytes that actually landed, never trusted: a store that enforces `x-amz-checksum-sha256` refuses any other body at the PUT, and a store that cannot enforce it receives the upload at a quarantine key that is re-hashed server-side before a server-side copy places it in the CAS. Existence and size are not verification. The commit takes its length from the store, so a target cannot lie about size either, and a sha already in the CAS skips the transfer entirely. `materialize()` extends its probe to `stat` and `curl` when this transport is selected.
+
+Which transport to use is the host's call and cannot be detected from here: SigV4 presigned URLs embed the endpoint host, so target-direct upload requires the blob endpoint to be reachable from the _target's_ network. A LAN-only MinIO behind a remote sandbox is exactly the case `'relay'` exists for. A `'presigned'` engine whose store cannot presign fails the capture loudly rather than quietly relaying gigabytes the host did not ask to pay for.
+
+**The local-directory target confines the filesystem, not the host.** Its `readFile`, `writeFile`, and `mkdir` refuse any path outside the workspace root and never follow a symlink out of it, so a governed mount cannot be used to read or overwrite host files. `exec` has no such protection: it runs a real shell as the host process user, with that user's environment, filesystem, and network. Anything that user can do through this target can do. Use it for agents and code you already trust on a machine you already trust; run untrusted code in a sandbox and give it its own target.
+
 ## Integration tests
 
 Unit tests are hermetic and do not require PostgreSQL:
@@ -289,14 +317,14 @@ TUDDOFS_DATABASE_URL="postgresql://tuddofs:tuddofs@127.0.0.1:${TUDDOFS_IT_PORT:-
 docker rm --force tuddofs-it
 ```
 
-The streaming acceptance suite starts and stops a pinned MinIO testcontainer itself. It defaults to a 2 GiB round trip, samples RSS continuously through upload and download, asserts a 384 MiB growth ceiling, verifies MinIO's real checksum-enforced PUT behavior, and removes its objects afterward. Supply only the disposable PostgreSQL URL:
+The MinIO acceptance suites start and stop a pinned MinIO testcontainer themselves. One covers session streaming, the other the sync capture path. Both default to a 2 GiB transfer, sample RSS continuously, assert a 384 MiB growth ceiling, verify MinIO's real checksum-enforced PUT behavior against a lying uploader, and remove their objects afterward. Supply only the disposable PostgreSQL URL:
 
 ```bash
 TUDDOFS_DATABASE_URL="postgresql://tuddofs:tuddofs@127.0.0.1:${TUDDOFS_IT_PORT:-55771}/tuddofs_it" \
   npm run test:minio
 ```
 
-Set `TUDDOFS_MINIO_STREAM_BYTES` to a positive byte count only for a smaller CI smoke run; the acceptance default remains exactly 2,147,483,648 bytes. The suite fails loudly rather than skipping when PostgreSQL or Docker is unavailable.
+Set `TUDDOFS_MINIO_STREAM_BYTES` or `TUDDOFS_MINIO_CAPTURE_BYTES` to a positive byte count only for a smaller CI smoke run; the acceptance default for both remains exactly 2,147,483,648 bytes, and the capture size must be a whole number of MiB. The suites fail loudly rather than skipping when PostgreSQL or Docker is unavailable.
 
 SigV4 presigned URLs embed their endpoint host. Client-direct I/O therefore requires the blob endpoint to be reachable from the client's network; otherwise the host must use the server-relay streaming path.
 

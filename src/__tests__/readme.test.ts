@@ -47,3 +47,7 @@ test('README sync-engine example compiles against the internal entry', async () 
 test('README SSH target example compiles against the internal entry', async () => {
   await compileReadmeBlock(/### SSH target[\s\S]*?```ts\n([\s\S]*?)\n```/u, '.readme-ssh.ts')
 })
+
+test('README large-blob capture example compiles against the internal entry', async () => {
+  await compileReadmeBlock(/### Large blobs in capture[\s\S]*?```ts\n([\s\S]*?)\n```/u, '.readme-large-blobs.ts')
+})

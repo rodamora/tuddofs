@@ -51,7 +51,7 @@
     "test": "npm run test:core && npm run test:s3",
     "test:core": "node scripts/run-tests.mjs unit",
     "test:integration": "node scripts/run-tests.mjs integration",
-    "test:minio": "node --import tsx --test scripts/minio-streaming.test.ts",
+    "test:minio": "node --import tsx --test --test-concurrency=1 scripts/minio-streaming.test.ts scripts/minio-capture.test.ts",
     "test:s3": "npm test --workspace @tuddofs/s3",
     "test:s3:contract": "npm run test:contract --workspace @tuddofs/s3",
     "test:ssh": "node --import tsx --test src/integration/sync-ssh-target.ssh.test.ts",

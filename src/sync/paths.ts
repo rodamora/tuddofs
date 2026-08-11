@@ -44,8 +44,26 @@ export interface ScanCommandInput {
   readonly newerThanStamp: boolean
 }
 
+/** A single `stat --printf` record resolved back to its mount and kernel path. */
+export interface SizeRecord {
+  readonly mountKey: string
+  readonly path: string
+  readonly sizeBytes: number
+}
+
+/** Inputs for the §8.2 target-direct upload exec. */
+export interface UploadCommandInput {
+  /** Mirror path of the file, absolute or relative to the root; re-checked either way. */
+  readonly path: string
+  /** Presigned PUT URL, quoted by {@link uploadCommand} because it contains `&`. */
+  readonly url: string
+  /** Headers the presign signed; sent verbatim or the signature does not match. */
+  readonly headers: Readonly<Record<string, string>>
+}
+
 const COLON_ENCODING = '%3A'
 const HEX_SHA256 = /^[0-9a-f]{64}$/u
+const DECIMAL_SIZE = /^(?:0|[1-9][0-9]*)$/u
 
 /**
  * How far behind the scan start the stamp is set. Filesystem timestamps come
@@ -97,9 +115,18 @@ export function resolveUnderRoot(root: string, candidate: string): string {
   return resolved
 }
 
-/** GNU coreutils probe run at acquire so capture cannot fail silently later (§7.3 phase 1 step 1). */
-export function probeCommand(): string {
-  return 'sha256sum --version && find --version'
+/**
+ * GNU coreutils probe run at acquire so capture cannot fail silently later
+ * (§7.3 phase 1 step 1).
+ *
+ * `directUpload` adds the two binaries the §8.2 path cannot work without:
+ * `stat` sizes the changed set and `curl` performs the presigned PUT. A target
+ * missing either would capture happily until the first large file, then fail
+ * mid-turn — which is exactly the silence this probe exists to prevent.
+ */
+export function probeCommand(options: { directUpload?: boolean } = {}): string {
+  const base = 'sha256sum --version && find --version'
+  return options.directUpload ? `${base} && stat --version && curl --version` : base
 }
 
 /**
@@ -161,6 +188,48 @@ export function scanCommand(input: ScanCommandInput): string {
 }
 
 /**
+ * Sizes for the files the scan just hashed, so capture can decide which ones
+ * take the §8.2 direct-upload path.
+ *
+ * It reads back the SAME NUL-terminated list `find` wrote for the scan. That is
+ * the whole design: no agent-controlled filename is interpolated into the
+ * command, there is no `ARG_MAX` ceiling on the changed set, and the sizes
+ * describe exactly the files whose shas the engine just diffed. A file removed
+ * between the two execs fails `stat` and therefore the whole command, matching
+ * how the scan itself already behaves — a failed scan is an error, never an
+ * empty diff (§7.2).
+ */
+export function sizeCommand(root: string): string {
+  return (
+    `cd ${quoteShellArg(root)} && ` + `xargs -0 -r stat --printf='%s\\0%n\\0' < ${quoteShellArg(SCAN_LIST_FILENAME)}`
+  )
+}
+
+/**
+ * The §8.2 upload exec: one presigned PUT, streamed off disk by `curl`.
+ *
+ * `--upload-file` is load-bearing. It makes curl stream the file with a
+ * `Content-Length` taken from `stat`, so a 2 GB blob never lands in a shell
+ * buffer, in curl's memory, or in the server's (§8.3).
+ *
+ * Everything interpolated is single-quoted and the path is re-checked against
+ * the root before the line exists at all. A presigned URL carries `&` and `;`,
+ * either of which ends the command early unquoted; a path outside the root
+ * would turn this into an exfiltration primitive with a network attached, which
+ * is the symlink hazard of §7.4 pointed outward.
+ */
+export function uploadCommand(root: string, input: UploadCommandInput): string {
+  const target = quoteShellArg(resolveUnderRoot(root, input.path))
+  const headers = Object.entries(input.headers)
+    .map(([name, value]) => `--header ${quoteShellArg(`${name}: ${value}`)} `)
+    .join('')
+  return (
+    `curl --silent --show-error --fail --write-out '%{http_code}' ` +
+    `${headers}--upload-file ${target} ${quoteShellArg(input.url)}`
+  )
+}
+
+/**
  * Move the stamp back to the instant the scan started, so files written during
  * the scan re-appear next cycle and sha-diffing makes the re-capture a no-op
  * (§7.3 phase 3 step 6). The same command sets the acquire watermark at the end
@@ -194,12 +263,35 @@ export function stampCommand(root: string, scanStartEpochMs: number): string {
 }
 
 /**
- * Parse `sha256sum --zero` output into mount-scoped kernel paths.
+ * Resolve one target-reported mirror-relative path back to its mount and kernel
+ * path, refusing anything that escapes a materialized mount directory.
  *
+ * Every record a target produces goes through here — scan shas and stat sizes
+ * alike — because both come out of the same untrusted `find` list (§7.3 step 2).
  * `mirrorDirs` maps mirror directory name to mount key and contains ref-backed
  * mounts only, so a record under a virtual mount's directory is rejected exactly
  * like any other unknown directory (§6.1).
  */
+function resolveMirrorRecord(
+  relative: string,
+  mirrorDirs: ReadonlyMap<string, string>,
+): { mountKey: string; path: string } {
+  const segments = relative.split('/')
+  if (
+    relative.startsWith('/') ||
+    segments.length < 2 ||
+    segments.some(segment => segment === '' || segment === '.' || segment === '..')
+  ) {
+    throw new InvalidPathError(relative, 'target path must be a file strictly under a mount mirror directory')
+  }
+  const mountKey = mirrorDirs.get(segments[0])
+  if (mountKey === undefined) {
+    throw new InvalidPathError(relative, 'target path escapes every materialized mount directory')
+  }
+  return { mountKey, path: validatePath(`/${segments.slice(1).join('/')}`, { mount: mountKey }) }
+}
+
+/** Parse `sha256sum --zero` output into mount-scoped kernel paths (§7.3 phase 3 step 2). */
 export function parseScanRecords(output: string, mirrorDirs: ReadonlyMap<string, string>): readonly ScanRecord[] {
   if (output.length === 0) return []
   if (!output.endsWith('\0')) {
@@ -210,24 +302,37 @@ export function parseScanRecords(output: string, mirrorDirs: ReadonlyMap<string,
     if (raw.length < 67 || !HEX_SHA256.test(raw.slice(0, 64)) || raw.slice(64, 66) !== '  ') {
       throw new InvalidPathError(raw, 'scan record is not a sha256sum --zero record')
     }
-    const relative = raw.slice(66)
-    const segments = relative.split('/')
-    if (
-      relative.startsWith('/') ||
-      segments.length < 2 ||
-      segments.some(segment => segment === '' || segment === '.' || segment === '..')
-    ) {
-      throw new InvalidPathError(relative, 'scan path must be a file strictly under a mount mirror directory')
+    const resolved = resolveMirrorRecord(raw.slice(66), mirrorDirs)
+    records.push({ mountKey: resolved.mountKey, path: resolved.path, sha256: raw.slice(0, 64) })
+  }
+  return records
+}
+
+/**
+ * Parse `stat --printf='%s\0%n\0'` output into mount-scoped kernel paths.
+ *
+ * Sizes are a transport prefilter and nothing more — commit identity comes from
+ * the store, never from this number (§8.2) — but the records still go through
+ * the same mount-escape checks as the scan, because they come from the same
+ * untrusted target.
+ */
+export function parseSizeRecords(output: string, mirrorDirs: ReadonlyMap<string, string>): readonly SizeRecord[] {
+  if (output.length === 0) return []
+  if (!output.endsWith('\0')) {
+    throw new InvalidPathError(undefined, 'size output is not NUL-terminated')
+  }
+  const fields = output.slice(0, -1).split('\0')
+  if (fields.length % 2 !== 0) {
+    throw new InvalidPathError(undefined, 'size output is not a sequence of size/path pairs')
+  }
+  const records: SizeRecord[] = []
+  for (let index = 0; index < fields.length; index += 2) {
+    const rawSize = fields[index]
+    if (!DECIMAL_SIZE.test(rawSize)) {
+      throw new InvalidPathError(rawSize, 'size record is not a stat --printf size')
     }
-    const mountKey = mirrorDirs.get(segments[0])
-    if (mountKey === undefined) {
-      throw new InvalidPathError(relative, 'scan path escapes every materialized mount directory')
-    }
-    records.push({
-      mountKey,
-      path: validatePath(`/${segments.slice(1).join('/')}`, { mount: mountKey }),
-      sha256: raw.slice(0, 64),
-    })
+    const resolved = resolveMirrorRecord(fields[index + 1], mirrorDirs)
+    records.push({ mountKey: resolved.mountKey, path: resolved.path, sizeBytes: Number(rawSize) })
   }
   return records
 }

@@ -55,10 +55,13 @@ import {
   hydrationManifestCommand,
   mirrorDirName,
   parseScanRecords,
+  parseSizeRecords,
   probeCommand,
   resolveUnderRoot,
   scanCommand,
+  sizeCommand,
   stampCommand,
+  uploadCommand,
 } from './paths.js'
 import { CaptureSlot } from './slot.js'
 import type { ExecOptions, ExecResult, SyncTarget } from './target.js'
@@ -68,6 +71,33 @@ export interface SyncEngineEvents {
   onCapture(event: { mountKey: string; commitSha: string; paths: readonly string[] }): void
   onCaptureFailed(event: { mountKey?: string; attempt: number; error: Error }): void
   onReadOnlySkipped(event: { mountKey: string; paths: readonly string[] }): void
+}
+
+/**
+ * How large changed files reach object storage (§8.2, §8.3).
+ *
+ * The choice is the host's and it is not guessable from here: presigned URLs
+ * embed the endpoint host in the SigV4 signature, so target-direct upload works
+ * only when the target's network can reach the blob endpoint. A LAN-only MinIO
+ * behind a remote sandbox cannot, and there is no probe that distinguishes
+ * "unreachable" from "slow" in time to be useful mid-capture. So the transport
+ * is declared, and a `presigned` engine that cannot presign fails loudly rather
+ * than relaying gigabytes through the server behind the host's back.
+ */
+export interface LargeBlobOptions {
+  /**
+   * `relay` (the default) pulls every changed file through the server with
+   * `readFile`, which is the §8.3 downgrade and the pre-§8.2 behaviour.
+   * `presigned` sends files at or above the threshold straight from the target
+   * to the store.
+   */
+  readonly transport?: 'relay' | 'presigned'
+  /** Files this size or larger take the direct path; smaller ones stay on `readFile`. */
+  readonly thresholdBytes?: number
+  /** Presign lifetime; it has to outlast the whole transfer. */
+  readonly ttlSeconds?: number
+  /** Wall-clock cap on one upload exec; the default is generous because the file may be gigabytes. */
+  readonly uploadTimeoutMs?: number
 }
 
 /** Construction inputs for {@link createSyncEngine}. */
@@ -83,6 +113,8 @@ export interface SyncEngineOptions {
   readonly verifySampleSize?: number
   /** Receives host-callback failures; without one they go to `console.error`, exactly as the kernel's `onCommit` hook does. */
   readonly logger?: TuddoFsLogger
+  /** Large-blob transport (§8.2); omitted means the §8.3 server-relay downgrade. */
+  readonly largeBlobs?: LargeBlobOptions
 }
 
 /** The disk-level runtime for one session against one target. */
@@ -110,6 +142,17 @@ export interface SyncEngine {
 }
 
 const DEFAULT_VERIFY_SAMPLE_SIZE = 3
+
+/**
+ * Default direct-upload threshold: 8 MiB. Comfortably above the kernel's 128
+ * KiB inline ceiling, so no file can be both "direct upload" and "inline", and
+ * high enough that the two extra round trips a presign costs are noise against
+ * the transfer they replace.
+ */
+const DEFAULT_LARGE_BLOB_THRESHOLD_BYTES = 8 * 1024 * 1024
+
+/** One upload exec may be moving gigabytes over an arbitrary link; an hour, not the two-minute exec default. */
+const DEFAULT_UPLOAD_TIMEOUT_MS = 3_600_000
 
 type IndexEntry = {
   /** Sha the engine believes the mirror holds. */
@@ -158,6 +201,19 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
   const events = options.events ?? {}
   const now = options.now ?? (() => Date.now())
   const verifySampleSize = options.verifySampleSize ?? DEFAULT_VERIFY_SAMPLE_SIZE
+  const directUpload = options.largeBlobs?.transport === 'presigned'
+  const thresholdBytes = options.largeBlobs?.thresholdBytes ?? DEFAULT_LARGE_BLOB_THRESHOLD_BYTES
+  const uploadTtlSeconds = options.largeBlobs?.ttlSeconds
+  const uploadTimeoutMs = options.largeBlobs?.uploadTimeoutMs ?? DEFAULT_UPLOAD_TIMEOUT_MS
+  // Bad transport settings are a host mistake, and the only honest time to say
+  // so is now: a threshold discovered to be nonsense mid-capture surfaces as a
+  // failed turn instead of a failed construction.
+  if (!Number.isSafeInteger(thresholdBytes) || thresholdBytes <= 0)
+    throw new InvariantError(`largeBlobs.thresholdBytes must be a positive safe integer, got ${thresholdBytes}`)
+  if (uploadTtlSeconds !== undefined && (!Number.isInteger(uploadTtlSeconds) || uploadTtlSeconds <= 0))
+    throw new InvariantError(`largeBlobs.ttlSeconds must be a positive integer, got ${uploadTtlSeconds}`)
+  if (!Number.isFinite(uploadTimeoutMs) || uploadTimeoutMs <= 0)
+    throw new InvariantError(`largeBlobs.uploadTimeoutMs must be a positive number, got ${uploadTimeoutMs}`)
 
   const index = new Map<string, Map<string, IndexEntry>>()
   const pendingMirrorWrites = new Set<PendingMirrorWrite>()
@@ -238,8 +294,8 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
     return resolveUnderRoot(root, posix.join(mirrorDirName(mountKey), path.slice(1)))
   }
 
-  const runExec = async (cmd: string, what: string): Promise<ExecResult> => {
-    const result = await target.exec(cmd)
+  const runExec = async (cmd: string, what: string, execOptions?: ExecOptions): Promise<ExecResult> => {
+    const result = await target.exec(cmd, execOptions)
     if (result.exitCode !== 0) {
       throw new SyncTargetError(`${what} failed`, { exitCode: result.exitCode, output: result.output })
     }
@@ -332,9 +388,10 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
   }
 
   async function materialize(): Promise<void> {
-    // GNU coreutils are required: busybox lacks `--zero`. Fail at acquire, not
-    // silently at capture (§7.3 phase 1 step 1).
-    await runExec(probeCommand(), 'GNU coreutils probe')
+    // GNU coreutils are required: busybox lacks `--zero`. With the §8.2
+    // transport, `stat` and `curl` join them. Fail at acquire, not silently at
+    // capture (§7.3 phase 1 step 1).
+    await runExec(probeCommand({ directUpload }), 'GNU coreutils probe')
     const state = await runExec(hydrationManifestCommand(root), 'workspace state probe')
     const lines = state.output.split('\n').filter(Boolean)
     const stampPresent = lines.includes(STAMP_FILENAME)
@@ -486,6 +543,56 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
   }
 
   /**
+   * Move one large changed file from the target into object storage without it
+   * passing through this process (§8.2, §8.3).
+   *
+   * The claimed sha is what the scan reported and nothing has bound it to
+   * anything yet. `promote` is what does: with an enforcing store the PUT
+   * itself refuses any body whose digest differs, and without one the object
+   * lands in quarantine and is re-hashed server-side before it is allowed near
+   * a CAS key. What comes back is the STORE's view — sha and length both — so a
+   * target that lied about either cannot reach the tree.
+   *
+   * Nothing here is caught. A failed upload fails the capture cycle, which
+   * releases the slot, fires `onCaptureFailed` and leaves the stamp untouched
+   * so the next cycle sees the same file again (§7.2, §7.3 phase 3). The only
+   * thing the failure path owes is the quarantine object, and `discard` is what
+   * settles it.
+   */
+  const uploadCaptured = async (
+    mountKey: string,
+    path: string,
+    mirror: string,
+    claimedSha: string,
+    claimedSize: bigint,
+  ): Promise<{ sha256: string; sizeBytes: bigint }> => {
+    const slot = await session.mount(mountKey).beginCaptureUpload({
+      sha256: claimedSha,
+      sizeBytes: claimedSize,
+      ...(uploadTtlSeconds === undefined ? {} : { ttlSeconds: uploadTtlSeconds }),
+    })
+    try {
+      if (slot.request) {
+        await runExec(
+          uploadCommand(root, { path: mirror, url: slot.request.url, headers: slot.request.headers }),
+          `large blob upload of ${mountKey}:${path}`,
+          { timeoutMs: uploadTimeoutMs },
+        )
+      }
+      return await slot.promote()
+    } catch (error) {
+      // Best effort, and never allowed to mask the real failure: an undiscarded
+      // quarantine object is an orphan GC sweeps, while a swallowed upload
+      // error would be a silent capture loss.
+      await slot.discard().catch(discardError => {
+        if (options.logger) options.logger.error(discardError, { mount: mountKey, path, operation: 'upload-discard' })
+        else console.error('TuddoFs capture upload discard failed', discardError, { mount: mountKey, path })
+      })
+      throw error
+    }
+  }
+
+  /**
    * Phases 3 and 4 share one scan-and-commit body. `full` drops `-newer` and
    * enables deletes; §7.4 forbids deleting from an incremental scan, where an
    * unmodified file simply does not appear.
@@ -506,6 +613,22 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
         observed.set(record.mountKey, paths)
       }
       paths.set(record.path, record.sha256)
+    }
+    // Sizes come from the same `find` list the scan hashed, and only when the
+    // §8.2 transport needs them to route a file. Like mtime, a target-reported
+    // size is a prefilter and never commit identity (§7.4): the store reports
+    // the length that reaches the tree.
+    const sizes = new Map<string, Map<string, number>>()
+    if (directUpload && scan.output.length > 0) {
+      const measured = await runExec(sizeCommand(root), 'capture size probe')
+      for (const record of parseSizeRecords(measured.output, mirrorDirs)) {
+        let paths = sizes.get(record.mountKey)
+        if (!paths) {
+          paths = new Map()
+          sizes.set(record.mountKey, paths)
+        }
+        paths.set(record.path, record.sizeBytes)
+      }
     }
     const lineage: LineageCache = { history: new Map(), deltas: new Map() }
 
@@ -576,14 +699,33 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
       for (const path of restage) await materializePath(mount.key, path)
       if (changed.length === 0 && deletes.length === 0) continue
 
-      // Bytes are fetched and re-hashed by the kernel; the target-reported sha
-      // is a diff prefilter only (§7.3 step 4, §7.4).
+      // Small files come back through the server and the kernel re-hashes them;
+      // the target-reported sha is a diff prefilter only (§7.3 step 4, §7.4).
+      // Large ones never touch server memory: they go target → store against a
+      // presigned PUT, and the store or a server-side re-hash is what binds the
+      // claimed sha to the bytes that landed (§8.2).
       const writes: CaptureWrite[] = []
       const capturedShas = new Map<string, string>()
+      const mountSizes = sizes.get(mount.key)
       for (const path of changed) {
-        const bytes = await target.readFile(mirrorPath(mount.key, path))
-        writes.push({ path, bytes })
-        capturedShas.set(path, sha256(bytes))
+        const mirror = mirrorPath(mount.key, path)
+        const claimedSha = seen.get(path) as string
+        const claimedSize = mountSizes?.get(path)
+        if (directUpload && claimedSize === undefined) {
+          // The size probe read the very list the scan hashed, so a changed path
+          // missing from it means the two execs disagree about what is on disk.
+          // Guessing here would silently route a 2 GB file through readFile.
+          throw new InvariantError(`No size observed for changed path ${path}`, { mount: mount.key })
+        }
+        if (claimedSize === undefined || claimedSize < thresholdBytes) {
+          const bytes = await target.readFile(mirror)
+          writes.push({ path, bytes })
+          capturedShas.set(path, sha256(bytes))
+          continue
+        }
+        const stored = await uploadCaptured(mount.key, path, mirror, claimedSha, BigInt(claimedSize))
+        writes.push({ path, sha256: stored.sha256, sizeBytes: stored.sizeBytes })
+        capturedShas.set(path, stored.sha256)
       }
       const result = await session.mount(mount.key).capture({ writes, deletes })
       for (const path of result.changedPaths) {

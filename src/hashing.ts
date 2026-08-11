@@ -32,6 +32,19 @@ export function sha256(input: Uint8Array | string): string {
   return createHash('sha256').update(input).digest('hex')
 }
 
+/** The digest shape every CAS key, checksum header, and capture claim is measured against. */
+export const CAS_SHA256 = /^[a-f0-9]{64}$/u
+
+/**
+ * The one place the content-addressed object key is spelled. Every write path —
+ * inline overflow (§4.5), streamed quarantine promotion (§8.1), target-direct
+ * capture upload (§8.2) — has to agree on it byte for byte or the CAS silently
+ * forks into two namespaces.
+ */
+export function casObjectKey(tenant: string, sha256Hex: string): string {
+  return `tuddo/${tenant}/${sha256Hex}`
+}
+
 /**
  * Serialize tree entries in the pinned UTF-8 byte order.
  */
