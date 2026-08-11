@@ -15,6 +15,7 @@ import {
 import {
   InvalidCommitTimestampError,
   InvalidPathError,
+  findMaskedPaths,
   findPathCollision,
   findTreeCoherenceCollisions,
 } from './validation.js'
@@ -281,6 +282,36 @@ export interface DeleteResult {
   readonly path: string
   readonly commitSha: string
 }
+
+/** One file observed on a target and re-hashed server-side before commit (§7.3 step 4). */
+export interface CaptureWrite {
+  readonly path: string
+  readonly bytes: Buffer | Uint8Array | string
+}
+
+/**
+ * Batch commit form used by exec capture and turn-end reconcile: one commit per
+ * touched mount, carrying every changed file and every deletion (§7.3 steps 5
+ * and phase 4, §4.5 batch form).
+ */
+export interface CaptureBatchInput {
+  readonly tenant: string
+  readonly mount: string
+  readonly ref: string
+  readonly writes: readonly CaptureWrite[]
+  readonly deletes: readonly string[]
+  readonly authorUser: string
+  readonly agentKind?: string | null
+  readonly threadId?: string | null
+  readonly runId?: string | null
+}
+
+/** Outcome of a batch capture; `created` is false when the target matched the head exactly. */
+export interface CaptureResult {
+  readonly commitSha: string
+  readonly changedPaths: readonly string[]
+  readonly created: boolean
+}
 /** Result of restoring a prior tree; unchanged restores are explicit no-ops. */
 export interface RestoreResult {
   readonly commitSha: string
@@ -332,6 +363,7 @@ export interface TuddoFs {
 export interface TuddoFsKernel extends TuddoFs {
   fork(input: ForkInput): Promise<ForkResult | null>
   write(input: WriteInput): Promise<WriteResult>
+  captureBatch(input: CaptureBatchInput): Promise<CaptureResult>
   read(input: ReadInput): Promise<ReadResult>
   delete(input: DeleteInput): Promise<DeleteResult>
   restore(input: RestoreInput): Promise<RestoreResult>
@@ -1055,6 +1087,28 @@ export function createTuddoFs(inputOptions: TuddoFsOptions): TuddoFsKernel {
     }
   }
 
+  /**
+   * Post-commit host hook (§4.5, §10 rule 4): queued off the write path, never
+   * able to fail a durable commit, and never aware of its listeners.
+   */
+  function emitCommit(event: CommitEvent): void {
+    if (!options.onCommit) return
+    setImmediate(() => {
+      void (async () => {
+        try {
+          await options.onCommit?.(event)
+        } catch (error: unknown) {
+          try {
+            if (options.logger) options.logger.error(error, event)
+            else console.error('TuddoFs onCommit hook failed', error, event)
+          } catch (loggerError: unknown) {
+            console.error('TuddoFs onCommit hook logger failed', loggerError, { error, event })
+          }
+        }
+      })()
+    })
+  }
+
   async function gc(input: GcOptions = {}): Promise<GcReport> {
     const graceMs = input.graceMs ?? DEFAULT_GRACE_MS
     const retentionMs = input.settledBranchRetentionMs ?? DEFAULT_SETTLED_BRANCH_RETENTION_MS
@@ -1667,22 +1721,7 @@ export function createTuddoFs(inputOptions: TuddoFsOptions): TuddoFsKernel {
           commitSha: commit.sha,
           changedPaths: [path],
         }
-        if (options.onCommit) {
-          setImmediate(() => {
-            void (async () => {
-              try {
-                await options.onCommit?.(event)
-              } catch (error: unknown) {
-                try {
-                  if (options.logger) options.logger.error(error, event)
-                  else console.error('TuddoFs onCommit hook failed', error, event)
-                } catch (loggerError: unknown) {
-                  console.error('TuddoFs onCommit hook logger failed', loggerError, { error, event })
-                }
-              }
-            })()
-          })
-        }
+        emitCommit(event)
         return {
           path,
           sha256: input.sha256,
@@ -1821,28 +1860,191 @@ export function createTuddoFs(inputOptions: TuddoFsOptions): TuddoFsKernel {
           await client.query('SELECT pg_advisory_unlock_shared(hashtext($1))', [`tuddo:gc:${input.tenant}`])
           lockState = 'none'
         }
-        if (options.onCommit) {
-          setImmediate(() => {
-            void (async () => {
-              try {
-                await options.onCommit?.(event)
-              } catch (error: unknown) {
-                try {
-                  if (options.logger) options.logger.error(error, event)
-                  else console.error('TuddoFs onCommit hook failed', error, event)
-                } catch (loggerError: unknown) {
-                  console.error('TuddoFs onCommit hook logger failed', loggerError, { error, event })
-                }
-              }
-            })()
-          })
-        }
+        emitCommit(event)
         return {
           path,
           sha256,
           sizeBytes: BigInt(bytes.length),
           commitSha: commit.sha,
         }
+      } catch (error) {
+        failure = error
+        await client.query('ROLLBACK').catch(() => undefined)
+        throw error
+      } finally {
+        if (lockState === 'held') {
+          lockState = 'uncertain'
+          try {
+            await client.query('SELECT pg_advisory_unlock_shared(hashtext($1))', [`tuddo:gc:${input.tenant}`])
+            lockState = 'none'
+          } catch (error) {
+            failure ??= error
+          }
+        }
+        if (lockState !== 'none') {
+          const releaseError =
+            failure instanceof Error ? failure : new Error('tuddofs advisory lock state is uncertain')
+          client.release(releaseError)
+        } else {
+          client.release()
+        }
+      }
+    }
+    throw new RefConflictError(context, maxCasRetries)
+  }
+
+  /**
+   * Commit one target scan against one mount: every changed file and every
+   * deletion in a single commit (§7.3 phase 3 step 5, phase 4, §4.5 batch form).
+   *
+   * Invariants:
+   * - Bytes are hashed here. A target-reported sha never becomes commit identity
+   *   (§13 never-do list).
+   * - Object-storage uploads happen BEFORE the transaction, under the tenant GC
+   *   lock, exactly as single-path `write` does.
+   * - §4.3 point 2 capture rule: a captured path that implies a directory over a
+   *   head file — or a captured file over a head directory — carries that file's
+   *   deletion in the same commit. Disk is the observed truth and cannot collide
+   *   with itself; a batch that IS internally incoherent came from a lying target
+   *   and is rejected.
+   * - Deletes name paths absent on the target. Deleting a path the head does not
+   *   have is a no-op, not an error: the engine's index is a cache (§7.3 state).
+   * - A scan that matches the head exactly produces no commit (§13 never-do list).
+   */
+  async function captureBatch(input: CaptureBatchInput): Promise<CaptureResult> {
+    const context = contextFor({
+      tenant: input.tenant,
+      mount: input.mount,
+      ref: input.ref,
+    })
+    validateMountKey(input.mount, context)
+    const writes = input.writes.map(entry => {
+      const bytes = bytesFor(entry.bytes)
+      return { path: validatePath(entry.path, context), bytes, sha256: hashSha256(bytes) }
+    })
+    const deletes = input.deletes.map(path => validatePath(path, context))
+    const selfCollision = findTreeCoherenceCollisions(writes.map(entry => entry.path))[0]
+    if (selfCollision) {
+      throw new InvalidPathError(
+        selfCollision.collidingPath,
+        `cannot be captured beside file ${selfCollision.path}; no filesystem holds both`,
+        context,
+      )
+    }
+    if (!(await grant(grants, 'write', input))) throw new PermissionDeniedError('Write permission denied', context)
+    const storageBacked = writes.some(entry => entry.bytes.length > inlineMaxBytes)
+
+    for (let attempt = 0; attempt < maxCasRetries; attempt += 1) {
+      const client = await options.pool.connect()
+      let lockState: 'none' | 'acquiring' | 'held' | 'uncertain' = 'none'
+      let failure: unknown
+      try {
+        if (storageBacked) {
+          lockState = 'acquiring'
+          await client.query('SELECT pg_advisory_lock_shared(hashtext($1))', [`tuddo:gc:${input.tenant}`])
+          lockState = 'held'
+        }
+        const objectKeys = new Map<string, string | null>()
+        for (const entry of writes) {
+          if (objectKeys.has(entry.sha256)) continue
+          objectKeys.set(
+            entry.sha256,
+            await ensureStorage(options.storage, input.tenant, entry.bytes, entry.sha256, inlineMaxBytes, context),
+          )
+        }
+        await client.query('BEGIN')
+        const ref = await loadRef(client, input.tenant, input.ref, context)
+        if (ref.kind === 'branch' && ref.state !== 'open') throw new BranchSettledError(ref.state, context)
+        const heads = await loadHeads(
+          client,
+          input.tenant,
+          input.ref,
+          asBigInt(ref.commit_id, 'tuddo_refs.commit_id', context),
+          context,
+        )
+        const next = new Map(heads)
+        for (const path of deletes) next.delete(path)
+        for (const entry of writes) for (const masked of findMaskedPaths(entry.path, next)) next.delete(masked)
+        for (const entry of writes) {
+          const current = heads.get(entry.path)
+          if (current?.sha256 === entry.sha256) {
+            next.set(entry.path, current)
+            continue
+          }
+          next.set(entry.path, {
+            blobId: await insertBlob(
+              client,
+              input.tenant,
+              entry.bytes,
+              entry.bytes.length,
+              entry.sha256,
+              inlineMaxBytes,
+              objectKeys.get(entry.sha256) ?? null,
+              context,
+            ),
+            sha256: entry.sha256,
+            sizeBytes: BigInt(entry.bytes.length),
+            mode: current?.mode ?? 420,
+          })
+        }
+        for (const entry of writes) {
+          const collision = findPathCollision(entry.path, next)
+          if (collision !== undefined) {
+            throw new InvariantError(`Capture left ${entry.path} colliding with ${collision}`, context)
+          }
+        }
+        if (sameEntries(heads, next)) {
+          await client.query('ROLLBACK')
+          return { commitSha: ref.commit_sha, changedPaths: [], created: false }
+        }
+        const changedPaths = [...new Set([...heads.keys(), ...next.keys()])]
+          .filter(path => {
+            const before = heads.get(path)
+            const after = next.get(path)
+            return before?.sha256 !== after?.sha256 || before?.mode !== after?.mode
+          })
+          .sort()
+        const tree = await insertTree(client, input.tenant, next, context)
+        const createdAt = timestamp(now, context)
+        const commit = await insertCommit(client, {
+          tenant: input.tenant,
+          treeId: tree.id,
+          treeSha: tree.sha,
+          parentIds: [asBigInt(ref.commit_id, 'tuddo_refs.commit_id', context)],
+          parentShas: [ref.commit_sha],
+          authorUser: input.authorUser,
+          agentKind: input.agentKind ?? null,
+          threadId: input.threadId ?? null,
+          runId: input.runId ?? null,
+          op: 'capture',
+          message: null,
+          createdAt: createdAt.date,
+          context,
+        })
+        const updated = await client.query(
+          `UPDATE tuddo_refs SET commit_id = $3::bigint
+           WHERE tenant = $1 AND name = $2 AND commit_id = $4::bigint`,
+          [input.tenant, input.ref, commit.id.toString(), ref.commit_id],
+        )
+        if ((updated.rowCount ?? 0) === 0) {
+          await client.query('ROLLBACK')
+          continue
+        }
+        await replaceHeads(client, input.tenant, input.ref, next)
+        await client.query('COMMIT')
+        if (lockState === 'held') {
+          lockState = 'uncertain'
+          await client.query('SELECT pg_advisory_unlock_shared(hashtext($1))', [`tuddo:gc:${input.tenant}`])
+          lockState = 'none'
+        }
+        emitCommit({
+          tenant: input.tenant,
+          mount: input.mount,
+          ref: input.ref,
+          commitSha: commit.sha,
+          changedPaths,
+        })
+        return { commitSha: commit.sha, changedPaths, created: true }
       } catch (error) {
         failure = error
         await client.query('ROLLBACK').catch(() => undefined)
@@ -2080,6 +2282,7 @@ export function createTuddoFs(inputOptions: TuddoFsOptions): TuddoFsKernel {
       fork,
       write,
       withBlobWriteLock,
+      captureBatch,
       read,
       delete: remove,
       resolveGrant: (actor, mount, resolutionOptions) => grants.resolve(actor, mount, resolutionOptions),
@@ -2094,6 +2297,7 @@ export function createTuddoFs(inputOptions: TuddoFsOptions): TuddoFsKernel {
     verify,
     fork,
     write,
+    captureBatch,
     read,
     delete: remove,
     restore,

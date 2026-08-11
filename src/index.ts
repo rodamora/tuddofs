@@ -33,6 +33,8 @@ export type {
   BlobObject,
   BlobStore,
   BlobStorePresignedPut,
+  CaptureResult,
+  CaptureWrite,
   ChecksumEnforcedPresignedPut,
   ChecksumUnsupportedPresignedPut,
   CommitEvent,
@@ -44,6 +46,7 @@ export type {
   TuddoFs,
   TuddoFsLogger,
   TuddoFsOptions,
+  WriteMode,
   WriteResult,
   VerifyFinding,
   VerifyOptions,
@@ -51,6 +54,7 @@ export type {
 } from './kernel.js'
 export type {
   DiffRecord,
+  CaptureInput,
   EditOptions,
   HistoryRecord,
   MergeResult,
@@ -60,6 +64,7 @@ export type {
   PresignOptions,
   SessionEntry,
   SessionFileSystem,
+  SessionMount,
   SessionStat,
   TextEdit,
   TimelineFilter,

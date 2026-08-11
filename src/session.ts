@@ -15,6 +15,8 @@ import {
 import { InvalidPathError, findTreeCoherenceCollisions, validateMountKey, validatePath } from './validation.js'
 import type {
   Actor,
+  CaptureResult,
+  CaptureWrite,
   ChecksumEnforcedPresignedPut,
   TuddoFsKernel,
   TuddoFsOptions,
@@ -22,6 +24,7 @@ import type {
   ForkResult,
   ReadResult,
   RestoreResult,
+  WriteMode,
   WriteResult,
 } from './kernel.js'
 import type { TuddoFsClient } from './migration.js'
@@ -144,6 +147,33 @@ export interface DiffRecord {
   readonly afterMode?: number
 }
 
+/**
+ * One mount visible to an open session, as the server sees it.
+ *
+ * Scope identity is server-derived, never model-constructed (§5 rule 7): the
+ * sync engine reads its mount table from here rather than trusting a host list
+ * or sandbox-reported data. Grants are resolved live, bypassing the cache, so
+ * `write` reflects policy at the moment of the call.
+ */
+export interface SessionMount {
+  readonly key: string
+  /** Virtual mounts are tool-level only; the sync engine skips them (§6.1). */
+  readonly virtual: boolean
+  /** Pinned mounts address a fixed commit and are read-only by construction (§5 rule 5). */
+  readonly pinned: boolean
+  /** Live write mode; `none` for pins and for virtual mounts without a write handler. */
+  readonly write: WriteMode
+}
+
+/**
+ * One target scan applied to one mount: every changed file and every deletion,
+ * committed together (§7.3 phase 3 step 5, phase 4).
+ */
+export interface CaptureInput {
+  readonly writes: readonly CaptureWrite[]
+  readonly deletes: readonly string[]
+}
+
 /** Per-mount merge outcome governed by architecture §6.2. */
 export type MergeResult =
   | { readonly status: 'merged' | 'unauthorized' | 'pendingApproval' }
@@ -180,6 +210,11 @@ export interface MountFileSystem {
   stat(path: string): Promise<SessionStat>
   delete(path: string, options?: { ifSha?: string | null }): Promise<DeleteResult>
   history(path: string): Promise<readonly HistoryRecord[]>
+  /**
+   * Commit one target scan of this mount (§7.3). Not a tool verb: the sync
+   * engine calls it with bytes it fetched and re-hashed itself.
+   */
+  capture(input: CaptureInput): Promise<CaptureResult>
 }
 
 /** Open-session metadata and history controls defined by architecture §6.2. */
@@ -187,6 +222,7 @@ export interface SessionFileSystem {
   readonly actor: Actor
   readonly sessionId: string
   mount(key: string): MountFileSystem
+  mounts(): Promise<readonly SessionMount[]>
   timeline(filter?: TimelineFilter): Promise<readonly TimelineRecord[]>
   diff(a: string, b: string): Promise<readonly DiffRecord[]>
   merge(options?: {
@@ -1091,6 +1127,7 @@ export function createSessionApi(kernel: SessionKernel, options: TuddoFsOptions)
         stat(mountKey: string, path: string): Promise<SessionStat>
         delete(mountKey: string, path: string, options?: { ifSha?: string | null }): Promise<DeleteResult>
         history(mountKey: string, path: string): Promise<readonly HistoryRecord[]>
+        capture(mountKey: string, captureInput: CaptureInput): Promise<CaptureResult>
       }
       const sessionOps: SessionOperations = {
         actor: input.actor,
@@ -1115,6 +1152,7 @@ export function createSessionApi(kernel: SessionKernel, options: TuddoFsOptions)
             stat: (path: string) => sessionOps.stat(key, path),
             delete: (path, deleteOptions) => sessionOps.delete(key, path, deleteOptions),
             history: (path: string) => sessionOps.history(key, path),
+            capture: (captureInput: CaptureInput) => sessionOps.capture(key, captureInput),
           }
         },
         async read(mountKey: string, path: string) {
@@ -1274,6 +1312,45 @@ export function createSessionApi(kernel: SessionKernel, options: TuddoFsOptions)
             runId: input.attribution?.runId,
           })
         },
+        async capture(mountKey: string, captureInput: CaptureInput) {
+          const mount = mounts.get(mountKey)
+          if (!mount)
+            throw new NotFoundError(`Mount not found: ${mountKey}`, {
+              tenant: input.actor.tenant,
+              mount: mountKey,
+            })
+          // A copy of live host data is stale by definition and capture would
+          // try to commit it (§6.1).
+          if ('virtual' in mount)
+            throw new PermissionDeniedError('Virtual mounts are never captured', {
+              tenant: input.actor.tenant,
+              mount: mount.key,
+            })
+          if (mount.mode !== 'follow')
+            throw new PermissionDeniedError('Pinned mount is read-only', {
+              tenant: input.actor.tenant,
+              mount: mount.key,
+            })
+          // Bytes arrive from an untrusted target, so the grant is re-resolved
+          // live rather than read from the ≤30s cache (§5 rules 1-2).
+          const grant = await kernel.resolveGrant(input.actor, { key: mount.key }, { bypassCache: true })
+          if (grant.write === 'none')
+            throw new PermissionDeniedError('Write permission denied', {
+              tenant: input.actor.tenant,
+              mount: mount.key,
+            })
+          return kernel.captureBatch({
+            tenant: input.actor.tenant,
+            mount: mount.key,
+            ref: refFor(mount),
+            writes: captureInput.writes,
+            deletes: captureInput.deletes,
+            authorUser: input.actor.id,
+            agentKind: input.attribution?.agentKind,
+            threadId: input.attribution?.threadId,
+            runId: input.attribution?.runId,
+          })
+        },
         async history(mountKey: string, rawPath: string) {
           const { mount, path } = mountFor(mountKey, rawPath)
           if ('virtual' in mount) return unsupportedVirtual(mount.key, path)
@@ -1356,6 +1433,28 @@ export function createSessionApi(kernel: SessionKernel, options: TuddoFsOptions)
           } finally {
             client.release()
           }
+        },
+        async mounts() {
+          const enumerated: SessionMount[] = []
+          for (const mount of mounts.values()) {
+            if ('virtual' in mount) {
+              enumerated.push({
+                key: mount.key,
+                virtual: true,
+                pinned: false,
+                write: mount.virtual.write ? 'direct' : 'none',
+              })
+              continue
+            }
+            const grant = await kernel.resolveGrant(input.actor, { key: mount.key }, { bypassCache: true })
+            enumerated.push({
+              key: mount.key,
+              virtual: false,
+              pinned: mount.mode !== 'follow',
+              write: mount.mode === 'follow' ? grant.write : 'none',
+            })
+          }
+          return enumerated
         },
         async timeline(filter: TimelineFilter = {}) {
           const records = new Map<string, TimelineRecord>()
@@ -1618,6 +1717,7 @@ export function createSessionApi(kernel: SessionKernel, options: TuddoFsOptions)
         actor: sessionOps.actor,
         sessionId: sessionOps.sessionId,
         mount: key => sessionOps.mount(key),
+        mounts: () => sessionOps.mounts(),
         timeline: filter => sessionOps.timeline(filter),
         diff: (a, b) => sessionOps.diff(a, b),
         merge: mergeOptions => sessionOps.merge(mergeOptions),
