@@ -206,6 +206,16 @@ export interface DeleteInput {
   readonly op?: string
   readonly message?: string | null
 }
+export interface RestoreInput {
+  readonly tenant: string
+  readonly mount: string
+  readonly ref: string
+  readonly sourceCommitId: string
+  readonly authorUser: string
+  readonly agentKind?: string | null
+  readonly threadId?: string | null
+  readonly runId?: string | null
+}
 
 export interface DeleteResult {
   readonly path: string
@@ -250,8 +260,9 @@ export interface AgentFsKernel {
   write(input: WriteInput): Promise<WriteResult>
   read(input: ReadInput): Promise<ReadResult>
   delete(input: DeleteInput): Promise<DeleteResult>
+  restore(input: RestoreInput): Promise<WriteResult | null>
   resolveGrant(actor: Actor, mount: { key: string }, options?: GrantResolutionOptions): Promise<Grant>
-  invalidate(actorId: string, mountKey?: string): void
+  invalidate(actorId: string, mountKey?: string, tenant?: string): void
   open(input: OpenInput): Promise<SessionFileSystem>
 }
 
@@ -540,6 +551,42 @@ async function loadHeads(
   )
 }
 
+async function loadTreeEntries(
+  client: Queryable,
+  tenant: string,
+  commitId: string,
+  context: ErrorContext,
+): Promise<Map<string, Entry>> {
+  const result = await client.query<HeadRow>(
+    `SELECT e.path, e.blob_id::text, b.sha256, b.size_bytes::text, e.mode
+     FROM afs_commits c
+     JOIN afs_tree_entries e ON e.tree_id = c.tree_id
+     JOIN afs_blobs b ON b.id = e.blob_id
+     WHERE c.tenant = $1 AND c.id = $2::bigint`,
+    [tenant, commitId],
+  )
+  return new Map(
+    result.rows.map(row => [
+      row.path,
+      {
+        blobId: asBigInt(row.blob_id, 'afs_tree_entries.blob_id', context),
+        sha256: row.sha256,
+        sizeBytes: asBigInt(row.size_bytes, 'afs_blobs.size_bytes', context),
+        mode: row.mode,
+      },
+    ]),
+  )
+}
+
+function sameEntries(left: Map<string, Entry>, right: Map<string, Entry>): boolean {
+  if (left.size !== right.size) return false
+  for (const [path, entry] of left) {
+    const other = right.get(path)
+    if (!other || other.sha256 !== entry.sha256 || other.mode !== entry.mode) return false
+  }
+  return true
+}
+
 async function ensureStorage(
   storage: BlobStore | undefined,
   tenant: string,
@@ -570,6 +617,15 @@ async function updateHead(client: Queryable, tenant: string, ref: string, path: 
        size_bytes = EXCLUDED.size_bytes`,
     [tenant, ref, path, entry.blobId.toString(), entry.sha256, entry.sizeBytes.toString()],
   )
+}
+async function replaceHeads(
+  client: Queryable,
+  tenant: string,
+  ref: string,
+  entries: Map<string, Entry>,
+): Promise<void> {
+  await client.query('DELETE FROM afs_heads WHERE tenant = $1 AND ref_name = $2', [tenant, ref])
+  for (const [path, entry] of entries) await updateHead(client, tenant, ref, path, entry)
 }
 
 const DEFAULT_GRACE_MS = 24 * 60 * 60 * 1000
@@ -1454,6 +1510,72 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
     }
     throw new RefConflictError(context, maxCasRetries)
   }
+  async function restore(input: RestoreInput): Promise<WriteResult | null> {
+    const initialContext = contextFor({ tenant: input.tenant, mount: input.mount, ref: input.ref })
+    validateMountKey(input.mount, initialContext)
+    const context = initialContext
+    if (!(await grant(grants, 'write', input))) throw new PermissionDeniedError('Write permission denied', context)
+    for (let attempt = 0; attempt < maxCasRetries; attempt += 1) {
+      const client = await options.pool.connect()
+      try {
+        await client.query('BEGIN')
+        const ref = await loadRef(client, input.tenant, input.ref, context)
+        if (ref.kind === 'branch' && ref.state !== 'open') throw new BranchSettledError(ref.state, context)
+        const current = await loadHeads(
+          client,
+          input.tenant,
+          input.ref,
+          asBigInt(ref.commit_id, 'afs_refs.commit_id', context),
+          context,
+        )
+        const restored = await loadTreeEntries(client, input.tenant, input.sourceCommitId, context)
+        if (sameEntries(current, restored)) {
+          await client.query('ROLLBACK')
+          return null
+        }
+        const tree = await insertTree(client, input.tenant, restored, context)
+        const createdAt = timestamp(now, context)
+        const commit = await insertCommit(client, {
+          tenant: input.tenant,
+          treeId: tree.id,
+          treeSha: tree.sha,
+          parentIds: [asBigInt(ref.commit_id, 'afs_refs.commit_id', context)],
+          parentShas: [ref.commit_sha],
+          authorUser: input.authorUser,
+          agentKind: input.agentKind ?? null,
+          threadId: input.threadId ?? null,
+          runId: input.runId ?? null,
+          op: 'restore',
+          message: null,
+          createdAt: createdAt.date,
+          context,
+        })
+        const updated = await client.query(
+          `UPDATE afs_refs SET commit_id = $3::bigint
+           WHERE tenant = $1 AND name = $2 AND commit_id = $4::bigint`,
+          [input.tenant, input.ref, commit.id.toString(), ref.commit_id],
+        )
+        if ((updated.rowCount ?? 0) === 0) {
+          await client.query('ROLLBACK')
+          continue
+        }
+        await replaceHeads(client, input.tenant, input.ref, restored)
+        await client.query('COMMIT')
+        return {
+          path: '/',
+          sha256: tree.sha,
+          sizeBytes: 0n,
+          commitSha: commit.sha,
+        }
+      } catch (error) {
+        await client.query('ROLLBACK').catch(() => undefined)
+        throw error
+      } finally {
+        client.release()
+      }
+    }
+    throw new RefConflictError(context, maxCasRetries)
+  }
 
   async function read(input: ReadInput): Promise<ReadResult> {
     const initialContext = contextFor(input)
@@ -1510,58 +1632,65 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
     const path = validatePath(input.path, initialContext)
     const context = contextFor({ tenant: input.tenant, mount: input.mount, path, ref: input.ref })
     if (!(await grant(grants, 'write', input))) throw new PermissionDeniedError('Write permission denied', context)
-    const client = await options.pool.connect()
-    try {
-      await client.query('BEGIN')
-      const ref = await loadRef(client, input.tenant, input.ref, context)
-      if (ref.kind === 'branch' && ref.state !== 'open') throw new BranchSettledError(ref.state, context)
-      const heads = await loadHeads(
-        client,
-        input.tenant,
-        input.ref,
-        asBigInt(ref.commit_id, 'afs_refs.commit_id', context),
-        context,
-      )
-      const current = heads.get(path)
-      if (!current) throw new NotFoundError(`Path not found: ${input.path}`, context)
-      if (input.ifSha !== undefined && input.ifSha !== (current.sha256 ?? null))
-        throw new PreconditionFailedError(input.ifSha, current.sha256, context)
-      heads.delete(path)
-      const tree = await insertTree(client, input.tenant, heads, context)
-      const createdAt = timestamp(now, context)
-      const commit = await insertCommit(client, {
-        tenant: input.tenant,
-        treeId: tree.id,
-        treeSha: tree.sha,
-        parentIds: [asBigInt(ref.commit_id, 'afs_refs.commit_id', context)],
-        parentShas: [ref.commit_sha],
-        authorUser: input.authorUser,
-        agentKind: input.agentKind ?? null,
-        threadId: input.threadId ?? null,
-        runId: input.runId ?? null,
-        op: input.op ?? 'delete',
-        message: input.message ?? null,
-        createdAt: createdAt.date,
-        context,
-      })
-      const updated = await client.query(
-        'UPDATE afs_refs SET commit_id = $3::bigint WHERE tenant = $1 AND name = $2 AND commit_id = $4::bigint',
-        [input.tenant, input.ref, commit.id.toString(), ref.commit_id],
-      )
-      if ((updated.rowCount ?? 0) === 0) throw new RefConflictError(context, 1)
-      await client.query('DELETE FROM afs_heads WHERE tenant = $1 AND ref_name = $2 AND path = $3', [
-        input.tenant,
-        input.ref,
-        path,
-      ])
-      await client.query('COMMIT')
-      return { path, commitSha: commit.sha }
-    } catch (error) {
-      await client.query('ROLLBACK').catch(() => undefined)
-      throw error
-    } finally {
-      client.release()
+    for (let attempt = 0; attempt < maxCasRetries; attempt += 1) {
+      const client = await options.pool.connect()
+      try {
+        await client.query('BEGIN')
+        const ref = await loadRef(client, input.tenant, input.ref, context)
+        if (ref.kind === 'branch' && ref.state !== 'open') throw new BranchSettledError(ref.state, context)
+        const heads = await loadHeads(
+          client,
+          input.tenant,
+          input.ref,
+          asBigInt(ref.commit_id, 'afs_refs.commit_id', context),
+          context,
+        )
+        const current = heads.get(path)
+        if (!current) throw new NotFoundError(`Path not found: ${input.path}`, context)
+        if (input.ifSha !== undefined && input.ifSha !== (current.sha256 ?? null))
+          throw new PreconditionFailedError(input.ifSha, current.sha256, context)
+        heads.delete(path)
+        const tree = await insertTree(client, input.tenant, heads, context)
+        const createdAt = timestamp(now, context)
+        const commit = await insertCommit(client, {
+          tenant: input.tenant,
+          treeId: tree.id,
+          treeSha: tree.sha,
+          parentIds: [asBigInt(ref.commit_id, 'afs_refs.commit_id', context)],
+          parentShas: [ref.commit_sha],
+          authorUser: input.authorUser,
+          agentKind: input.agentKind ?? null,
+          threadId: input.threadId ?? null,
+          runId: input.runId ?? null,
+          op: input.op ?? 'delete',
+          message: input.message ?? null,
+          createdAt: createdAt.date,
+          context,
+        })
+        const updated = await client.query(
+          `UPDATE afs_refs SET commit_id = $3::bigint
+           WHERE tenant = $1 AND name = $2 AND commit_id = $4::bigint`,
+          [input.tenant, input.ref, commit.id.toString(), ref.commit_id],
+        )
+        if ((updated.rowCount ?? 0) === 0) {
+          await client.query('ROLLBACK')
+          continue
+        }
+        await client.query('DELETE FROM afs_heads WHERE tenant = $1 AND ref_name = $2 AND path = $3', [
+          input.tenant,
+          input.ref,
+          path,
+        ])
+        await client.query('COMMIT')
+        return { path, commitSha: commit.sha }
+      } catch (error) {
+        await client.query('ROLLBACK').catch(() => undefined)
+        throw error
+      } finally {
+        client.release()
+      }
     }
+    throw new RefConflictError(context, maxCasRetries)
   }
 
   const session = createSessionApi(
@@ -1574,7 +1703,8 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
       read,
       delete: remove,
       resolveGrant: (actor, mount, resolutionOptions) => grants.resolve(actor, mount, resolutionOptions),
-      invalidate: (actorId, mountKey) => grants.invalidate(actorId, mountKey),
+      restore,
+      invalidate: (actorId, mountKey, tenant) => grants.invalidate(actorId, mountKey, tenant),
     },
     options,
   )
@@ -1586,6 +1716,7 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
     write,
     read,
     delete: remove,
+    restore,
     resolveGrant: (actor, mount, resolutionOptions) => grants.resolve(actor, mount, resolutionOptions),
     ...session,
   }

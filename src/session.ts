@@ -6,7 +6,7 @@ import {
   PermissionDeniedError,
   PreconditionFailedError,
 } from './errors.js'
-import { validateMountKey, validatePath } from './validation.js'
+import { InvalidPathError, validateMountKey, validatePath } from './validation.js'
 import type {
   Actor,
   AgentFsKernel,
@@ -209,8 +209,8 @@ function changedPaths(before: Map<string, Head>, after: Map<string, Head>): stri
 type SessionKernel = Omit<AgentFsKernel, 'open'>
 export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions) {
   return {
-    invalidate(actorId: string, mountKey?: string) {
-      kernel.invalidate(actorId, mountKey)
+    invalidate(actorId: string, mountKey?: string, tenant?: string) {
+      kernel.invalidate(actorId, mountKey, tenant)
     },
     async open(input: OpenInput): Promise<SessionFileSystem> {
       if (!input.actor.id || input.actor.id === 'system')
@@ -271,8 +271,8 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
         if (mount.ref) return mount.ref
         return `mount/${mount.key}`
       }
-      const ensureRead = async (mount: RefMount): Promise<void> => {
-        const grant = await kernel.resolveGrant(input.actor, { key: mount.key })
+      const ensureRead = async (mount: RefMount, resolutionOptions: { bypassCache?: boolean } = {}): Promise<void> => {
+        const grant = await kernel.resolveGrant(input.actor, { key: mount.key }, resolutionOptions)
         if (!grant.read)
           throw new PermissionDeniedError('Read permission denied', {
             tenant: input.actor.tenant,
@@ -280,25 +280,73 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
           })
       }
 
+      type LineageCommit = { id: string; commit_sha: string }
+      const assertCommitInMountLineage = async (
+        client: AgentFsClient,
+        mountKey: string,
+        commitSha: string,
+      ): Promise<LineageCommit> => {
+        const result = await client.query<LineageCommit>(
+          `WITH RECURSIVE lineage(id) AS (
+             SELECT r.commit_id
+             FROM afs_refs r
+             WHERE r.tenant = $1
+               AND (
+                 r.name = $2
+                 OR (r.kind = 'tag' AND r.name LIKE $3)
+                 OR (r.kind = 'branch' AND r.name LIKE $4)
+               )
+             UNION
+             SELECT parent_id
+             FROM lineage current
+             JOIN afs_commits c ON c.id = current.id
+             CROSS JOIN LATERAL unnest(c.parents) AS parent_id
+           )
+           SELECT c.id::text, c.commit_sha
+           FROM lineage
+           JOIN afs_commits c ON c.id = lineage.id
+           WHERE c.tenant = $1 AND c.commit_sha = $5
+           LIMIT 1`,
+          [input.actor.tenant, `mount/${mountKey}`, `tag/${mountKey}/%`, `agent/%/${mountKey}`, commitSha],
+        )
+        const row = result.rows[0]
+        if (!row)
+          throw new NotFoundError(`Commit not found in mount lineage: ${commitSha}`, {
+            tenant: input.actor.tenant,
+            mount: mountKey,
+          })
+        return row
+      }
+
       const pinnedRef = async (mount: RefMount): Promise<{ ref: string; commitId: string }> => {
         if (mount.mode === 'follow') return { ref: refFor(mount), commitId: '' }
         const pin = mount.mode.pin
         const client = await options.pool.connect()
         try {
-          const result = await client.query<{ id: string; commit_sha: string }>(
-            `SELECT c.id::text, c.commit_sha
-             FROM afs_commits c LEFT JOIN afs_refs r ON r.tenant = c.tenant AND r.commit_id = c.id
-             WHERE c.tenant = $1 AND (c.commit_sha = $2 OR r.name = $2)
-             ORDER BY CASE WHEN r.name = $2 THEN 0 ELSE 1 END LIMIT 1`,
-            [input.actor.tenant, pin],
-          )
-          const row = result.rows[0]
+          let row: LineageCommit | undefined
+          if (pin.startsWith('mount/') || pin.startsWith('tag/') || pin.startsWith('agent/')) {
+            const result = await client.query<LineageCommit>(
+              `SELECT c.id::text, c.commit_sha
+               FROM afs_refs r JOIN afs_commits c ON c.id = r.commit_id
+               WHERE r.tenant = $1 AND r.name = $2
+                 AND (
+                   r.name = $3
+                   OR (r.kind = 'tag' AND r.name LIKE $4)
+                   OR (r.kind = 'branch' AND r.name LIKE $5)
+                 )`,
+              [input.actor.tenant, pin, `mount/${mount.key}`, `tag/${mount.key}/%`, `agent/%/${mount.key}`],
+            )
+            row = result.rows[0]
+          } else {
+            row = await assertCommitInMountLineage(client, mount.key, pin)
+          }
           if (!row)
             throw new NotFoundError(`Pinned commit not found: ${pin}`, {
               tenant: input.actor.tenant,
               mount: mount.key,
             })
-          return { ref: `__pin/${input.sessionId}/${mount.key}`, commitId: row.id }
+          const confined = await assertCommitInMountLineage(client, mount.key, row.commit_sha)
+          return { ref: `__pin/${input.sessionId}/${mount.key}`, commitId: confined.id }
         } finally {
           client.release()
         }
@@ -462,21 +510,51 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
         }
       }
 
-      const resolveCommit = async (value: string): Promise<{ id: string; sha: string; mountKey?: string }> => {
+      const resolveCommit = async (
+        value: string,
+        preferredMountKey?: string,
+        optionsForResolution: { checkRead?: boolean } = {},
+      ): Promise<{ id: string; sha: string; mountKey: string }> => {
         const parsed = value.includes(':/') ? pathForAddress(value) : null
         if (parsed) {
+          if (preferredMountKey !== undefined && preferredMountKey !== parsed.mountKey)
+            throw new NotFoundError(`Commit not found in mount lineage: ${value}`, {
+              tenant: input.actor.tenant,
+              mount: preferredMountKey,
+            })
           const mount = mounts.get(parsed.mountKey)
           if (!mount || 'virtual' in mount)
             throw new NotFoundError('Virtual mount has no commits', {
               tenant: input.actor.tenant,
               mount: parsed.mountKey,
             })
-          const ref = refFor(mount)
+          if (optionsForResolution.checkRead !== false) await ensureRead(mount, { bypassCache: true })
+          if (mount.mode !== 'follow') {
+            const pinned = await pinnedRef(mount)
+            const client = await options.pool.connect()
+            try {
+              const result = await client.query<{ commit_sha: string }>(
+                'SELECT commit_sha FROM afs_commits WHERE tenant = $1 AND id = $2::bigint',
+                [input.actor.tenant, pinned.commitId],
+              )
+              const row = result.rows[0]
+              if (!row)
+                throw new NotFoundError(`Commit not found: ${value}`, {
+                  tenant: input.actor.tenant,
+                  mount: parsed.mountKey,
+                })
+              return { id: pinned.commitId, sha: row.commit_sha, mountKey: mount.key }
+            } finally {
+              client.release()
+            }
+          }
           const client = await options.pool.connect()
           try {
-            const result = await client.query<{ id: string; commit_sha: string }>(
-              'SELECT c.id::text, c.commit_sha FROM afs_refs r JOIN afs_commits c ON c.id = r.commit_id WHERE r.tenant = $1 AND r.name = $2',
-              [input.actor.tenant, ref],
+            const result = await client.query<{ commit_sha: string }>(
+              `SELECT c.commit_sha
+               FROM afs_refs r JOIN afs_commits c ON c.id = r.commit_id
+               WHERE r.tenant = $1 AND r.name = $2`,
+              [input.actor.tenant, refFor(mount)],
             )
             const row = result.rows[0]
             if (!row)
@@ -484,23 +562,45 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
                 tenant: input.actor.tenant,
                 mount: parsed.mountKey,
               })
-            return { id: row.id, sha: row.commit_sha, mountKey: parsed.mountKey }
+            const confined = await assertCommitInMountLineage(client, mount.key, row.commit_sha)
+            return { id: confined.id, sha: confined.commit_sha, mountKey: mount.key }
           } finally {
             client.release()
           }
         }
-        const client = await options.pool.connect()
-        try {
-          const result = await client.query<{ id: string; commit_sha: string }>(
-            'SELECT id::text, commit_sha FROM afs_commits WHERE tenant = $1 AND commit_sha = $2',
-            [input.actor.tenant, value],
-          )
-          const row = result.rows[0]
-          if (!row) throw new NotFoundError(`Commit not found: ${value}`, { tenant: input.actor.tenant })
-          return { id: row.id, sha: row.commit_sha }
-        } finally {
-          client.release()
+        const candidates = [...mounts.values()].filter((mount): mount is RefMount => !('virtual' in mount))
+        for (const mount of candidates) {
+          if (preferredMountKey !== undefined && preferredMountKey !== mount.key) continue
+          const client = await options.pool.connect()
+          try {
+            let candidateSha = value
+            if (preferredMountKey !== undefined && !/^[0-9a-f]{64}$/u.test(value)) {
+              const tagName = value.startsWith('tag/') ? value : `tag/${mount.key}/${value}`
+              const tag = await client.query<{ commit_sha: string }>(
+                `SELECT c.commit_sha
+                 FROM afs_refs r JOIN afs_commits c ON c.id = r.commit_id
+                 WHERE r.tenant = $1 AND r.name = $2 AND r.kind = 'tag'`,
+                [input.actor.tenant, tagName],
+              )
+              if (tag.rows[0]) candidateSha = tag.rows[0].commit_sha
+            }
+            let confined: LineageCommit
+            try {
+              confined = await assertCommitInMountLineage(client, mount.key, candidateSha)
+            } catch (error) {
+              if (error instanceof NotFoundError) continue
+              throw error
+            }
+            if (optionsForResolution.checkRead !== false) await ensureRead(mount, { bypassCache: true })
+            return { id: confined.id, sha: confined.commit_sha, mountKey: mount.key }
+          } finally {
+            client.release()
+          }
         }
+        throw new NotFoundError(`Commit not found in granted mount lineage: ${value}`, {
+          tenant: input.actor.tenant,
+          ...(preferredMountKey === undefined ? {} : { mount: preferredMountKey }),
+        })
       }
 
       const readTree = async (client: AgentFsClient, commitId: string): Promise<Map<string, Head>> => {
@@ -678,16 +778,54 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
         async history(address: string) {
           const { mount, path } = mountFor(address)
           if ('virtual' in mount) return unsupportedVirtual(mount.key)
-          await ensureRead(mount)
+          await ensureRead(mount, { bypassCache: true })
           const client = await options.pool.connect()
           try {
+            const ref = refFor(mount)
+            const tip = await client.query<{ commit_sha: string }>(
+              `SELECT c.commit_sha
+               FROM afs_refs r JOIN afs_commits c ON c.id = r.commit_id
+               WHERE r.tenant = $1 AND r.name = $2`,
+              [input.actor.tenant, ref],
+            )
+            const tipRow = tip.rows[0]
+            if (!tipRow)
+              throw new NotFoundError(`Commit not found: ${ref}`, {
+                tenant: input.actor.tenant,
+                mount: mount.key,
+                ref,
+              })
+            await assertCommitInMountLineage(client, mount.key, tipRow.commit_sha)
             const result = await client.query<CommitRow & { parent_shas: string[] }>(
-              `SELECT c.id::text, c.commit_sha, c.parents, c.op, c.author_user, c.agent_kind, c.thread_id, c.run_id, c.created_at,
+              `WITH RECURSIVE lineage(id) AS (
+                 SELECT r.commit_id
+                 FROM afs_refs r
+                 WHERE r.tenant = $1 AND r.name = $2
+                 UNION
+                 SELECT parent_id
+                 FROM lineage current
+                 JOIN afs_commits c ON c.id = current.id
+                 CROSS JOIN LATERAL unnest(c.parents) AS parent_id
+               )
+               SELECT c.id::text, c.commit_sha, c.parents, c.op, c.author_user, c.agent_kind, c.thread_id, c.run_id, c.created_at,
                       COALESCE((SELECT array_agg(p.commit_sha ORDER BY p.id) FROM afs_commits p WHERE p.id = ANY(c.parents)), '{}') AS parent_shas
-               FROM afs_commits c JOIN afs_refs r ON r.tenant = c.tenant AND r.name = $2
-               WHERE c.tenant = $1 AND EXISTS (SELECT 1 FROM afs_tree_entries e JOIN afs_trees t ON t.id = e.tree_id WHERE t.id = c.tree_id AND e.path = $3)
+               FROM lineage JOIN afs_commits c ON c.id = lineage.id
+               WHERE c.tenant = $1
+                 AND EXISTS (
+                   SELECT 1
+                   FROM unnest(c.parents) AS parent_id
+                   LEFT JOIN afs_commits parent ON parent.id = parent_id
+                   LEFT JOIN afs_tree_entries current_entry
+                     ON current_entry.tree_id = c.tree_id AND current_entry.path = $3
+                   LEFT JOIN afs_blobs current_blob ON current_blob.id = current_entry.blob_id
+                   LEFT JOIN afs_tree_entries parent_entry
+                     ON parent_entry.tree_id = parent.tree_id AND parent_entry.path = $3
+                   LEFT JOIN afs_blobs parent_blob ON parent_blob.id = parent_entry.blob_id
+                   WHERE (current_entry.path = $3 OR parent_entry.path = $3)
+                     AND current_blob.sha256 IS DISTINCT FROM parent_blob.sha256
+                 )
                ORDER BY c.id DESC`,
-              [input.actor.tenant, refFor(mount), path],
+              [input.actor.tenant, ref, path],
             )
             return result.rows.map(row => ({
               commitSha: row.commit_sha,
@@ -705,33 +843,61 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
           }
         },
         async timeline(filter: TimelineFilter = {}) {
-          const client = await options.pool.connect()
-          try {
-            const result = await client.query<CommitRow & { parent_shas: string[]; changed_paths: string[] }>(
-              `SELECT c.id::text, c.commit_sha, c.parents, c.op, c.author_user, c.agent_kind, c.thread_id, c.run_id, c.created_at,
-                      COALESCE((SELECT array_agg(p.path ORDER BY p.path) FROM afs_tree_entries p WHERE p.tree_id = c.tree_id), '{}') AS changed_paths,
-                      '{}'::text[] AS parent_shas
-               FROM afs_commits c WHERE c.tenant = $1
-                 AND ($2::text IS NULL OR c.run_id = $2)
-                 AND ($3::text IS NULL OR c.agent_kind = $3)
-                 AND ($4::text IS NULL OR c.thread_id = $4)
-               ORDER BY c.id`,
-              [input.actor.tenant, filter.runId ?? null, filter.agentKind ?? null, filter.threadId ?? null],
-            )
-            return result.rows.map(row => ({
-              commitSha: row.commit_sha,
-              parentShas: asParentArray(row.parents),
-              changedPaths: [...new Set(row.changed_paths ?? [])].sort(),
-              op: row.op,
-              authorUser: row.author_user,
-              agentKind: row.agent_kind,
-              threadId: row.thread_id,
-              runId: row.run_id,
-              createdAt: new Date(row.created_at),
-            }))
-          } finally {
-            client.release()
+          const records = new Map<string, TimelineRecord>()
+          for (const mount of mounts.values()) {
+            if ('virtual' in mount) continue
+            await ensureRead(mount, { bypassCache: true })
+            const client = await options.pool.connect()
+            try {
+              const ref = refFor(mount)
+              const tip = await client.query<{ commit_sha: string }>(
+                `SELECT c.commit_sha
+                 FROM afs_refs r JOIN afs_commits c ON c.id = r.commit_id
+                 WHERE r.tenant = $1 AND r.name = $2`,
+                [input.actor.tenant, ref],
+              )
+              const tipRow = tip.rows[0]
+              if (!tipRow) continue
+              await assertCommitInMountLineage(client, mount.key, tipRow.commit_sha)
+              const result = await client.query<CommitRow & { changed_paths: string[] }>(
+                `WITH RECURSIVE lineage(id) AS (
+                   SELECT r.commit_id
+                   FROM afs_refs r
+                   WHERE r.tenant = $1 AND r.name = $2
+                   UNION
+                   SELECT parent_id
+                   FROM lineage current
+                   JOIN afs_commits c ON c.id = current.id
+                   CROSS JOIN LATERAL unnest(c.parents) AS parent_id
+                 )
+                 SELECT c.id::text, c.commit_sha, c.parents, c.op, c.author_user, c.agent_kind, c.thread_id, c.run_id, c.created_at,
+                        COALESCE((SELECT array_agg(e.path ORDER BY e.path) FROM afs_tree_entries e WHERE e.tree_id = c.tree_id), '{}') AS changed_paths
+                 FROM lineage JOIN afs_commits c ON c.id = lineage.id
+                 WHERE c.tenant = $1
+                   AND ($3::text IS NULL OR c.run_id = $3)
+                   AND ($4::text IS NULL OR c.agent_kind = $4)
+                   AND ($5::text IS NULL OR c.thread_id = $5)
+                 ORDER BY c.id`,
+                [input.actor.tenant, ref, filter.runId ?? null, filter.agentKind ?? null, filter.threadId ?? null],
+              )
+              for (const row of result.rows) {
+                records.set(row.commit_sha, {
+                  commitSha: row.commit_sha,
+                  parentShas: asParentArray(row.parents),
+                  changedPaths: [...new Set(row.changed_paths ?? [])].sort(),
+                  op: row.op,
+                  authorUser: row.author_user,
+                  agentKind: row.agent_kind,
+                  threadId: row.thread_id,
+                  runId: row.run_id,
+                  createdAt: new Date(row.created_at),
+                })
+              }
+            } finally {
+              client.release()
+            }
           }
+          return [...records.values()]
         },
         async diff(a: string, b: string) {
           const first = resolveCommit(a)
@@ -769,18 +935,7 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
           if (!mount)
             throw new NotFoundError(`Mount not found: ${mountKey}`, { tenant: input.actor.tenant, mount: mountKey })
           if ('virtual' in mount) return unsupportedVirtual(mount.key)
-          const actorGrant = await kernel.resolveGrant(input.actor, { key: mount.key }, { bypassCache: true })
-          if (actorGrant.write === 'none') return 'unauthorized'
-          if (actorGrant.write === 'staged') {
-            if (!mergeOptions.approver) return 'pendingApproval'
-            const approverGrant = await kernel.resolveGrant(
-              mergeOptions.approver,
-              { key: mount.key },
-              { bypassCache: true },
-            )
-            if (approverGrant.write !== 'direct') return 'unauthorized'
-          }
-          return mergeRef(mount)
+          return mergeRef(mount, mergeOptions)
         },
         async restore(mountKey: string, at: string) {
           const mount = mounts.get(mountKey)
@@ -792,68 +947,97 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
               tenant: input.actor.tenant,
               mount: mount.key,
             })
-          const commit = await resolveCommit(at)
-          const client = await options.pool.connect()
-          try {
-            await client.query('BEGIN')
-            const tree = await readTree(client, commit.id)
-            const current = await client.query<{ commit_id: string; commit_sha: string }>(
-              'SELECT r.commit_id::text, c.commit_sha FROM afs_refs r JOIN afs_commits c ON c.id = r.commit_id WHERE r.tenant = $1 AND r.name = $2 FOR UPDATE',
-              [input.actor.tenant, refFor(mount)],
-            )
-            if (!current.rows[0])
-              throw new NotFoundError(`Mount not found: ${mount.key}`, { tenant: input.actor.tenant, mount: mount.key })
-            const created = await insertTreeCommit(
-              client,
-              input.actor.tenant,
-              tree,
-              [BigInt(current.rows[0].commit_id)],
-              [current.rows[0].commit_sha],
-              input,
-              'restore',
-            )
-            await client.query('UPDATE afs_refs SET commit_id = $3::bigint WHERE tenant = $1 AND name = $2', [
-              input.actor.tenant,
-              refFor(mount),
-              created.id.toString(),
-            ])
-            await replaceHeads(client, input.actor.tenant, refFor(mount), tree)
-            await client.query('COMMIT')
-            return {
-              path: '/',
-              sha256: hashTree(
-                [...tree.values()].map(entry => ({ path: entry.path, mode: entry.mode, blobSha: entry.sha256 })),
-              ),
-              sizeBytes: 0n,
-              commitSha: created.sha,
-            }
-          } catch (error) {
-            await client.query('ROLLBACK').catch(() => undefined)
-            throw error
-          } finally {
-            client.release()
-          }
+          const grant = await kernel.resolveGrant(input.actor, { key: mount.key }, { bypassCache: true })
+          if (grant.write === 'none')
+            throw new PermissionDeniedError('Write permission denied', {
+              tenant: input.actor.tenant,
+              mount: mount.key,
+            })
+          const commit = await resolveCommit(at, mount.key, { checkRead: false })
+          return kernel.restore({
+            tenant: input.actor.tenant,
+            mount: mount.key,
+            ref: refFor(mount),
+            sourceCommitId: commit.id,
+            authorUser: input.actor.id,
+            agentKind: input.attribution?.agentKind,
+            threadId: input.attribution?.threadId,
+            runId: input.attribution?.runId,
+          })
         },
         async tag(mountKey: string, label: string) {
           const mount = mounts.get(mountKey)
           if (!mount)
             throw new NotFoundError(`Mount not found: ${mountKey}`, { tenant: input.actor.tenant, mount: mountKey })
           if ('virtual' in mount) return unsupportedVirtual(mount.key)
+          if (mount.mode !== 'follow')
+            throw new PermissionDeniedError('Pinned mount is read-only', {
+              tenant: input.actor.tenant,
+              mount: mount.key,
+            })
+          if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/u.test(label))
+            throw new InvalidPathError(label, 'tag label must be a single safe ref segment', {
+              tenant: input.actor.tenant,
+              mount: mount.key,
+            })
+          const grant = await kernel.resolveGrant(input.actor, { key: mount.key }, { bypassCache: true })
+          if (grant.write === 'none')
+            throw new PermissionDeniedError('Write permission denied', {
+              tenant: input.actor.tenant,
+              mount: mount.key,
+            })
           const client = await options.pool.connect()
           try {
-            const result = await client.query<{ commit_id: string }>(
-              'SELECT commit_id::text FROM afs_refs WHERE tenant = $1 AND name = $2',
+            await client.query('BEGIN')
+            const result = await client.query<{ commit_id: string; commit_sha: string; state: string }>(
+              `SELECT r.commit_id::text, c.commit_sha, r.state
+               FROM afs_refs r JOIN afs_commits c ON c.id = r.commit_id
+               WHERE r.tenant = $1 AND r.name = $2 FOR UPDATE`,
               [input.actor.tenant, refFor(mount)],
             )
             const row = result.rows[0]
             if (!row)
               throw new NotFoundError(`Mount not found: ${mount.key}`, { tenant: input.actor.tenant, mount: mount.key })
+            if (row.state !== 'open')
+              throw new BranchSettledError(row.state, { tenant: input.actor.tenant, mount: mount.key })
             const tagName = `tag/${mount.key}/${label}`
-            await client.query(
-              `INSERT INTO afs_refs (tenant, name, kind, commit_id, state) VALUES ($1, $2, 'tag', $3::bigint, 'open') ON CONFLICT (tenant, name) DO UPDATE SET commit_id = EXCLUDED.commit_id`,
+            const existing = await client.query<{ commit_sha: string }>(
+              `SELECT c.commit_sha
+               FROM afs_refs r JOIN afs_commits c ON c.id = r.commit_id
+               WHERE r.tenant = $1 AND r.name = $2
+               FOR UPDATE`,
+              [input.actor.tenant, tagName],
+            )
+            if (existing.rows[0])
+              throw new PreconditionFailedError(null, existing.rows[0].commit_sha, {
+                tenant: input.actor.tenant,
+                mount: mount.key,
+                ref: tagName,
+              })
+            const inserted = await client.query(
+              `INSERT INTO afs_refs (tenant, name, kind, commit_id, state)
+               VALUES ($1, $2, 'tag', $3::bigint, 'tag')
+               ON CONFLICT (tenant, name) DO NOTHING`,
               [input.actor.tenant, tagName, row.commit_id],
             )
+            if ((inserted.rowCount ?? 0) === 0) {
+              const concurrent = await client.query<{ commit_sha: string }>(
+                `SELECT c.commit_sha
+                 FROM afs_refs r JOIN afs_commits c ON c.id = r.commit_id
+                 WHERE r.tenant = $1 AND r.name = $2`,
+                [input.actor.tenant, tagName],
+              )
+              throw new PreconditionFailedError(null, concurrent.rows[0]?.commit_sha ?? null, {
+                tenant: input.actor.tenant,
+                mount: mount.key,
+                ref: tagName,
+              })
+            }
+            await client.query('COMMIT')
             return tagName
+          } catch (error) {
+            await client.query('ROLLBACK').catch(() => undefined)
+            throw error
           } finally {
             client.release()
           }
@@ -876,11 +1060,12 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
         },
       } as SessionFileSystem
 
-      async function mergeRef(mount: RefMount): Promise<MergeResult> {
+      async function mergeRef(mount: RefMount, mergeOptions: { approver?: Actor } = {}): Promise<MergeResult> {
         if (!mount.fork || !mount.ref) return 'merged'
         const client = await options.pool.connect()
         try {
           await client.query('BEGIN')
+          await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`${input.actor.tenant}:mount/${mount.key}`])
           const refResult = await client.query<{
             commit_id: string
             base_commit: string
@@ -893,8 +1078,38 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
           const branch = refResult.rows[0]
           if (!branch)
             throw new NotFoundError(`Branch not found: ${mount.ref}`, { tenant: input.actor.tenant, mount: mount.key })
+          const actorGrant = await kernel.resolveGrant(input.actor, { key: mount.key }, { bypassCache: true })
+          if (actorGrant.write === 'none') {
+            if (branch.state === 'open') {
+              await client.query(
+                `UPDATE afs_refs SET state = 'unauthorized', settled_at = now()
+                 WHERE tenant = $1 AND name = $2`,
+                [input.actor.tenant, mount.ref],
+              )
+              await client.query('COMMIT')
+            } else {
+              await client.query('ROLLBACK')
+            }
+            return 'unauthorized'
+          }
           if (branch.state !== 'open')
             throw new BranchSettledError(branch.state, { tenant: input.actor.tenant, mount: mount.key, ref: mount.ref })
+
+          if (actorGrant.write === 'staged') {
+            if (!mergeOptions.approver) {
+              await client.query('ROLLBACK')
+              return 'pendingApproval'
+            }
+            const approverGrant = await kernel.resolveGrant(
+              mergeOptions.approver,
+              { key: mount.key },
+              { bypassCache: true },
+            )
+            if (approverGrant.write !== 'direct') {
+              await client.query('ROLLBACK')
+              return 'unauthorized'
+            }
+          }
           const mountResult = await client.query<{ commit_id: string; commit_sha: string }>(
             'SELECT r.commit_id::text, c.commit_sha FROM afs_refs r JOIN afs_commits c ON c.id = r.commit_id WHERE r.tenant = $1 AND r.name = $2 FOR UPDATE',
             [input.actor.tenant, `mount/${mount.key}`],

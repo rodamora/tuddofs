@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { GrantResolverError, GrantController } from '../index.js'
+import { GrantResolverError, GrantController, PermissionDeniedError } from '../index.js'
 
 test('resolver throw surfaces GrantResolverError and denies the operation', async () => {
   const grants = new GrantController({
@@ -11,6 +11,17 @@ test('resolver throw surfaces GrantResolverError and denies the operation', asyn
   })
 
   await assert.rejects(grants.resolve({ id: 'u1', tenant: 't1' }, { key: 'project:one' }), GrantResolverError)
+})
+
+test('typed AgentFsError from a resolver propagates without taxonomy wrapping', async () => {
+  const denied = new PermissionDeniedError('resolver denied', { tenant: 't1', mount: 'project:one' })
+  const grants = new GrantController({
+    resolve: async () => {
+      throw denied
+    },
+  })
+
+  await assert.rejects(grants.resolve({ id: 'u1', tenant: 't1' }, { key: 'project:one' }), error => error === denied)
 })
 
 test('resolver timeout surfaces GrantResolverError and denies the operation', async () => {

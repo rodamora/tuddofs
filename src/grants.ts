@@ -1,4 +1,4 @@
-import { GrantResolverError } from './errors.js'
+import { AgentFsError, GrantResolverError } from './errors.js'
 import type { Actor, GrantResolver, WriteMode } from './kernel.js'
 
 export interface Grant {
@@ -28,14 +28,14 @@ export class GrantController {
     this.ttlMs = 'ttlMs' in options ? (options.ttlMs ?? 30_000) : 30_000
     this.timeoutMs = 'timeoutMs' in options ? (options.timeoutMs ?? 5_000) : 5_000
     this.now = 'now' in options ? (options.now ?? (() => Date.now())) : () => Date.now()
-    if (!Number.isFinite(this.ttlMs) || this.ttlMs < 0)
-      throw new RangeError('Grant cache TTL must be finite and non-negative')
+    if (!Number.isFinite(this.ttlMs) || this.ttlMs < 0 || this.ttlMs > 30_000)
+      throw new RangeError('Grant cache TTL must be finite, non-negative, and at most 30000ms')
     if (!Number.isFinite(this.timeoutMs) || this.timeoutMs <= 0)
       throw new RangeError('Grant resolver timeout must be finite and positive')
   }
 
   async resolve(actor: Actor, mount: { key: string }, options: { bypassCache?: boolean } = {}): Promise<Grant> {
-    const key = `${actor.id}\u0000${mount.key}`
+    const key = `${actor.tenant}\u0000${actor.id}\u0000${mount.key}`
     const now = this.now()
     if (!options.bypassCache) {
       const cached = this.cache.get(key)
@@ -46,6 +46,7 @@ export class GrantController {
     try {
       result = await this.withTimeout(this.resolveFn(actor, mount))
     } catch (error) {
+      if (error instanceof AgentFsError) throw error
       throw new GrantResolverError(error instanceof Error ? error.message : 'Grant resolver failed', {
         tenant: actor.tenant,
         mount: mount.key,
@@ -62,12 +63,17 @@ export class GrantController {
     return grant
   }
 
-  invalidate(actorId: string, mountKey?: string): void {
-    if (mountKey === undefined) {
-      for (const key of this.cache.keys()) if (key.startsWith(`${actorId}\u0000`)) this.cache.delete(key)
-      return
+  invalidate(actorId: string, mountKey?: string, tenant?: string): void {
+    const actorPrefix = tenant === undefined ? undefined : `${tenant}\u0000${actorId}\u0000`
+    for (const key of this.cache.keys()) {
+      if (actorPrefix !== undefined) {
+        if (!key.startsWith(actorPrefix)) continue
+      } else {
+        const parts = key.split('\u0000')
+        if (parts.length !== 3 || parts[1] !== actorId) continue
+      }
+      if (mountKey === undefined || key.endsWith(`\u0000${mountKey}`)) this.cache.delete(key)
     }
-    this.cache.delete(`${actorId}\u0000${mountKey}`)
   }
 
   private async withTimeout<T>(promise: Promise<T>): Promise<T> {

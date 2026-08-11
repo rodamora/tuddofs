@@ -1,0 +1,244 @@
+import assert from 'node:assert/strict'
+import test, { after, before, beforeEach } from 'node:test'
+
+import { Pool } from 'pg'
+import {
+  BranchSettledError,
+  GrantController,
+  InvalidPathError,
+  NotFoundError,
+  PermissionDeniedError,
+  PreconditionFailedError,
+  createAgentFs,
+  migrate,
+} from '../index.js'
+
+const pool = new Pool({ connectionString: process.env.AGENT_FS_DATABASE_URL })
+const tenant = 'session-security-integration'
+const actor = { id: 'security-user', tenant }
+
+before(async () => migrate(pool))
+beforeEach(async () => {
+  await pool.query(
+    'TRUNCATE afs_heads, afs_refs, afs_commits, afs_tree_entries, afs_trees, afs_blobs RESTART IDENTITY CASCADE',
+  )
+})
+after(async () => pool.end())
+
+function fsWith(grant: (mount: string) => { read: boolean; write: 'direct' | 'staged' | 'none' }) {
+  return createAgentFs({ pool, grants: { resolve: async (_actor, mount) => grant(mount.key) } })
+}
+
+async function seedMount(key: string, path: string, value: string): Promise<string> {
+  const fs = fsWith(() => ({ read: true, write: 'direct' }))
+  const session = await fs.open({ actor, sessionId: `seed-${key}`, mounts: [{ key }] })
+  const result = await session.write(`${key}:${path}`, value)
+  await session.resolveMerge(key)
+  return result.commitSha
+}
+
+test('pinnedRef rejects a commit or ref outside the pinned mount lineage', async () => {
+  await seedMount('hr-payroll', '/secret.txt', 'payroll-secret')
+  const fs = fsWith(() => ({ read: true, write: 'direct' }))
+  const session = await fs.open({
+    actor,
+    sessionId: 'pin-confinement',
+    mounts: [{ key: 'scratch', mode: { pin: 'mount/hr-payroll' } }],
+  })
+
+  await assert.rejects(session.read('scratch:/secret.txt'), NotFoundError)
+})
+test('restore rejects a foreign tenant commit that is not in the addressed mount lineage', async () => {
+  const foreignSha = await seedMount('foreign', '/secret.txt', 'foreign-secret')
+  const fs = fsWith(() => ({ read: true, write: 'direct' }))
+  const session = await fs.open({ actor, sessionId: 'restore-confinement', mounts: [{ key: 'scratch' }] })
+
+  await assert.rejects(session.restore('scratch', foreignSha), NotFoundError)
+})
+
+test('pinnedRef rejects a foreign commit SHA even when the ref is hidden', async () => {
+  const foreignSha = await seedMount('hr-payroll', '/secret.txt', 'payroll-secret')
+  const fs = fsWith(() => ({ read: true, write: 'direct' }))
+  const session = await fs.open({
+    actor,
+    sessionId: 'pin-sha-confinement',
+    mounts: [{ key: 'scratch', mode: { pin: foreignSha } }],
+  })
+
+  await assert.rejects(session.read('scratch:/secret.txt'), NotFoundError)
+})
+
+test('timeline only returns commits reachable from the session mounts', async () => {
+  const foreignSha = await seedMount('foreign', '/secret.txt', 'foreign-secret')
+  const fs = fsWith(() => ({ read: true, write: 'direct' }))
+  const session = await fs.open({ actor, sessionId: 'timeline-confinement', mounts: [{ key: 'scratch' }] })
+  const ownSha = (await session.write('scratch:/own.txt', 'own')).commitSha
+
+  const timeline = await session.timeline()
+  assert.ok(timeline.some(record => record.commitSha === ownSha))
+  assert.ok(!timeline.some(record => record.commitSha === foreignSha))
+})
+
+test('history only returns path changes from the addressed mount lineage', async () => {
+  await seedMount('foreign', '/secret.txt', 'foreign-secret')
+  const fs = fsWith(() => ({ read: true, write: 'direct' }))
+  const session = await fs.open({ actor, sessionId: 'history-confinement', mounts: [{ key: 'scratch' }] })
+
+  assert.deepEqual(await session.history('scratch:/secret.txt'), [])
+})
+
+test('history includes a deletion commit when the path disappears from the tree', async () => {
+  const fs = fsWith(() => ({ read: true, write: 'direct' }))
+  const session = await fs.open({ actor, sessionId: 'history-deletion', mounts: [{ key: 'scratch' }] })
+  await session.write('scratch:/deleted.txt', 'gone')
+  await session.delete('scratch:/deleted.txt')
+
+  assert.ok((await session.history('scratch:/deleted.txt')).some(record => record.op === 'delete'))
+})
+
+test('timeline re-resolves read permission for every granted mount', async () => {
+  let read = true
+  const fs = fsWith(() => ({ read, write: 'direct' }))
+  const session = await fs.open({ actor, sessionId: 'timeline-grant-check', mounts: [{ key: 'scratch' }] })
+  read = false
+
+  await assert.rejects(session.timeline(), PermissionDeniedError)
+})
+
+test('diff rejects raw commits that are not reachable from a granted mount', async () => {
+  const foreignSha = await seedMount('foreign', '/secret.txt', 'foreign-secret')
+  const fs = fsWith(() => ({ read: true, write: 'direct' }))
+  const session = await fs.open({ actor, sessionId: 'diff-confinement', mounts: [{ key: 'scratch' }] })
+  const ownSha = (await session.write('scratch:/own.txt', 'own')).commitSha
+
+  await assert.rejects(session.diff(foreignSha, ownSha), NotFoundError)
+})
+
+test('restore re-resolves the write grant at operation time', async () => {
+  let write: 'direct' | 'none' = 'direct'
+  const fs = fsWith(() => ({ read: true, write }))
+  const seed = await fs.open({ actor, sessionId: 'restore-grant-seed', mounts: [{ key: 'scratch' }] })
+  const sha = (await seed.write('scratch:/before.txt', 'before')).commitSha
+  write = 'none'
+
+  const session = await fs.open({ actor, sessionId: 'restore-grant-check', mounts: [{ key: 'scratch' }] })
+  await assert.rejects(session.restore('scratch', sha), PermissionDeniedError)
+})
+
+test('restore refuses to mutate a settled branch', async () => {
+  const fs = fsWith(() => ({ read: true, write: 'direct' }))
+  const seed = await fs.open({ actor, sessionId: 'restore-settled-seed', mounts: [{ key: 'scratch' }] })
+  const sha = (await seed.write('scratch:/before.txt', 'before')).commitSha
+  const session = await fs.open({ actor, sessionId: 'restore-settled-check', mounts: [{ key: 'scratch' }] })
+  await session.discard()
+
+  await assert.rejects(session.restore('scratch', sha), BranchSettledError)
+})
+
+test('tag re-resolves write permission and validates labels', async () => {
+  let write: 'direct' | 'none' = 'direct'
+  const fs = fsWith(() => ({ read: true, write }))
+  const session = await fs.open({ actor, sessionId: 'tag-validation', mounts: [{ key: 'scratch' }] })
+  write = 'none'
+  await assert.rejects(session.tag('scratch', 'safe'), PermissionDeniedError)
+
+  write = 'direct'
+  await assert.rejects(session.tag('scratch', '../escape'), InvalidPathError)
+})
+
+test('tag state is immutable and uses the tag state', async () => {
+  const fs = fsWith(() => ({ read: true, write: 'direct' }))
+  const session = await fs.open({ actor, sessionId: 'tag-immutable', mounts: [{ key: 'scratch' }] })
+  await session.write('scratch:/first.txt', 'first')
+  const tagName = await session.tag('scratch', 'snapshot')
+  await session.write('scratch:/second.txt', 'second')
+
+  await assert.rejects(session.tag('scratch', 'snapshot'), PreconditionFailedError)
+  const tag = await pool.query<{ commit_sha: string; state: string }>(
+    `SELECT c.commit_sha, r.state
+     FROM afs_refs r JOIN afs_commits c ON c.id = r.commit_id
+     WHERE r.tenant = $1 AND r.name = $2`,
+    [tenant, tagName],
+  )
+  assert.equal(tag.rows[0]?.state, 'tag')
+  assert.equal(tag.rows[0]?.commit_sha, (await session.timeline()).find(record => record.op === 'write')?.commitSha)
+})
+
+test('merge records unauthorized when the live writer grant is revoked', async () => {
+  let write: 'direct' | 'none' = 'direct'
+  const fs = fsWith(() => ({ read: true, write }))
+  const session = await fs.open({ actor, sessionId: 'merge-unauthorized', mounts: [{ key: 'scratch' }] })
+  write = 'none'
+
+  assert.equal(await session.resolveMerge('scratch'), 'unauthorized')
+  const branch = await pool.query<{ state: string }>('SELECT state FROM afs_refs WHERE tenant = $1 AND name = $2', [
+    tenant,
+    'agent/merge-unauthorized/scratch',
+  ])
+  assert.equal(branch.rows[0]?.state, 'unauthorized')
+})
+
+test('kernel delete retries a compare-and-swap conflict before failing', async () => {
+  const normal = fsWith(() => ({ read: true, write: 'direct' }))
+  const session = await normal.open({ actor, sessionId: 'delete-cas', mounts: [{ key: 'scratch' }] })
+  await session.write('scratch:/delete-me.txt', 'delete-me')
+
+  let failures = 1
+  const flakyPool = {
+    connect: async () => {
+      const client = await pool.connect()
+      return {
+        query: async <Row extends Record<string, unknown>>(text: string, values?: readonly unknown[]) => {
+          if (text.includes('UPDATE afs_refs SET commit_id') && failures > 0) {
+            failures -= 1
+            return { rows: [] as Row[], rowCount: 0 }
+          }
+          return client.query<Row>(text, values === undefined ? undefined : [...values])
+        },
+        release: (error?: Error) => client.release(error),
+      }
+    },
+  }
+  const flaky = createAgentFs({
+    pool: flakyPool,
+    grants: { resolve: async () => ({ read: true, write: 'direct' }) },
+    maxCasRetries: 2,
+  })
+
+  const result = await flaky.delete({
+    tenant,
+    mount: 'scratch',
+    ref: 'agent/delete-cas/scratch',
+    path: '/delete-me.txt',
+    authorUser: actor.id,
+  })
+  assert.equal(result.path, '/delete-me.txt')
+  assert.equal(failures, 0)
+})
+test('grant cache isolates identical actor ids across tenants and enforces its ttl ceiling', async () => {
+  let calls = 0
+  const grants = new GrantController({
+    ttlMs: 30_000,
+    resolve: async actorForGrant => {
+      calls += 1
+      return { read: actorForGrant.tenant === 'tenant-a', write: 'none' }
+    },
+  })
+  const sameId = { id: 'same-user', tenant: 'tenant-a' }
+  await grants.resolve(sameId, { key: 'mount' })
+  const other = await grants.resolve({ id: sameId.id, tenant: 'tenant-b' }, { key: 'mount' })
+  assert.equal(other.read, false)
+  assert.equal(calls, 2)
+  grants.invalidate('same-user', 'mount', 'tenant-a')
+  await grants.resolve(sameId, { key: 'mount' })
+  await grants.resolve({ id: sameId.id, tenant: 'tenant-b' }, { key: 'mount' })
+  assert.equal(calls, 3)
+  assert.throws(
+    () =>
+      new GrantController({
+        ttlMs: 30_001,
+        resolve: async () => ({ read: true, write: 'none' }),
+      }),
+    RangeError,
+  )
+})
