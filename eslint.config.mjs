@@ -2,7 +2,7 @@ import tseslint from 'typescript-eslint'
 
 export default tseslint.config(
   {
-    ignores: ['dist/**', 'node_modules/**', '**/*.mjs'],
+    ignores: ['**/dist/**', '**/node_modules/**', '**/*.mjs'],
   },
   ...tseslint.configs.recommendedTypeChecked,
   {
@@ -16,7 +16,7 @@ export default tseslint.config(
     },
   },
   {
-    files: ['src/**/__tests__/**/*.ts', 'src/integration/**/*.ts'],
+    files: ['src/**/__tests__/**/*.ts', 'src/integration/**/*.ts', 'packages/s3/test/**/*.ts'],
     rules: {
       '@typescript-eslint/no-floating-promises': 'off',
       '@typescript-eslint/require-await': 'off',

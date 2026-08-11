@@ -7,7 +7,7 @@
   "author": "Rod Amora",
   "repository": {
     "type": "git",
-    "url": "https://github.com/rodamora/tuddofs.git",
+    "url": "git+https://github.com/rodamora/tuddofs.git",
     "directory": "packages/s3"
   },
   "files": [

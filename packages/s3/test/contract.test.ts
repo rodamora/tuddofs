@@ -32,7 +32,7 @@ if (endpoint) {
     }
   })
 
-  after(async () => {
+  after(() => {
     client.destroy()
   })
 
@@ -43,7 +43,9 @@ if (endpoint) {
     await store.put(key, bytes)
     assert.deepEqual(await store.head(key), { sizeBytes: bytes.length })
     assert.deepEqual(await collect(await store.get(key)), bytes)
-    assert.deepEqual(await store.list(prefix), [{ key, lastModified: (await store.list(prefix))[0]!.lastModified }])
+    const listed = await store.list(prefix)
+    assert.equal(listed.length, 1)
+    assert.equal(listed[0]?.key, key)
 
     await store.delete(key)
     assert.equal(await store.head(key), null)
@@ -93,6 +95,6 @@ if (endpoint) {
 
 async function collect(stream: Readable): Promise<Buffer> {
   const chunks: Buffer[] = []
-  for await (const chunk of stream) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
+  for await (const chunk of stream) chunks.push(Buffer.from(chunk as Uint8Array))
   return Buffer.concat(chunks)
 }
