@@ -4,14 +4,12 @@ import test, { after, before, beforeEach } from 'node:test'
 import { Pool } from 'pg'
 import {
   BranchSettledError,
-  GrantController,
-  InvalidPathError,
   NotFoundError,
   PermissionDeniedError,
   PreconditionFailedError,
   createTuddoFs,
-  migrate,
 } from '../index.js'
+import { GrantController, InvalidPathError, migrate } from '../internal.js'
 
 const pool = new Pool({ connectionString: process.env.TUDDOFS_DATABASE_URL })
 const tenant = 'session-security-integration'
@@ -55,7 +53,7 @@ async function seedMount(key: string, path: string, value: string): Promise<stri
     mounts: [{ key }],
   })
   const result = await session.write(`${key}:${path}`, value)
-  await session.resolveMerge(key)
+  await session.merge({ mounts: [key] })
   return result.commitSha
 }
 async function waitForMergeGrantFreshnessWindow(): Promise<void> {
@@ -245,7 +243,9 @@ test('merge records unauthorized when the live writer grant is revoked', async (
   })
   write = 'none'
 
-  assert.equal(await session.resolveMerge('scratch'), 'unauthorized')
+  assert.deepEqual(await session.merge({ mounts: ['scratch'] }), {
+    scratch: { status: 'unauthorized' },
+  })
   const branch = await pool.query<{ state: string }>('SELECT state FROM tuddo_refs WHERE tenant = $1 AND name = $2', [
     tenant,
     'agent/merge-unauthorized/scratch',
@@ -298,12 +298,12 @@ test('staged merge returns merged for an already merged branch', async () => {
   await session.write('scratch:/staged.txt', 'staged')
 
   write = 'direct'
-  assert.equal(await session.resolveMerge('scratch'), 'merged')
+  assert.deepEqual(await session.merge({ mounts: ['scratch'] }), { scratch: { status: 'merged' } })
   write = 'staged'
-  assert.equal(await session.resolveMerge('scratch'), 'merged')
+  assert.deepEqual(await session.merge({ mounts: ['scratch'] }), { scratch: { status: 'merged' } })
 })
 
-test('staged merge raises BranchSettledError for an abandoned branch', async () => {
+test('staged merge reports unauthorized for an abandoned branch', async () => {
   const fs = fsWith(() => ({ read: true, write: 'staged' }))
   const session = await fs.open({
     actor,
@@ -313,7 +313,9 @@ test('staged merge raises BranchSettledError for an abandoned branch', async () 
   await session.write('scratch:/staged.txt', 'staged')
   await session.discard()
 
-  await assert.rejects(session.resolveMerge('scratch'), BranchSettledError)
+  assert.deepEqual(await session.merge({ mounts: ['scratch'] }), {
+    scratch: { status: 'unauthorized' },
+  })
 })
 
 test('kernel delete retries a compare-and-swap conflict before failing', async () => {
@@ -505,7 +507,7 @@ test('merge refreshes a grant that aged while waiting for a saturated pool', asy
     await session.write('scratch:/staged.txt', 'staged')
     held = await saturatedPool.connect()
     mergeStarted = true
-    const mergePromise = session.resolveMerge('scratch')
+    const mergePromise = session.merge({ mounts: ['scratch'] })
 
     await grantSeen
     write = 'none'
@@ -516,7 +518,7 @@ test('merge refreshes a grant that aged while waiting for a saturated pool', asy
 
     const result = await mergePromise
     assert.ok(grantCalls >= 5)
-    assert.equal(result, 'unauthorized')
+    assert.deepEqual(result, { scratch: { status: 'unauthorized' } })
     const branch = await pool.query<{ state: string }>('SELECT state FROM tuddo_refs WHERE tenant = $1 AND name = $2', [
       tenant,
       'agent/merge-grant-revoked-while-waiting/scratch',
@@ -565,7 +567,7 @@ test('merge refreshes a stale denied grant after it is restored while waiting', 
     held = await saturatedPool.connect()
     write = 'none'
     mergeStarted = true
-    const mergePromise = session.resolveMerge('scratch')
+    const mergePromise = session.merge({ mounts: ['scratch'] })
 
     await grantSeen
     write = 'direct'
@@ -575,7 +577,7 @@ test('merge refreshes a stale denied grant after it is restored while waiting', 
     held = undefined
     const result = await mergePromise
     assert.ok(grantCalls >= 5)
-    assert.equal(result, 'merged')
+    assert.deepEqual(result, { scratch: { status: 'merged' } })
     const branch = await pool.query<{ state: string }>('SELECT state FROM tuddo_refs WHERE tenant = $1 AND name = $2', [
       tenant,
       'agent/merge-grant-restored-while-waiting/scratch',
@@ -607,10 +609,13 @@ test('merge records the other mount when a settled mount throws', async () => {
   await session.write('p:/p.txt', 'p')
   await session.write('q:/q.txt', 'q')
   pWrite = 'none'
-  assert.equal(await session.resolveMerge('p'), 'unauthorized')
+  assert.deepEqual(await session.merge({ mounts: ['p'] }), { p: { status: 'unauthorized' } })
   pWrite = 'direct'
 
-  assert.deepEqual(await session.merge(), { p: 'unauthorized', q: 'merged' })
+  assert.deepEqual(await session.merge(), {
+    p: { status: 'unauthorized' },
+    q: { status: 'merged' },
+  })
   assert.equal((await session.read('q:/q.txt')).toString(), 'q')
 })
 test('merge reports a settled mount alongside other per-mount outcomes', async () => {
@@ -629,8 +634,8 @@ test('merge reports a settled mount alongside other per-mount outcomes', async (
   )
 
   assert.deepEqual(await session.merge(), {
-    p: { settled: 'abandoned' },
-    q: 'merged',
+    p: { status: 'unauthorized' },
+    q: { status: 'merged' },
   })
 })
 
@@ -706,7 +711,7 @@ test('timeline preserves stored merge parent order', async () => {
     mounts: [{ key: 'scratch' }],
   })
   const firstWrite = await first.write('scratch:/first.txt', 'first')
-  await first.resolveMerge('scratch')
+  await first.merge({ mounts: ['scratch'] })
 
   const second = await fs.open({
     actor,
@@ -720,8 +725,8 @@ test('timeline preserves stored merge parent order', async () => {
     mounts: [{ key: 'scratch' }],
   })
   await external.write('scratch:/external.txt', 'external')
-  await external.resolveMerge('scratch')
-  assert.equal(await second.resolveMerge('scratch'), 'merged')
+  await external.merge({ mounts: ['scratch'] })
+  assert.deepEqual(await second.merge({ mounts: ['scratch'] }), { scratch: { status: 'merged' } })
 
   const mountTip = await pool.query<{ commit_id: string; parents: string[] }>(
     `SELECT c.id::text, c.parents
@@ -749,7 +754,7 @@ test('timeline preserves stored merge parent order', async () => {
   void firstWrite
   void secondWrite
 })
-test('session merge omits pinned mounts and rejects direct pinned merges', async () => {
+test('session merge omits pinned mounts including when selected', async () => {
   await seedMount('pinned-source', '/source.txt', 'source')
   const fs = fsWith(() => ({ read: true, write: 'direct' }))
   const session = await fs.open({
@@ -759,5 +764,5 @@ test('session merge omits pinned mounts and rejects direct pinned merges', async
   })
 
   assert.deepEqual(await session.merge(), {})
-  await assert.rejects(session.resolveMerge('pinned'), PermissionDeniedError)
+  assert.deepEqual(await session.merge({ mounts: ['pinned'] }), {})
 })

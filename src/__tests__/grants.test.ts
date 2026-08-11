@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { GrantResolverError, GrantController, PermissionDeniedError, createTuddoFs } from '../index.js'
+import { GrantResolverError, PermissionDeniedError } from '../index.js'
+import { GrantController, createTuddoFs } from '../internal.js'
 
 test('resolver throw surfaces GrantResolverError and denies the operation', async () => {
   const grants = new GrantController({

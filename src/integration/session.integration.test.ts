@@ -2,14 +2,8 @@ import assert from 'node:assert/strict'
 import test, { after, before, beforeEach } from 'node:test'
 
 import { Pool } from 'pg'
-import {
-  BranchSettledError,
-  NotFoundError,
-  PermissionDeniedError,
-  PreconditionFailedError,
-  createTuddoFs,
-  migrate,
-} from '../index.js'
+import { BranchSettledError, NotFoundError, PermissionDeniedError, PreconditionFailedError, createTuddoFs } from '../index.js'
+import { migrate } from '../internal.js'
 
 const pool = new Pool({ connectionString: process.env.TUDDOFS_DATABASE_URL })
 const tenant = 'session-integration'
@@ -49,7 +43,7 @@ test('session file API writes, edits, lists, globs, stats, deletes, and maps err
     ['/notes.md'],
   )
 
-  const edited = await session.edit('project:docs:/notes.md', [{ start: 5, end: 5, text: ' world' }], {
+  const edited = await session.edit('project:docs:/notes.md', [{ oldText: 'hello', newText: 'hello world' }], {
     ifSha: created.sha256,
   })
   assert.equal(await session.read('project:docs:/notes.md'), 'hello world')
@@ -95,7 +89,7 @@ test('session merge skips virtual mounts and is idempotent after completion', as
 
   await session.write('project:docs:/notes.md', 'hello')
   const first = await session.merge()
-  assert.equal(first['project:docs'], 'merged')
+  assert.deepEqual(first['project:docs'], { status: 'merged' })
   assert.equal(first['team:roster'], undefined)
 
   const second = await session.merge()

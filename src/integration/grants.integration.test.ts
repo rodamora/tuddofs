@@ -2,7 +2,8 @@ import assert from 'node:assert/strict'
 import test, { after, before, beforeEach } from 'node:test'
 
 import { Pool } from 'pg'
-import { GrantResolverError, PermissionDeniedError, createTuddoFs, migrate } from '../index.js'
+import { GrantResolverError, PermissionDeniedError, createTuddoFs } from '../index.js'
+import { migrate } from '../internal.js'
 
 const pool = new Pool({ connectionString: process.env.TUDDOFS_DATABASE_URL })
 const tenant = 'grants-integration'

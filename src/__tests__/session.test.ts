@@ -71,7 +71,7 @@ test('virtual mounts are read-only when handler write is absent and have no hist
   await assert.rejects(session.restore('live:data', 'tag/live'), NotFoundError)
   await assert.rejects(session.tag('live:data', 'snapshot'), NotFoundError)
   assert.deepEqual(await session.merge(), {})
-  await assert.rejects(session.resolveMerge('live:data'), NotFoundError)
+  assert.deepEqual(await session.merge({ mounts: ['live:data'] }), {})
 })
 test('virtual glob entries use UTF-16 code-unit ordering', async () => {
   const fs = createTuddoFs({
