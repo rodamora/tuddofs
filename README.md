@@ -4,12 +4,14 @@
 
 ## Current status
 
-The kernel and session layers are implemented and covered by unit and PostgreSQL integration tests. This release includes governed mounts, branch and commit history, merge and merge resolution, restore, tags, pinning, garbage collection, and verification.
+The kernel and session layers are implemented and covered by unit and PostgreSQL integration tests. This release includes governed mounts, branch and commit history, merge and merge resolution, restore, tags, pinning, garbage collection, verification, and object-storage streaming.
 
 The following are intentionally not promised features of this release:
 
 - a sync engine for external workspaces;
-- streaming large-blob reads and writes.
+- multipart object-storage upload.
+
+The session streaming methods require a `BlobStore` with stream-capable `put`, server-side `copy`, and the relevant presign method. `readStream` returns a Node `Readable`; `writeStream` hashes into a quarantine key before promoting to `tuddo/<tenant>/<sha256>` and committing. `presign(address, { method: 'GET' })` issues a read URL, while PUT requires `{ method: 'PUT', sha256 }` so the store signs `x-amz-checksum-sha256`. Missing storage capabilities fail with `StorageError`.
 
 These boundaries are reflected in the exported API; do not build a production workflow around capabilities that are not listed there.
 
@@ -200,6 +202,19 @@ docker run --rm --detach --name tuddofs-it \
 until docker exec tuddofs-it pg_isready -U tuddofs -d tuddofs_it >/dev/null 2>&1; do sleep 1; done
 TUDDOFS_DATABASE_URL="postgresql://tuddofs:tuddofs@127.0.0.1:${TUDDOFS_IT_PORT:-55771}/tuddofs_it" npm run test:integration
 docker rm --force tuddofs-it
+```
+
+The 2 GB streaming acceptance test uses MinIO and asserts a 384 MiB server RSS-growth ceiling:
+
+```bash
+docker run --rm --detach --name tuddofs-minio \
+  --env MINIO_ROOT_USER=tuddofs \
+  --env MINIO_ROOT_PASSWORD=tuddofs-secret \
+  --publish 55774:9000 \
+  minio/minio server /data
+TUDDOFS_DATABASE_URL="postgresql://tuddofs:tuddofs@127.0.0.1:${TUDDOFS_IT_PORT:-55771}/tuddofs_it" \
+  npm run test:minio
+docker rm --force tuddofs-minio
 ```
 
 Never point these commands at a shared development or production database.

@@ -28,12 +28,18 @@ export interface BlobObject {
   readonly lastModified: Date | string
 }
 
+/**
+ * Object storage used by the kernel. `put` accepts a stream so session
+ * streaming can keep large blobs out of server memory (§8.1).
+ */
 export interface BlobStore {
-  put(key: string, bytes: Buffer): Promise<void>
+  put(key: string, bytes: Buffer | Readable): Promise<void>
   head(key: string): Promise<{ sizeBytes: number } | null>
   get(key: string): Promise<Readable>
   delete(key: string): Promise<void>
   list?(prefix: string): Promise<readonly BlobObject[]>
+  /** Server-side copy used to promote a completed quarantine upload (§8.1). */
+  copy?(sourceKey: string, destinationKey: string): Promise<void>
   presignPut?(key: string, opts: { ttlSeconds: number; checksumSha256: string }): Promise<string>
   presignGet?(key: string, opts: { ttlSeconds: number }): Promise<string>
 }
@@ -171,6 +177,23 @@ export interface WriteInput {
   readonly ref: string
   readonly path: string
   readonly bytes: Buffer | Uint8Array | string
+  readonly ifSha?: string | null
+  readonly authorUser: string
+  readonly agentKind?: string | null
+  readonly threadId?: string | null
+  readonly runId?: string | null
+  readonly op?: string
+  readonly message?: string | null
+}
+
+interface StoredWriteInput {
+  readonly tenant: string
+  readonly mount: string
+  readonly ref: string
+  readonly path: string
+  readonly sha256: string
+  readonly sizeBytes: bigint
+  readonly objectKey: string
   readonly ifSha?: string | null
   readonly authorUser: string
   readonly agentKind?: string | null
@@ -399,18 +422,20 @@ function timestamp(now: () => Date, context: ErrorContext): { date: Date; iso: s
 async function insertBlob(
   client: Queryable,
   tenant: string,
-  bytes: Buffer,
+  bytes: Buffer | null,
+  sizeBytes: number | bigint,
   sha256: string,
   inlineMaxBytes: number,
   objectKey: string | null,
   context: ErrorContext,
 ): Promise<bigint> {
+  const size = BigInt(sizeBytes)
   const result = await client.query<{ id: string }>(
     `INSERT INTO tuddo_blobs (tenant, sha256, size_bytes, inline, object_key)
      VALUES ($1, $2, $3, $4, $5)
      ON CONFLICT (tenant, sha256) DO NOTHING
      RETURNING id::text`,
-    [tenant, sha256, bytes.length.toString(), bytes.length <= inlineMaxBytes ? bytes : null, objectKey],
+    [tenant, sha256, size.toString(), bytes && size <= BigInt(inlineMaxBytes) ? bytes : null, objectKey],
   )
   if (result.rows[0]) return asBigInt(result.rows[0].id, 'tuddo_blobs.id', context)
   const existing = await client.query<{ id: string; size_bytes: string }>(
@@ -419,9 +444,8 @@ async function insertBlob(
   )
   const row = existing.rows[0]
   if (!row) throw new InvariantError(`Blob insert/select failed for ${sha256}`, context)
-  if (asBigInt(row.size_bytes, 'tuddo_blobs.size_bytes', context) !== BigInt(bytes.length)) {
+  if (asBigInt(row.size_bytes, 'tuddo_blobs.size_bytes', context) !== size)
     throw new InvariantError(`Blob collision for ${sha256}`, context)
-  }
   return asBigInt(row.id, 'tuddo_blobs.id', context)
 }
 
@@ -1483,6 +1507,129 @@ export function createTuddoFs(inputOptions: TuddoFsOptions): TuddoFsKernel {
       client.release()
     }
   }
+  async function writeStored(input: StoredWriteInput): Promise<WriteResult> {
+    const initialContext = contextFor({
+      tenant: input.tenant,
+      mount: input.mount,
+      ref: input.ref,
+    })
+    validateMountKey(input.mount, initialContext)
+    const path = validatePath(input.path, initialContext)
+    const context = contextFor({
+      tenant: input.tenant,
+      mount: input.mount,
+      path,
+      ref: input.ref,
+    })
+    if (!(await grant(grants, 'write', input))) throw new PermissionDeniedError('Write permission denied', context)
+    for (let attempt = 0; attempt < maxCasRetries; attempt += 1) {
+      const client = await options.pool.connect()
+      try {
+        await client.query('BEGIN')
+        const ref = await loadRef(client, input.tenant, input.ref, context)
+        if (ref.kind === 'branch' && ref.state !== 'open') throw new BranchSettledError(ref.state, context)
+        const heads = await loadHeads(
+          client,
+          input.tenant,
+          input.ref,
+          asBigInt(ref.commit_id, 'tuddo_refs.commit_id', context),
+          context,
+        )
+        const current = heads.get(path)
+        if (input.ifSha !== undefined && input.ifSha !== (current?.sha256 ?? null))
+          throw new PreconditionFailedError(input.ifSha, current?.sha256 ?? null, context)
+        if (current?.sha256 === input.sha256) {
+          await client.query('ROLLBACK')
+          return {
+            path,
+            sha256: input.sha256,
+            sizeBytes: current.sizeBytes,
+            commitSha: ref.commit_sha,
+          }
+        }
+        const blobId = await insertBlob(
+          client,
+          input.tenant,
+          null,
+          input.sizeBytes,
+          input.sha256,
+          0,
+          input.objectKey,
+          context,
+        )
+        const next = new Map(heads)
+        next.set(path, {
+          blobId,
+          sha256: input.sha256,
+          sizeBytes: input.sizeBytes,
+          mode: current?.mode ?? 420,
+        })
+        const tree = await insertTree(client, input.tenant, next, context)
+        const createdAt = timestamp(now, context)
+        const commit = await insertCommit(client, {
+          tenant: input.tenant,
+          treeId: tree.id,
+          treeSha: tree.sha,
+          parentIds: [asBigInt(ref.commit_id, 'tuddo_refs.commit_id', context)],
+          parentShas: [ref.commit_sha],
+          authorUser: input.authorUser,
+          agentKind: input.agentKind ?? null,
+          threadId: input.threadId ?? null,
+          runId: input.runId ?? null,
+          op: input.op ?? 'write',
+          message: input.message ?? null,
+          createdAt: createdAt.date,
+          context,
+        })
+        const updated = await client.query(
+          `UPDATE tuddo_refs SET commit_id = $3::bigint
+           WHERE tenant = $1 AND name = $2 AND commit_id = $4::bigint`,
+          [input.tenant, input.ref, commit.id.toString(), ref.commit_id],
+        )
+        if ((updated.rowCount ?? 0) === 0) {
+          await client.query('ROLLBACK')
+          continue
+        }
+        await updateHead(client, input.tenant, input.ref, path, next.get(path) as Entry)
+        await client.query('COMMIT')
+        const event: CommitEvent = {
+          tenant: input.tenant,
+          mount: input.mount,
+          ref: input.ref,
+          commitSha: commit.sha,
+          changedPaths: [path],
+        }
+        if (options.onCommit) {
+          setImmediate(() => {
+            void (async () => {
+              try {
+                await options.onCommit?.(event)
+              } catch (error: unknown) {
+                try {
+                  if (options.logger) options.logger.error(error, event)
+                  else console.error('TuddoFs onCommit hook failed', error, event)
+                } catch (loggerError: unknown) {
+                  console.error('TuddoFs onCommit hook logger failed', loggerError, { error, event })
+                }
+              }
+            })()
+          })
+        }
+        return {
+          path,
+          sha256: input.sha256,
+          sizeBytes: input.sizeBytes,
+          commitSha: commit.sha,
+        }
+      } catch (error) {
+        await client.query('ROLLBACK').catch(() => undefined)
+        throw error
+      } finally {
+        client.release()
+      }
+    }
+    throw new RefConflictError(context, maxCasRetries)
+  }
 
   async function write(input: WriteInput): Promise<WriteResult> {
     const initialContext = contextFor({
@@ -1549,7 +1696,16 @@ export function createTuddoFs(inputOptions: TuddoFsOptions): TuddoFsKernel {
 
         // Spec §4.5 lists blob insertion earlier; doing it after ref checks
         // avoids orphan blob rows on precondition or settled-branch exits.
-        const blobId = await insertBlob(client, input.tenant, bytes, sha256, inlineMaxBytes, objectKey, context)
+        const blobId = await insertBlob(
+          client,
+          input.tenant,
+          bytes,
+          bytes.length,
+          sha256,
+          inlineMaxBytes,
+          objectKey,
+          context,
+        )
         const next = new Map(heads)
         next.set(path, {
           blobId,
@@ -1855,6 +2011,7 @@ export function createTuddoFs(inputOptions: TuddoFsOptions): TuddoFsKernel {
       verify,
       fork,
       write,
+      writeStored,
       read,
       delete: remove,
       resolveGrant: (actor, mount, resolutionOptions) => grants.resolve(actor, mount, resolutionOptions),

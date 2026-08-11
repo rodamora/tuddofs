@@ -2,8 +2,7 @@ import assert from 'node:assert/strict'
 import { Readable } from 'node:stream'
 import test, { after, before, beforeEach } from 'node:test'
 import { Pool } from 'pg'
-
-import { createTuddoFs, migrate, sha256, type BlobStore } from '../index.js'
+import { createTuddoFs, migrate, sha256, StorageError, type BlobStore } from '../index.js'
 
 const pool = new Pool({ connectionString: process.env.TUDDOFS_DATABASE_URL })
 const tenant = 'session-streaming'
@@ -52,6 +51,17 @@ class StreamingStore implements BlobStore {
     this.presigns.push(url)
     return url
   }
+  async putPresigned(url: string, bytes: Buffer): Promise<void> {
+    const [key, query] = url.slice('put://'.length).split('?')
+    const checksum = new URLSearchParams(query).get('sha256')
+    if (!checksum || sha256(bytes) !== checksum) throw new Error('checksum mismatch')
+    this.objects.set(key, Buffer.from(bytes))
+  }
+
+  async getPresigned(url: string): Promise<Readable> {
+    const key = url.slice('get://'.length).split('?')[0]
+    return this.get(key)
+  }
 }
 
 before(async () => migrate(pool))
@@ -60,6 +70,7 @@ beforeEach(async () => {
     'TRUNCATE tuddo_heads, tuddo_refs, tuddo_commits, tuddo_tree_entries, tuddo_trees, tuddo_blobs RESTART IDENTITY CASCADE',
   )
 })
+
 after(async () => pool.end())
 
 test('writeStream hashes and promotes without buffering the read path', async () => {
@@ -77,11 +88,16 @@ test('writeStream hashes and promotes without buffering the read path', async ()
   assert.equal(result.sha256, sha256(bytes))
   assert.deepEqual([...storage.objects.keys()], [`tuddo/${tenant}/${result.sha256}`])
   const stream = await session.readStream('project:media:/clip.bin')
-  assert.deepEqual(Buffer.concat(await (async () => {
-    const chunks: Buffer[] = []
-    for await (const chunk of stream) chunks.push(Buffer.from(chunk as Uint8Array))
-    return chunks
-  })()), bytes)
+  assert.deepEqual(
+    Buffer.concat(
+      await (async () => {
+        const chunks: Buffer[] = []
+        for await (const chunk of stream) chunks.push(Buffer.from(chunk as Uint8Array))
+        return chunks
+      })(),
+    ),
+    bytes,
+  )
 })
 
 test('presign pins the requested checksum and serves CAS reads', async () => {
@@ -96,12 +112,52 @@ test('presign pins the requested checksum and serves CAS reads', async () => {
   const bytes = Buffer.from('presigned media')
   const result = await session.writeStream('project:media:/clip.bin', Readable.from([bytes]))
 
-  assert.equal(
-    await session.presign('project:media:/clip.bin', { method: 'PUT', sha256: result.sha256, ttlSeconds: 30 }),
-    `put://tuddo/${tenant}/${result.sha256}?ttl=30&sha256=${result.sha256}`,
+  const putUrl = await session.presign('project:media:/clip.bin', {
+    method: 'PUT',
+    sha256: result.sha256,
+    ttlSeconds: 30,
+  })
+  assert.equal(putUrl, `put://tuddo/${tenant}/${result.sha256}?ttl=30&sha256=${result.sha256}`)
+  await assert.rejects(storage.putPresigned(putUrl, Buffer.from('wrong bytes')), /checksum mismatch/)
+  await storage.putPresigned(putUrl, bytes)
+
+  const getUrl = await session.presign('project:media:/clip.bin', { method: 'GET', ttlSeconds: 31 })
+  assert.equal(getUrl, `get://tuddo/${tenant}/${result.sha256}?ttl=31`)
+  const downloaded: Buffer[] = []
+  for await (const chunk of await storage.getPresigned(getUrl)) downloaded.push(Buffer.from(chunk as Uint8Array))
+  assert.deepEqual(Buffer.concat(downloaded), bytes)
+})
+
+test('stream capabilities fail with typed storage errors', async () => {
+  const storage = new StreamingStore()
+  Object.assign(storage, { copy: undefined })
+  const fs = createTuddoFs({
+    pool,
+    storage,
+    inlineMaxBytes: 4,
+    grants: { resolve: async () => ({ read: true, write: 'direct' }) },
+  })
+  const session = await fs.open({ actor, sessionId: 'stream-capabilities', mounts: [{ key: 'project:media' }] })
+
+  await assert.rejects(
+    session.writeStream('project:media:/clip.bin', Readable.from([Buffer.from('large media')])),
+    StorageError,
   )
-  assert.equal(
-    await session.presign('project:media:/clip.bin', { method: 'GET', ttlSeconds: 31 }),
-    `get://tuddo/${tenant}/${result.sha256}?ttl=31`,
-  )
+})
+
+test('small stream writes retain inline storage semantics', async () => {
+  const storage = new StreamingStore()
+  Object.assign(storage, { copy: undefined })
+  const fs = createTuddoFs({
+    pool,
+    storage,
+    inlineMaxBytes: 100,
+    grants: { resolve: async () => ({ read: true, write: 'direct' }) },
+  })
+  const session = await fs.open({ actor, sessionId: 'stream-inline', mounts: [{ key: 'project:media' }] })
+
+  const result = await session.writeStream('project:media:/tiny.txt', Readable.from([Buffer.from('tiny')]))
+  assert.equal(result.sizeBytes, 4n)
+  assert.deepEqual([...storage.objects.keys()], [])
+  assert.equal(await session.read('project:media:/tiny.txt'), 'tiny')
 })

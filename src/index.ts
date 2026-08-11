@@ -54,6 +54,7 @@ export type {
   MountFileSystem,
   MountSpec,
   OpenInput,
+  PresignOptions,
   SessionEntry,
   SessionFileSystem,
   SessionStat,
