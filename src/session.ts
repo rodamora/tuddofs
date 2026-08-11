@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { Readable, Transform } from 'node:stream'
+import { pipeline } from 'node:stream/promises'
 
 import { hashCommit, hashTree, sha256, type TreeEntry } from './hashing.js'
 import {
@@ -14,6 +15,7 @@ import {
 import { InvalidPathError, findTreeCoherenceCollisions, validateMountKey, validatePath } from './validation.js'
 import type {
   Actor,
+  ChecksumEnforcedPresignedPut,
   TuddoFsKernel,
   TuddoFsOptions,
   DeleteResult,
@@ -181,15 +183,20 @@ export interface SessionFileSystem {
   mount(key: string): MountFileSystem
   timeline(filter?: TimelineFilter): Promise<readonly TimelineRecord[]>
   diff(a: string, b: string): Promise<readonly DiffRecord[]>
-  /** Stream a blob without buffering CAS bytes (§8.1). */
+  /** Stream a blob without buffering CAS bytes (architecture §8.1). */
   readStream(mountKey: string, path: string): Promise<Readable>
   merge(options?: {
     mounts?: readonly string[]
     approver?: Actor
   }): Promise<Readonly<Partial<Record<string, MergeResult>>>>
+  /** Hash, quarantine, promote, and durably commit a byte stream under §8.1 and §4.5. */
   writeStream(mountKey: string, path: string, source: Readable): Promise<WriteResult>
-  /** Issue a store-native GET or checksum-pinned PUT URL (§8.1). */
-  presign(mountKey: string, path: string, options?: PresignOptions): Promise<string>
+  /** Issue a GET URL or checksum-enforced PUT request under architecture §8.1. */
+  presign(
+    mountKey: string,
+    path: string,
+    options?: PresignOptions,
+  ): Promise<string | ChecksumEnforcedPresignedPut>
   restore(mountKey: string, at: string): Promise<RestoreResult>
   tag(mountKey: string, label: string): Promise<string>
   discard(): Promise<void>
@@ -236,6 +243,23 @@ function bytesFor(value: Buffer | Uint8Array | string): Buffer {
   return Buffer.isBuffer(value) ? value : Buffer.from(value)
 }
 
+const CAS_SHA256 = /^[a-f0-9]{64}$/u
+
+function checksumHeaderForCasSha(value: string, context: ErrorContext): string {
+  if (!CAS_SHA256.test(value)) throw new StorageError('PUT presigns require a lowercase hexadecimal sha256', context)
+  return Buffer.from(value, 'hex').toString('base64')
+}
+
+function signsChecksumHeader(url: string): boolean {
+  try {
+    const signedHeaders = [...new URL(url).searchParams.entries()].find(
+      ([name]) => name.toLowerCase() === 'x-amz-signedheaders',
+    )?.[1]
+    return signedHeaders?.toLowerCase().split(';').includes('x-amz-checksum-sha256') === true
+  } catch {
+    return false
+  }
+}
 function globRegex(pattern: string): RegExp {
   let source = '^'
   for (let index = 0; index < pattern.length; index += 1) {
@@ -276,20 +300,24 @@ function sameHead(left: Head | undefined, right: Head | undefined): boolean {
   return left.sha256 === right.sha256 && left.mode === right.mode
 }
 
+type SessionStoredWriteInput = {
+  readonly tenant: string
+  readonly mount: string
+  readonly ref: string
+  readonly path: string
+  readonly sha256: string
+  readonly sizeBytes: bigint
+  readonly objectKey: string
+  readonly authorUser: string
+  readonly agentKind?: string | null
+  readonly threadId?: string | null
+  readonly runId?: string | null
+}
 type SessionKernel = Omit<TuddoFsKernel, 'open'> & {
-  writeStored(input: {
-    readonly tenant: string
-    readonly mount: string
-    readonly ref: string
-    readonly path: string
-    readonly sha256: string
-    readonly sizeBytes: bigint
-    readonly objectKey: string
-    readonly authorUser: string
-    readonly agentKind?: string | null
-    readonly threadId?: string | null
-    readonly runId?: string | null
-  }): Promise<WriteResult>
+  withBlobWriteLock<T>(
+    tenant: string,
+    work: (commit: (input: SessionStoredWriteInput) => Promise<WriteResult>) => Promise<T>,
+  ): Promise<T>
 }
 /** Build the session API over a kernel and its host options. */
 export function createSessionApi(kernel: SessionKernel, options: TuddoFsOptions) {
@@ -643,63 +671,92 @@ export function createSessionApi(kernel: SessionKernel, options: TuddoFsOptions)
             callback(null, bytes)
           },
         })
-        try {
-          await storage.put(quarantineKey, source.pipe(hashing))
-          const contentSha = digest.digest('hex')
-          if (sizeBytes <= BigInt(options.inlineMaxBytes ?? 131_072)) {
-            const chunks: Buffer[] = []
-            for await (const chunk of await storage.get(quarantineKey))
-              chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array))
-            return await kernel.write({
+        const prepared = await kernel.withBlobWriteLock(input.actor.tenant, async commit => {
+          try {
+            const upload = storage.put(quarantineKey, hashing)
+            const pump = pipeline(source, hashing)
+            try {
+              await Promise.all([upload, pump])
+            } catch (error) {
+              const streamError = error instanceof Error ? error : new Error('Object storage failed')
+              source.destroy(streamError)
+              hashing.destroy(streamError)
+              await Promise.allSettled([upload, pump])
+              throw error
+            }
+            const contentSha = digest.digest('hex')
+            if (sizeBytes <= BigInt(options.inlineMaxBytes ?? 131_072)) {
+              const chunks: Buffer[] = []
+              for await (const chunk of await storage.get(quarantineKey))
+                chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array))
+              return { kind: 'inline' as const, bytes: Buffer.concat(chunks) }
+            }
+            if (!storage.copy)
+              throw new StorageError('Streaming writes require server-side object copy support', {
+                tenant: input.actor.tenant,
+                mount: mount.key,
+                path,
+              })
+            const objectKey = `tuddo/${input.actor.tenant}/${contentSha}`
+            await storage.copy(quarantineKey, objectKey)
+            return {
+              kind: 'stored' as const,
+              result: await commit({
+                tenant: input.actor.tenant,
+                mount: mount.key,
+                ref: refFor(mount),
+                path,
+                sha256: contentSha,
+                sizeBytes,
+                objectKey,
+                authorUser: input.actor.id,
+                agentKind: input.attribution?.agentKind,
+                threadId: input.attribution?.threadId,
+                runId: input.attribution?.runId,
+              }),
+            }
+          } catch (error) {
+            if (error instanceof TuddoFsError) throw error
+            throw new StorageError(error instanceof Error ? error.message : 'Object storage failed', {
               tenant: input.actor.tenant,
               mount: mount.key,
-              ref: refFor(mount),
               path,
-              bytes: Buffer.concat(chunks),
-              authorUser: input.actor.id,
-              agentKind: input.attribution?.agentKind,
-              threadId: input.attribution?.threadId,
-              runId: input.attribution?.runId,
             })
+          } finally {
+            try {
+              await storage.delete(quarantineKey)
+            } catch (error) {
+              const cleanup = {
+                tenant: input.actor.tenant,
+                mount: mount.key,
+                path,
+                objectKey: quarantineKey,
+                operation: 'quarantine-cleanup',
+              }
+              if (options.logger) options.logger.error(error, cleanup)
+              else console.error('TuddoFs quarantine cleanup failed', error, cleanup)
+            }
           }
-          if (!storage.copy)
-            throw new StorageError('Streaming writes require server-side object copy support', {
-              tenant: input.actor.tenant,
-              mount: mount.key,
-              path,
-            })
-          const objectKey = `tuddo/${input.actor.tenant}/${contentSha}`
-          await storage.copy(quarantineKey, objectKey)
-          return await kernel.writeStored({
-            tenant: input.actor.tenant,
-            mount: mount.key,
-            ref: refFor(mount),
-            path,
-            sha256: contentSha,
-            sizeBytes,
-            objectKey,
-            authorUser: input.actor.id,
-            agentKind: input.attribution?.agentKind,
-            threadId: input.attribution?.threadId,
-            runId: input.attribution?.runId,
-          })
-        } catch (error) {
-          if (error instanceof TuddoFsError) throw error
-          throw new StorageError(error instanceof Error ? error.message : 'Object storage failed', {
-            tenant: input.actor.tenant,
-            mount: mount.key,
-            path,
-          })
-        } finally {
-          await storage.delete(quarantineKey).catch(() => undefined)
-        }
+        })
+        if (prepared.kind === 'stored') return prepared.result
+        return kernel.write({
+          tenant: input.actor.tenant,
+          mount: mount.key,
+          ref: refFor(mount),
+          path,
+          bytes: prepared.bytes,
+          authorUser: input.actor.id,
+          agentKind: input.attribution?.agentKind,
+          threadId: input.attribution?.threadId,
+          runId: input.attribution?.runId,
+        })
       }
 
       const presign = async (
         mountKey: string,
         rawPath: string,
         presignOptions: PresignOptions = {},
-      ): Promise<string> => {
+      ): Promise<string | ChecksumEnforcedPresignedPut> => {
         const { mount, path } = mountFor(mountKey, rawPath)
         const method = presignOptions.method ?? 'GET'
         const ttlSeconds = presignOptions.ttlSeconds ?? 900
@@ -715,10 +772,22 @@ export function createSessionApi(kernel: SessionKernel, options: TuddoFsOptions)
           if (mount.mode !== 'follow') throw new PermissionDeniedError('Pinned mount is read-only', context)
           const checksum = presignOptions.sha256
           if (!checksum) throw new StorageError('PUT presigns require a sha256 checksum', context)
+          const checksumHeader = checksumHeaderForCasSha(checksum, context)
           if (!storage.presignPut) throw new StorageError('Object storage does not support PUT presigning', context)
           const objectKey = `tuddo/${input.actor.tenant}/${checksum}`
           try {
-            return await storage.presignPut(objectKey, { ttlSeconds, checksumSha256: checksum })
+            const result = await storage.presignPut(objectKey, {
+              ttlSeconds,
+              checksumSha256: checksumHeader,
+            })
+            if (!result.checksumEnforced)
+              throw new StorageError(
+                `Object storage does not enforce PUT checksums${result.reason ? `: ${result.reason}` : ''}`,
+                context,
+              )
+            if (result.headers['x-amz-checksum-sha256'] !== checksumHeader || !signsChecksumHeader(result.url))
+              throw new StorageError('Object storage did not sign the required x-amz-checksum-sha256 header', context)
+            return result
           } catch (error) {
             if (error instanceof StorageError) throw error
             throw new StorageError(error instanceof Error ? error.message : 'Object storage failed', context)

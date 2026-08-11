@@ -11,7 +11,7 @@ The following are intentionally not promised features of this release:
 - a sync engine for external workspaces;
 - multipart object-storage upload.
 
-The session streaming methods require a `BlobStore` with stream-capable `put`, server-side `copy`, and the relevant presign method. `readStream` returns a Node `Readable`; `writeStream` hashes into a quarantine key before promoting to `tuddo/<tenant>/<sha256>` and committing. `presign(address, { method: 'GET' })` issues a read URL, while PUT requires `{ method: 'PUT', sha256 }` so the store signs `x-amz-checksum-sha256`. Missing storage capabilities fail with `StorageError`.
+The session streaming methods require a `BlobStore` with stream-capable `put`, server-side `copy`, and the relevant presign method. `readStream` returns a Node `Readable`; `writeStream` hashes into a quarantine key while holding the same tenant GC lease as kernel writes, promotes to `tuddo/<tenant>/<sha256>`, then commits. `presign(address, { method: 'GET' })` returns a read URL. PUT requires a lowercase hexadecimal `{ method: 'PUT', sha256 }` and returns `{ url, headers, checksumEnforced: true }`; clients must send the returned `x-amz-checksum-sha256` header. Core converts the CAS hash to S3's base64 checksum format and rejects adapters whose result does not sign that header or whose store cannot enforce uploaded-byte checksums. Missing or non-enforcing storage capabilities fail with `StorageError`.
 
 These boundaries are reflected in the exported API; do not build a production workflow around capabilities that are not listed there.
 
@@ -204,18 +204,16 @@ TUDDOFS_DATABASE_URL="postgresql://tuddofs:tuddofs@127.0.0.1:${TUDDOFS_IT_PORT:-
 docker rm --force tuddofs-it
 ```
 
-The 2 GB streaming acceptance test uses MinIO and asserts a 384 MiB server RSS-growth ceiling:
+The streaming acceptance suite starts and stops a pinned MinIO testcontainer itself. It defaults to a 2 GiB round trip, samples RSS continuously through upload and download, asserts a 384 MiB growth ceiling, verifies MinIO's real checksum-enforced PUT behavior, and removes its objects afterward. Supply only the disposable PostgreSQL URL:
 
 ```bash
-docker run --rm --detach --name tuddofs-minio \
-  --env MINIO_ROOT_USER=tuddofs \
-  --env MINIO_ROOT_PASSWORD=tuddofs-secret \
-  --publish 55774:9000 \
-  minio/minio server /data
 TUDDOFS_DATABASE_URL="postgresql://tuddofs:tuddofs@127.0.0.1:${TUDDOFS_IT_PORT:-55771}/tuddofs_it" \
   npm run test:minio
-docker rm --force tuddofs-minio
 ```
+
+Set `TUDDOFS_MINIO_STREAM_BYTES` to a positive byte count only for a smaller CI smoke run; the acceptance default remains exactly 2,147,483,648 bytes. The suite fails loudly rather than skipping when PostgreSQL or Docker is unavailable.
+
+SigV4 presigned URLs embed their endpoint host. Client-direct I/O therefore requires the blob endpoint to be reachable from the client's network; otherwise the host must use the server-relay streaming path.
 
 Never point these commands at a shared development or production database.
 

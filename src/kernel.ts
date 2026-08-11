@@ -18,30 +18,57 @@ import {
   findPathCollision,
   findTreeCoherenceCollisions,
 } from './validation.js'
-import { createTuddoFsSchemaPool, migrate, normalizeTuddoFsSchema, type TuddoFsPool } from './migration.js'
+import {
+  createTuddoFsSchemaPool,
+  migrate,
+  normalizeTuddoFsSchema,
+  type TuddoFsClient,
+  type TuddoFsPool,
+} from './migration.js'
 import { validateMountKey, validatePath } from './validation.js'
 import { GrantController, type Grant } from './grants.js'
 import { createSessionApi } from './session.js'
 import type { OpenInput, SessionFileSystem } from './session.js'
+/** Object metadata consumed by the §4.5 orphan-object GC sweep. */
 export interface BlobObject {
   readonly key: string
   readonly lastModified: Date | string
 }
 
+/** Checksum-enforced SigV4 PUT request issued under architecture §8.1 and §8.2. */
+export interface ChecksumEnforcedPresignedPut {
+  readonly checksumEnforced: true
+  readonly url: string
+  readonly headers: Readonly<Record<'x-amz-checksum-sha256', string>>
+}
+
+/** Honest capability result for stores that cannot enforce uploaded-byte checksums (§8.2). */
+export interface ChecksumUnsupportedPresignedPut {
+  readonly checksumEnforced: false
+  readonly reason?: string
+}
+
+/** Store-level PUT-presign result; callers reject the unsupported arm rather than trusting bytes (§8.2). */
+export type BlobStorePresignedPut = ChecksumEnforcedPresignedPut | ChecksumUnsupportedPresignedPut
+
 /**
- * Object storage used by the kernel. `put` accepts a stream so session
- * streaming can keep large blobs out of server memory (§8.1).
+ * Object-storage SPI governed by architecture §8.4. Function properties keep
+ * streaming parameters contravariant, so buffer-only adapters cannot satisfy
+ * the interface and then receive a `Readable` from §8.1.
  */
 export interface BlobStore {
-  put(key: string, bytes: Buffer | Readable): Promise<void>
-  head(key: string): Promise<{ sizeBytes: number } | null>
-  get(key: string): Promise<Readable>
-  delete(key: string): Promise<void>
-  list?(prefix: string): Promise<readonly BlobObject[]>
+  readonly put: (key: string, bytes: Buffer | Readable) => Promise<void>
+  readonly head: (key: string) => Promise<{ sizeBytes: number } | null>
+  readonly get: (key: string) => Promise<Readable>
+  readonly delete: (key: string) => Promise<void>
+  readonly list?: (prefix: string) => Promise<readonly BlobObject[]>
   /** Server-side copy used to promote a completed quarantine upload (§8.1). */
-  copy?(sourceKey: string, destinationKey: string): Promise<void>
-  presignPut?(key: string, opts: { ttlSeconds: number; checksumSha256: string }): Promise<string>
-  presignGet?(key: string, opts: { ttlSeconds: number }): Promise<string>
+  readonly copy?: (sourceKey: string, destinationKey: string) => Promise<void>
+  readonly presignPut?: (
+    key: string,
+    opts: { ttlSeconds: number; checksumSha256: string },
+  ) => Promise<BlobStorePresignedPut>
+  readonly presignGet?: (key: string, opts: { ttlSeconds: number }) => Promise<string>
 }
 
 /** Reachability-GC windows and optional tenant scope. */
@@ -991,6 +1018,43 @@ export function createTuddoFs(inputOptions: TuddoFsOptions): TuddoFsKernel {
     now: () => now().getTime(),
   })
 
+  async function withBlobWriteLock<T>(
+    tenant: string,
+    work: (commit: (input: StoredWriteInput) => Promise<WriteResult>) => Promise<T>,
+  ): Promise<T> {
+    const client = await options.pool.connect()
+    let lockState: 'acquiring' | 'held' | 'uncertain' | 'none' = 'acquiring'
+    let failure: unknown
+    try {
+      await client.query('SELECT pg_advisory_lock_shared(hashtext($1))', [`tuddo:gc:${tenant}`])
+      lockState = 'held'
+      const result = await work(input => writeStored(input, client))
+      lockState = 'uncertain'
+      await client.query('SELECT pg_advisory_unlock_shared(hashtext($1))', [`tuddo:gc:${tenant}`])
+      lockState = 'none'
+      return result
+    } catch (error) {
+      failure = error
+      throw error
+    } finally {
+      if (lockState === 'held') {
+        lockState = 'uncertain'
+        try {
+          await client.query('SELECT pg_advisory_unlock_shared(hashtext($1))', [`tuddo:gc:${tenant}`])
+          lockState = 'none'
+        } catch (error) {
+          failure ??= error
+        }
+      }
+      if (lockState !== 'none') {
+        const releaseError = failure instanceof Error ? failure : new Error('tuddofs advisory lock state is uncertain')
+        client.release(releaseError)
+      } else {
+        client.release()
+      }
+    }
+  }
+
   async function gc(input: GcOptions = {}): Promise<GcReport> {
     const graceMs = input.graceMs ?? DEFAULT_GRACE_MS
     const retentionMs = input.settledBranchRetentionMs ?? DEFAULT_SETTLED_BRANCH_RETENTION_MS
@@ -1507,7 +1571,7 @@ export function createTuddoFs(inputOptions: TuddoFsOptions): TuddoFsKernel {
       client.release()
     }
   }
-  async function writeStored(input: StoredWriteInput): Promise<WriteResult> {
+  async function writeStored(input: StoredWriteInput, lockedClient?: TuddoFsClient): Promise<WriteResult> {
     const initialContext = contextFor({
       tenant: input.tenant,
       mount: input.mount,
@@ -1523,7 +1587,7 @@ export function createTuddoFs(inputOptions: TuddoFsOptions): TuddoFsKernel {
     })
     if (!(await grant(grants, 'write', input))) throw new PermissionDeniedError('Write permission denied', context)
     for (let attempt = 0; attempt < maxCasRetries; attempt += 1) {
-      const client = await options.pool.connect()
+      const client = lockedClient ?? (await options.pool.connect())
       try {
         await client.query('BEGIN')
         const ref = await loadRef(client, input.tenant, input.ref, context)
@@ -1625,7 +1689,7 @@ export function createTuddoFs(inputOptions: TuddoFsOptions): TuddoFsKernel {
         await client.query('ROLLBACK').catch(() => undefined)
         throw error
       } finally {
-        client.release()
+        if (!lockedClient) client.release()
       }
     }
     throw new RefConflictError(context, maxCasRetries)
@@ -2011,7 +2075,7 @@ export function createTuddoFs(inputOptions: TuddoFsOptions): TuddoFsKernel {
       verify,
       fork,
       write,
-      writeStored,
+      withBlobWriteLock,
       read,
       delete: remove,
       resolveGrant: (actor, mount, resolutionOptions) => grants.resolve(actor, mount, resolutionOptions),
