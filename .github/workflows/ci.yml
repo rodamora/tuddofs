@@ -79,6 +79,10 @@ jobs:
       TUDDOFS_MINIO_STREAM_BYTES: '268435456'
       TUDDOFS_S3_ENDPOINT: http://127.0.0.1:9000
       TUDDOFS_S3_FORCE_PATH_STYLE: 'true'
+      # Hosted runners have neither the scratch disk nor the minutes for the
+      # 2 GiB the spec names; the size is a knob and the local acceptance run
+      # is what exercises it. What CI still proves is the whole path.
+      TUDDOFS_MINIO_CAPTURE_BYTES: '268435456'
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
