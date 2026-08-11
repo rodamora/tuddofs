@@ -1,6 +1,6 @@
 # s1-tree-coherence — enforce the no-prefix-collision invariant
 
-Status: open
+Status: done (evidence: b6b2c62)
 Stage: S1 pre-work (ships with s1-surface-diet as one breaking release)
 Depends on: —
 Spec: `../architecture.md` §4.3 (invariant + three enforcement points), §4.5 (TO ADD markers on Write/Merge/verify), §11 S1 proof column

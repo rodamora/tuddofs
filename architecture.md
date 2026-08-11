@@ -5,6 +5,7 @@
 **Positioning:** A product of its own — the `tuddofs` npm package. Any application that supplies a Postgres pool, actor identity, and a grant resolver is a consumer.
 
 **How to read this document if you are implementing:**
+
 - §4–§6 and §9 describe the **shipped** system. Their invariants remain normative, but the pin is now the code: `src/migration.ts` (frozen-schema check), `fixtures/golden-hashes.json` (hash preimages), and the integration suites. If this document and the shipped behavior disagree, the code + tests win and this document has a bug — fix the document.
 - §7 (sync engine) and §8 (large blobs) are **NORMATIVE for unbuilt work** — the algorithms, tables, and invariants are the answer; do not improvise alternatives.
 - §13 tells you how to work. When this document is ambiguous, STOP and ask; do not fill gaps with guesses.
@@ -15,25 +16,25 @@
 
 A **multi-tenant, permission-confined, branchable filesystem for AI agents.** Postgres + object storage. Embeddable TypeScript library.
 
-One sentence: *git's object model with your application's permissions, built for agents that run anywhere.*
+One sentence: _git's object model with your application's permissions, built for agents that run anywhere._
 
 The moat: competitors treat files as agent scratch. Here files are **governed user data** — scoped to whatever mounts the host defines, access-controlled by the host app's live permission logic, with agent changes flowing through branches and honest merges.
 
 ## 2. Requirements
 
-| # | Requirement | Status |
-|---|---|---|
-| R1 | Concurrent agents on the same user's data — isolated, merge with honest conflicts | shipped |
-| R2 | One FS contract for both runtimes: in-process agent AND sandboxed/remote agent | session API shipped; remote half is the sync engine (§7) |
-| R3 | Real files inside a workspace so shell tools (bash, grep, any binary) work natively | sync engine (§7) |
-| R4 | Durable per operation; workspace death loses at most the exec in flight | sync engine (§7) |
-| R5 | Multi-source mounts in one agent view; mount vocabulary is the host's | shipped |
-| R6 | Agent confined to the executing user's grants, resolved live, on every operation | shipped |
-| R7 | Versioned + attributed (user, agent, run) + restorable — structurally | shipped |
-| R8 | Small working sets (dozens of files); correctness over throughput | design stance, unchanged |
-| R9 | Standalone npm package, zero hard runtime deps; pool/storage/logger/grants injected | shipped |
-| R10 | Coexists with host product surfaces via events (`onCommit`) and virtual mounts — the package never knows its listeners | shipped |
-| R11 | Large binaries/media streamed via presigned object-storage I/O, never through server memory | §8 |
+| #   | Requirement                                                                                                            | Status                                                   |
+| --- | ---------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------- |
+| R1  | Concurrent agents on the same user's data — isolated, merge with honest conflicts                                      | shipped                                                  |
+| R2  | One FS contract for both runtimes: in-process agent AND sandboxed/remote agent                                         | session API shipped; remote half is the sync engine (§7) |
+| R3  | Real files inside a workspace so shell tools (bash, grep, any binary) work natively                                    | sync engine (§7)                                         |
+| R4  | Durable per operation; workspace death loses at most the exec in flight                                                | sync engine (§7)                                         |
+| R5  | Multi-source mounts in one agent view; mount vocabulary is the host's                                                  | shipped                                                  |
+| R6  | Agent confined to the executing user's grants, resolved live, on every operation                                       | shipped                                                  |
+| R7  | Versioned + attributed (user, agent, run) + restorable — structurally                                                  | shipped                                                  |
+| R8  | Small working sets (dozens of files); correctness over throughput                                                      | design stance, unchanged                                 |
+| R9  | Standalone npm package, zero hard runtime deps; pool/storage/logger/grants injected                                    | shipped                                                  |
+| R10 | Coexists with host product surfaces via events (`onCommit`) and virtual mounts — the package never knows its listeners | shipped                                                  |
+| R11 | Large binaries/media streamed via presigned object-storage I/O, never through server memory                            | §8                                                       |
 
 ## 3. Architecture — five layers
 
@@ -57,6 +58,7 @@ Load-bearing rule for every layer: **agent tools never talk to the kernel — th
 Tables (all `tuddo_*`, package-owned, created by exported `migrate()`; frozen-schema drift check on every boot): `tuddo_blobs`, `tuddo_trees`, `tuddo_tree_entries`, `tuddo_commits`, `tuddo_refs`, `tuddo_heads`, `tuddo_migrations`. Exact DDL: `tuddoFsDdl` in `src/migration.ts`. Migrations are numbered and immutable once merged.
 
 Structural invariants (each enforced in DDL or code, each has a test):
+
 - `tuddo_blobs`: exactly one of `inline` / `object_key` is non-null (`CHECK`); `UNIQUE (tenant, sha256)`.
 - `tuddo_tree_entries.blob_id` → `ON DELETE RESTRICT` — the hard GC floor.
 - `tuddo_commits.parents` is ordered; `parents[1]` = "ours" from the ref's own lineage.
@@ -77,7 +79,8 @@ NFC-normalize, then: `^/[^\0]*$`, no `//`, no trailing `/`, no `.`/`..` segments
 
 **Directories are implicit.** Trees contain only file entries keyed by full path; folders exist because file paths pass through them. There is no directory object, no `mkdir`, no empty directory (hosts wanting empty-folder UX use a keep-file convention). This is deliberate and permanent: directory entries would extend the §4.2 preimage format (identity corruption for every existing commit), add git's D/F conflict family to the §9 decision table, and complicate the one-exec capture scan — for scaffolding value a keep-file already provides.
 
-**Tree-coherence invariant (NORMATIVE; specced, NOT YET ENFORCED — gates S1):** within one tree, no path may be a directory-prefix of another (`/a` file + `/a/x.md` is incoherent). Git's nested trees prevent this structurally; flat trees MUST enforce it explicitly, or `list` silently masks the file behind the synthesized directory and Phase-1 materialize hits an impossible disk state (a real filesystem cannot hold file `a` and directory `a/`). Enforcement is asymmetric by design:
+**Tree-coherence invariant (NORMATIVE; enforced):** within one tree, no path may be a directory-prefix of another (`/a` file + `/a/x.md` is incoherent). Git's nested trees prevent this structurally; flat trees MUST enforce it explicitly, or `list` silently masks the file behind the synthesized directory and Phase-1 materialize hits an impossible disk state (a real filesystem cannot hold file `a` and directory `a/`). Enforcement is asymmetric by design:
+
 1. **write/edit:** reject with `InvalidPathError` naming the colliding entry — API callers must be explicit (`delete('/a')` first).
 2. **capture (§7.3):** disk is the observed truth and cannot collide with itself, but the branch head can disagree mid-run (`rm a && mkdir a && touch a/x.md` — the `rm` normally lands only at reconcile). Capturing a path that implies a directory where the head has a file includes that file's deletion in the same commit.
 3. **merge (§4.5):** two individually-coherent trees can merge into an incoherent union (ours adds file `/a`, theirs adds `/a/x.md` — different paths, no per-path conflict). After the per-path pass, validate the merged tree; a collision is returned as a conflict on both paths, never committed.
@@ -90,25 +93,25 @@ NFC-normalize, then: `^/[^\0]*$`, no `//`, no trailing `/`, no `.`/`..` segments
 
 ### 4.5 Core algorithms (shipped; see file-header comments for the full step lists)
 
-- **Write** (`kernel.ts`): grant → hash → object-store upload BEFORE the tx (idempotent HEAD-first) → single-tx blob/tree/commit insert with CAS ref update (`UPDATE … WHERE commit_id=$expected`, max 3 retries) and heads update **in the same tx** → post-commit `onCommit` via `setImmediate`, failures logged, never fail the write. Same-sha writes are no-ops (no empty commits). `ifSha` mismatch → `PreconditionFailedError`, no retry. TO ADD (gates S1): the §4.3 coherence check against current heads, inside the tx.
+- **Write** (`kernel.ts`): grant → hash → object-store upload BEFORE the tx (idempotent HEAD-first) → single-tx blob/tree/commit insert with CAS ref update (`UPDATE … WHERE commit_id=$expected`, max 3 retries) and heads update **in the same tx** → post-commit `onCommit` via `setImmediate`, failures logged, never fail the write. Same-sha writes are no-ops (no empty commits). `ifSha` mismatch → `PreconditionFailedError`, no retry. §4.3 coherence check against current heads runs inside the tx.
 - **Fork**: metadata-only; genesis (empty tree, `op='import'`) created inside the tx on first touch; concurrent geneses race safely via `ON CONFLICT`, loser adopts winner. `base_commit` recorded at fork **is** the merge base — no merge-base graph walk exists or should.
-- **Merge**: `pg_advisory_xact_lock(hashtext(tenant || ':mount/' || key))`; grants re-resolved inside the tx (freshness bound 100ms of pool wait); staged writer without approver → `pendingApproval`; approver must resolve `direct` live. Conflicts are computed, returned as data, never stored. Completed-merge re-run produces no commit. TO ADD (gates S1): §4.3 merged-tree coherence validation — collision ⇒ conflict result.
+- **Merge**: `pg_advisory_xact_lock(hashtext(tenant || ':mount/' || key))`; grants re-resolved inside the tx (freshness bound 100ms of pool wait); staged writer without approver → `pendingApproval`; approver must resolve `direct` live. Conflicts are computed, returned as data, never stored. Completed-merge re-run produces no commit. §4.3 merged-tree coherence validation — collision ⇒ conflict result.
 - **GC**: reachability mark from ALL refs + grace window (default 24h); settled-branch retention 7d; five sweeps ending in orphan-object listing under `tuddo/<tenant>/`; single-flight per tenant via `pg_try_advisory_lock('tuddo:gc:' || tenant)` — a worker that fails to acquire SKIPS, never queues. Batched deletes (500/batch). FK violation mid-sweep = "referenced mid-sweep": drop the batch, continue.
-- **verify()**: recompute tree/commit shas, rebuild expected heads per ref, spot-check object storage, audit `parents[]` referential integrity (arrays carry no FK) and orphaned heads. Content-addressing is a set-cardinality commitment only if something recomputes it — hosts MUST schedule verify (§10). TO ADD (gates S1): §4.3 coherence audit over ref-tip trees (flags any pre-enforcement incoherent tree).
+- **verify()**: recompute tree/commit shas, rebuild expected heads per ref, spot-check object storage, audit `parents[]` referential integrity (arrays carry no FK) and orphaned heads. Content-addressing is a set-cardinality commitment only if something recomputes it — hosts MUST schedule verify (§10). §4.3 coherence audit over ref-tip trees (flags any pre-enforcement incoherent tree).
 
 ### 4.6 As-built defaults
 
-| Constant | Value |
-|---|---|
-| `inlineMaxBytes` | 131 072 |
-| CAS retries | 3 |
-| GC grace | 24 h |
-| Settled-branch retention | 7 d |
-| Maintenance batch size | 500 |
-| Grant cache TTL | 30 s (hard-capped at 30 s — cannot be raised) |
-| Grant resolver timeout | 5 s |
-| Merge grant freshness | 100 ms |
-| Object key format | `tuddo/<tenant>/<sha256>` |
+| Constant                 | Value                                         |
+| ------------------------ | --------------------------------------------- |
+| `inlineMaxBytes`         | 131 072                                       |
+| CAS retries              | 3                                             |
+| GC grace                 | 24 h                                          |
+| Settled-branch retention | 7 d                                           |
+| Maintenance batch size   | 500                                           |
+| Grant cache TTL          | 30 s (hard-capped at 30 s — cannot be raised) |
+| Grant resolver timeout   | 5 s                                           |
+| Merge grant freshness    | 100 ms                                        |
+| Object key format        | `tuddo/<tenant>/<sha256>`                     |
 
 ## 5. Layer 2 — authorization boundary (SHIPPED; rules normative)
 
@@ -120,6 +123,7 @@ interface GrantResolver {
 ```
 
 Rules (each is a test in `grants.test.ts` / `grants.integration.test.ts` / `session-security.integration.test.ts`):
+
 1. **Fail closed.** Resolver throw / timeout / malformed result → deny + `GrantResolverError`. NEVER fail open.
 2. **Live per-op resolution.** Cache TTL ≤ 30s + `invalidate(actorId, mountKey?, tenant?)`. Merge and fork ALWAYS bypass the cache.
 3. **Permission never travels through time.** Fork checks read at fork time; write checks at write time; merge re-resolves inside the merge tx.
@@ -132,13 +136,13 @@ Multi-worker caveat (host guide, §10): per-process `invalidate()` does not reac
 
 ### 5.1 Identity taxonomy (never collapse these)
 
-| Identity | Where it lives |
-|---|---|
-| Trigger/attribution — the human on whose behalf | `commits.author_user` |
-| Execution — who performs operations | session `actor` (always the executing user) |
-| Agent provenance — which automation | `commits.agent_kind / thread_id / run_id` |
-| Authorization — whose grant permits | GrantResolver result at op time; merge `approver` may differ under `staged` |
-| Tenant — which boundary | `tenant` column on every table; refs PK includes tenant |
+| Identity                                        | Where it lives                                                              |
+| ----------------------------------------------- | --------------------------------------------------------------------------- |
+| Trigger/attribution — the human on whose behalf | `commits.author_user`                                                       |
+| Execution — who performs operations             | session `actor` (always the executing user)                                 |
+| Agent provenance — which automation             | `commits.agent_kind / thread_id / run_id`                                   |
+| Authorization — whose grant permits             | GrantResolver result at op time; merge `approver` may differ under `staged` |
+| Tenant — which boundary                         | `tenant` column on every table; refs PK includes tenant                     |
 
 ## 6. Layer 3 — session API (SHIPPED)
 
@@ -201,6 +205,7 @@ interface SyncTarget {
 ```
 
 The engine never imports a provider SDK. First-party targets, in build order:
+
 1. **Local directory** (S1) — child-process exec + node:fs. This is a product story in itself (governed workspace for CLI/harness agents on a trusted machine) and makes the whole engine CI-testable with zero infrastructure. Grant confinement protects the FS, NOT the host; sandboxes exist for untrusted code — document this, loudly.
 2. **SSH** (S2) — the cheapest honest remote: real network, real quoting hazards, no vendor SDK. Proves seam portability.
 3. Provider targets (E2B, Blaxel, …) — doc recipes or separate packages, never in core.
@@ -224,6 +229,7 @@ A failed scan is an error event, never an empty diff. Silently treating exec fai
 **State:** server-side branch index `Map<mountKey, Map<path, sha256>>` (a CACHE — rebuildable from heads + full scan); stamp file `<root>/.tuddofs-stamp` in the target.
 
 **Phase 1 — materialize (acquire):**
+
 1. Precondition probe: `exec("sha256sum --version && find --version")` — GNU coreutils required (busybox lacks `--zero`). Fail loudly at acquire, not silently at capture.
 2. Per mount: write branch-view files under `<root>/<mountKey>/…`; `chmod -R a-w` read-only mounts; verify (spot-check shas); write hydrated marker LAST; seed index; `touch` stamp.
 3. Warm re-acquire: liveness probe + index check only — NEVER a per-file probe.
@@ -231,6 +237,7 @@ A failed scan is an error event, never an empty diff. Silently treating exec fai
 **Phase 2 — write-through (file tools):** kernel commit first (§4.5) → index update → mirror `writeFile` (async; on failure mark path dirty → re-materialize on next touch). Grant refusal happens before the commit; nothing touches disk.
 
 **Phase 3 — exec capture** (after every shell-capable call; fire-and-forget; ONE in flight per target, extra triggers coalesce to exactly one follow-up; the slot is RELEASED on failure as well as success):
+
 1. `scanStart = now()`. One exec: `cd <root> && find <mountDirs> -type f -newer .tuddofs-stamp -print0 | xargs -0 -r sha256sum --zero`
 2. Parse NUL-terminated records. REJECT any path that, after normalization, escapes its mount dir — the target is untrusted input.
 3. Diff against index. Same sha → drop.
@@ -284,38 +291,40 @@ Ship `@tuddofs/s3` (or equivalent) as a separate package implementing `BlobStore
 
 The 14-row (base, theirs, ours) decision table is implemented and unit-tested per row; the classifier is exhaustive — an unmatched combination throws, never defaults silently:
 
-| base | theirs (mount) | ours (branch) | action |
-|---|---|---|---|
-| A | A | A | no-op |
-| A | A | B | take B |
-| A | B | A | keep theirs |
-| A | B | B | no-op (converged) |
-| A | B | C | **conflict** |
-| A | A | absent | delete |
-| A | B | absent | **conflict** |
-| A | absent | A | keep their delete |
-| A | absent | B | **conflict** |
-| A | absent | absent | no-op |
-| absent | absent | B | create B |
-| absent | B | B | no-op |
-| absent | B | C | **conflict** |
-| absent | B | absent | keep theirs |
+| base   | theirs (mount) | ours (branch) | action            |
+| ------ | -------------- | ------------- | ----------------- |
+| A      | A              | A             | no-op             |
+| A      | A              | B             | take B            |
+| A      | B              | A             | keep theirs       |
+| A      | B              | B             | no-op (converged) |
+| A      | B              | C             | **conflict**      |
+| A      | A              | absent        | delete            |
+| A      | B              | absent        | **conflict**      |
+| A      | absent         | A             | keep their delete |
+| A      | absent         | B             | **conflict**      |
+| A      | absent         | absent        | no-op             |
+| absent | absent         | B             | create B          |
+| absent | B              | B             | no-op             |
+| absent | B              | C             | **conflict**      |
+| absent | B              | absent        | keep theirs       |
 
 Mode-only changes count as content changes (mode is in the tree entry).
 
 Exported errors (hosts and tools switch on these; never swallowed, never wrapped generic): `InvalidPathError`, `InvalidMountKeyError`, `InvalidCommitTimestampError`, `PermissionDeniedError`, `PreconditionFailedError`, `RefConflictError`, `NotFoundError`, `BranchSettledError` (message prescribes recovery: open a new session — never a dead end), `MergePendingApprovalError`, `GrantResolverError` (failed CLOSED), `SchemaDriftError`, `StorageError`, `InvariantError`; at S1, `EditMatchError` (str-replace `edit()` found zero or multiple matches without `replaceAll`; carries the match count — §6.2). Every error carries `{tenant, mount?, path?, ref?}` context. Conflicts are a merge RESULT, not an exception.
 
-Decision: there is no merge-policy hook. `onCommit` covers eventing, and merge policy is the host's decision about *when to call* `merge()` and with which approver — a second hook adds surface for zero value.
+Decision: there is no merge-policy hook. `onCommit` covers eventing, and merge policy is the host's decision about _when to call_ `merge()` and with which approver — a second hook adds surface for zero value.
 
 ## 10. Packaging & host obligations
 
 Boundary rules (already enforced):
+
 1. **Zero hard runtime dependencies.** Pool, storage, logger, grants all injected. `pg` appears only in examples and dev/test.
 2. **Kernel owns its tables:** package-owned numbered migrations, exported `migrate()`, frozen-schema drift check (`SchemaDriftError`). The `tuddo_*` namespace in the configured Postgres schema belongs to the package.
 3. **Object storage is the 5-verb `BlobStore` SPI**; adapters live in their own packages (§8.4). Core ships no storage SDK.
 4. **Product hooks are events:** `onCommit(event)` post-commit, queued, failures logged and never fail the write. The package never knows its listeners.
 
 Host obligations — these go in a **host integration guide** (S4 deliverable):
+
 - Schedule `gc()` and `verify()`; nothing runs them for you. A `verify()` that has never run is a receipt chain nobody audits.
 - Wire `invalidate()` to permission revocations; understand the multi-worker TTL bound (§5).
 - Grant-resolver patterns (fail closed, keep it close to your authz system, treat inputs/outputs as security-sensitive).
@@ -325,13 +334,13 @@ Host obligations — these go in a **host integration guide** (S4 deliverable):
 
 Shipped work (kernel, session, grants, merge/staged/approver, restore, tags, pin, virtual mounts, GC, verify, direct adapter) is DONE with test evidence; those roadmap tasks close, they are not re-specified.
 
-| S | Deliverable | Proof |
-|---|---|---|
-| S0 | This spec; close shipped tasks against test evidence | doc merged; task tracker reflects reality |
-| S1 | Pre-work, lands FIRST: API surface diet (§6.2) + tree-coherence enforcement (§4.3: write rejection, merge-conflict validation, `verify()` audit). Then sync engine core (§7.1–7.4) + **local-directory target**; engine events | main entry exports exactly the §6.2 Tier-1 set (asserted by a test); README quickstart compiles against it; coherence property test (no op sequence yields an incoherent tree; merge of colliding coherent trees conflicts); kill matrix (§7.5) green in CI with zero infrastructure |
-| S2 | SSH reference target; hostile-input suite at full strength | same kill matrix over a real network target; quoting/escape tests |
-| S3 | Large blobs (§8): session streaming + presign issuance; sync capture path; `@tuddofs/s3` reference adapter | 2 GB MinIO round-trip, flat RSS, both paths; presign contract tests |
-| S4 | Standalone hardening: host integration guide, GC/verify scheduling doc, semver/release pipeline, README↔`.d.ts` drift check; measure §12 budgets | published release; docs gate in CI |
+| S   | Deliverable                                                                                                                                                                                                                    | Proof                                                                                                                                                                                                                                                                                |
+| --- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| S0  | This spec; close shipped tasks against test evidence                                                                                                                                                                           | doc merged; task tracker reflects reality                                                                                                                                                                                                                                            |
+| S1  | Pre-work, lands FIRST: API surface diet (§6.2) + tree-coherence enforcement (§4.3: write rejection, merge-conflict validation, `verify()` audit). Then sync engine core (§7.1–7.4) + **local-directory target**; engine events | main entry exports exactly the §6.2 Tier-1 set (asserted by a test); README quickstart compiles against it; coherence property test (no op sequence yields an incoherent tree; merge of colliding coherent trees conflicts); kill matrix (§7.5) green in CI with zero infrastructure |
+| S2  | SSH reference target; hostile-input suite at full strength                                                                                                                                                                     | same kill matrix over a real network target; quoting/escape tests                                                                                                                                                                                                                    |
+| S3  | Large blobs (§8): session streaming + presign issuance; sync capture path; `@tuddofs/s3` reference adapter                                                                                                                     | 2 GB MinIO round-trip, flat RSS, both paths; presign contract tests                                                                                                                                                                                                                  |
+| S4  | Standalone hardening: host integration guide, GC/verify scheduling doc, semver/release pipeline, README↔`.d.ts` drift check; measure §12 budgets                                                                               | published release; docs gate in CI                                                                                                                                                                                                                                                   |
 
 Dependencies: S1→S2; S1→S3(capture half); S3(streaming half) is independent of S1; S0 first so tasks are cut against this spec.
 
@@ -339,20 +348,22 @@ Dependencies: S1→S2; S1→S3(capture half); S3(streaming half) is independent 
 
 Assumptions: PG stmt 0.3–1ms; S3 20–80ms; remote exec 150–500ms; LLM step 1–10s.
 
-| Op | Budget |
-|---|---|
-| Session read | 1–3 ms (heads index; no per-read provider I/O) |
-| Session write | 8–20 ms visible (mirror write off the critical path) |
-| Exec capture | 0 visible (async; one exec per cycle) |
-| Warm re-acquire | ≤ 0.1 s (index-driven; never a full reseed) |
-| Fork / merge | 10–100 ms once per mount / < 1 s at 100 paths |
+| Op              | Budget                                               |
+| --------------- | ---------------------------------------------------- |
+| Session read    | 1–3 ms (heads index; no per-read provider I/O)       |
+| Session write   | 8–20 ms visible (mirror write off the critical path) |
+| Exec capture    | 0 visible (async; one exec per cycle)                |
+| Warm re-acquire | ≤ 0.1 s (index-driven; never a full reseed)          |
+| Fork / merge    | 10–100 ms once per mount / < 1 s at 100 paths        |
 
 ## 13. Working methodology (binding)
 
 ### Order of work
+
 Strict roadmap order S1→S4 (S0 is this document); inside a stage: pure functions → algorithms → targets → integration. Never start Sn+1 while Sn acceptance is red.
 
 ### Per-component discipline
+
 1. Golden tests first for anything with a pinned byte format; golden tests are append-only.
 2. Property tests for the DAG: fork→write→merge roundtrips; merge idempotency; restore(x)-then-diff(x) empty; GC never collects ref-reachable state; §9 classifier exhaustive over generated sha-states. (Shipped suites already do this — extend, don't fork conventions.)
 3. The decision table and error taxonomy are normative. If an implementation choice contradicts a table, the table wins; if the table seems wrong, STOP and ask.
@@ -362,6 +373,7 @@ Strict roadmap order S1→S4 (S0 is this document); inside a stage: pure functio
 7. Docs are part of the contract: README updated in the same PR as any surface change; exported symbols carry TSDoc citing the governing spec section; kernel algorithm files open with a header naming their spec section and invariants; migrations immutable once merged; README examples compile in a test.
 
 ### Never-do list (each item has caused a production incident in systems like this)
+
 - NEVER `SELECT` then `UPDATE` a ref — the CAS `UPDATE … WHERE commit_id=$expected` is the only legal ref write.
 - NEVER hold a DB transaction across network I/O (object storage, target exec, resolver call). Upload first, then tx.
 - NEVER update `tuddo_refs` and `tuddo_heads` in different transactions.
@@ -376,6 +388,7 @@ Strict roadmap order S1→S4 (S0 is this document); inside a stage: pure functio
 - NEVER catch-and-continue in kernel code paths; errors propagate typed (§9).
 
 ### When stuck
+
 Ambiguity or contradiction in this spec → stop, name the confusion, ask. Do not invent semantics; every table here was decided deliberately.
 
 ## 14. Risks

@@ -12,7 +12,12 @@ import {
   StorageError,
   type ErrorContext,
 } from './errors.js'
-import { InvalidCommitTimestampError } from './validation.js'
+import {
+  InvalidCommitTimestampError,
+  InvalidPathError,
+  findPathCollision,
+  findTreeCoherenceCollisions,
+} from './validation.js'
 import { createTuddoFsSchemaPool, migrate, normalizeTuddoFsSchema, type TuddoFsPool } from './migration.js'
 import { validateMountKey, validatePath } from './validation.js'
 import { GrantController, type Grant } from './grants.js'
@@ -50,7 +55,7 @@ export interface GcReport {
   readonly deletedObjects: number
   readonly settledBranches: number
 }
-/** Typed fsck findings; corruption is reported as data instead of aborting the scan. */
+/** Typed fsck findings required by architecture §4.5; corruption is reported as data instead of aborting the scan. */
 export type VerifyFinding =
   | {
       readonly kind: 'tree-hash-drift'
@@ -97,6 +102,13 @@ export type VerifyFinding =
       readonly treeId: string
       readonly path: string
       readonly blobId: string
+    }
+  | {
+      readonly kind: 'tree-coherence'
+      readonly tenant: string
+      readonly ref: string
+      readonly path: string
+      readonly collidingPath: string
     }
 /** Limits fsck scope to one tenant and randomizes the tree, commit, and CAS spot-check samples. Ref/head drift remains full-scope. */
 export interface VerifyOptions {
@@ -1249,6 +1261,15 @@ export function createTuddoFs(inputOptions: TuddoFsOptions): TuddoFsKernel {
         const expected =
           expectedByRef.get(refKey) ?? new Map<string, { blobId: string; sha256: string; sizeBytes: string }>()
         const actual = headsByRef.get(refKey) ?? new Map<string, VerifyHeadRow>()
+        for (const collision of findTreeCoherenceCollisions(expected.keys())) {
+          findings.push({
+            kind: 'tree-coherence',
+            tenant: ref.tenant,
+            ref: ref.name,
+            path: collision.path,
+            collidingPath: collision.collidingPath,
+          })
+        }
         for (const [path, entry] of expected) {
           const head = actual.get(path)
           if (!head) {
@@ -1506,6 +1527,10 @@ export function createTuddoFs(inputOptions: TuddoFsOptions): TuddoFsKernel {
         const current = heads.get(path)
         if (input.ifSha !== undefined && input.ifSha !== (current?.sha256 ?? null)) {
           throw new PreconditionFailedError(input.ifSha, current?.sha256 ?? null, context)
+        }
+        const collision = findPathCollision(path, heads)
+        if (collision !== undefined) {
+          throw new InvalidPathError(path, `collides with existing file ${collision}`, context)
         }
         if (current?.sha256 === sha256) {
           await client.query('ROLLBACK')
