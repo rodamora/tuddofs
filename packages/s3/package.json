@@ -31,7 +31,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json --incremental false",
-    "test": "node --import tsx --test test/*.test.ts",
+    "test": "node ../../scripts/run-tests.mjs s3",
     "test:contract": "node --import tsx --test test/contract.test.ts",
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },

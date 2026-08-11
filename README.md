@@ -181,6 +181,10 @@ Low-level ref operations, deterministic hashing helpers, `GrantController`, migr
 
 The TypeScript declarations in `dist/index.d.ts` are the authoritative details for option and result shapes.
 
+## Host integration
+
+Running this in production means owning five things the package deliberately does not: the grant resolver, revocation, scheduled `gc()` and `verify()`, `onCommit` wiring, and — if you use the sync engine — the trust boundary around `exec`. [`docs/host-guide.md`](./docs/host-guide.md) covers each with working examples, including a copy-pasteable maintenance job, the multi-worker `invalidate()` bound, virtual-mount handler rules, the SigV4 host-reachability caveat, and an error-to-recovery table. Its examples are compiled and executed in CI alongside the README's.
+
 ## Sync engine
 
 The sync engine materializes a session's governed mounts into a real directory so shell tools work natively, and commits what they change back to the kernel. It is exported from `tuddofs/internal`:
@@ -283,6 +287,32 @@ Which transport to use is the host's call and cannot be detected from here: SigV
 
 **The local-directory target confines the filesystem, not the host.** Its `readFile`, `writeFile`, and `mkdir` refuse any path outside the workspace root and never follow a symlink out of it, so a governed mount cannot be used to read or overwrite host files. `exec` has no such protection: it runs a real shell as the host process user, with that user's environment, filesystem, and network. Anything that user can do through this target can do. Use it for agents and code you already trust on a machine you already trust; run untrusted code in a sandbox and give it its own target.
 
+## Versioning and releases
+
+The published surface is semantically versioned, and the surface is defined narrowly on purpose: the `tuddofs` main entry, the `tuddofs/internal` subpath, the `tuddo_*` schema, the canonical hash formats, and the documented behavior of each. What that means in practice:
+
+| Change                                                                                       | Release |
+| -------------------------------------------------------------------------------------------- | ------- |
+| Bug fix that restores documented behavior; performance work; documentation                   | patch   |
+| New export on the main entry; new optional option, method, or result field                   | minor   |
+| New error class thrown only by a newly added code path                                       | minor   |
+| New numbered migration that adds tables or columns (deploy note: hosts must run `migrate()`) | minor   |
+| Breaking change on the `tuddofs/internal` subpath                                            | minor   |
+| Removing or renaming a main-entry export; changing a signature; narrowing an accepted input  | major   |
+| Changing which error class an existing condition throws, or a result discriminant            | major   |
+| Changing the frozen `tuddo_*` DDL contract, or the default schema resolution                 | major   |
+| Changing the §4.2 canonical tree or commit preimage                                          | never   |
+
+Three of those rows are the load-bearing ones:
+
+- **Hash formats never change.** The golden fixtures in `fixtures/golden-hashes.json` pin the tree and commit preimages byte for byte, and those tests are append-only. A change that would rewrite the identity of every commit ever created is not a major version, it is a different product.
+- **Migrations are immutable once released.** Fixing a shipped migration means adding the next one. The frozen-schema check turns a hand-patched database into `SchemaDriftError` at boot rather than into corruption later.
+- **`tuddofs/internal` carries a weaker promise than the main entry.** It exists so that low-level ref operations and the sync engine are reachable without widening the Tier-1 storefront, and its shape is still settling. A breaking change there ships in a minor release with a changelog entry; a breaking change to the main entry does not.
+
+While the package is `0.x`, semver's pre-1.0 rule applies on top of the table: everything marked _major_ ships as a minor bump, and everything marked _minor_ or _patch_ ships as a patch bump.
+
+Publishing runs from a tag, and the gates below run before `npm publish`: format, lint, typecheck, build, the Tier-1 export-set test (`npm run gate:surface`), the documentation compilation gate (`npm run gate:docs`), the full test suite with skips treated as failures, and the packed-tarball smoke test. `npm publish` also re-runs the build and those two gates through `prepublishOnly`, so a manual publish from a laptop cannot skip them.
+
 ## Integration tests
 
 Unit tests are hermetic and do not require PostgreSQL:
@@ -337,6 +367,8 @@ TUDDOFS_DATABASE_URL="postgresql://tuddofs:tuddofs@127.0.0.1:${TUDDOFS_IT_PORT:-
 
 To run it against a machine you already have instead, set `TUDDOFS_SSH_HOST` and, as needed, `TUDDOFS_SSH_USER`, `TUDDOFS_SSH_PORT`, `TUDDOFS_SSH_IDENTITY`, `TUDDOFS_SSH_KNOWN_HOSTS`, and `TUDDOFS_SSH_ROOT` (default `/tmp/tuddofs-acceptance`). Workspaces are created and removed per case; the suite never kills a daemon it did not start. Like the MinIO suite, it fails loudly rather than skipping when its prerequisites are missing.
 
+The same command also measures the architecture §12 performance budgets over that network target — the visible cost of a write, a capture trigger, a warm re-acquire, and one remote exec round trip — and asserts them. Every measurement is printed by the suite; the local-target measurements come from `npm run test:integration`.
+
 Never point these commands at a shared development or production database.
 
 ## Development commands
@@ -348,5 +380,17 @@ npm run typecheck
 npm run build
 npm test
 ```
+
+Three gates exist as their own commands because CI names them individually and a release runs them before publishing:
+
+```bash
+npm run gate:surface     # the main entry exports exactly the Tier-1 set
+npm run gate:docs        # every TypeScript example in the docs compiles against the shipped surface
+npm run gate:quickstart  # the README quickstart and the host-guide maintenance job, in a clean container
+```
+
+`gate:quickstart` needs Docker. It packs the package, starts a scratch PostgreSQL and a scratch `node:22-alpine` container on a private network, installs the tarball into an empty project, and runs the two programs the documents hand out verbatim. Nothing from this checkout reaches the consumer container except the tarball.
+
+Set `TUDDOFS_NO_SKIPS=1` on any test command to turn a skipped test into a failure. CI sets it wherever the suite's environment is fully provisioned; without it, skips are still reported separately from passes at the end of the run.
 
 The package is published under the MIT license. See [LICENSE](./LICENSE).
