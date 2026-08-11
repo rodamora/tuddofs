@@ -7,7 +7,7 @@ import {
   PreconditionFailedError,
   StorageError,
 } from './errors.js'
-import { InvalidPathError, validateMountKey, validatePath } from './validation.js'
+import { InvalidPathError, findTreeCoherenceCollisions, validateMountKey, validatePath } from './validation.js'
 import type {
   Actor,
   TuddoFsKernel,
@@ -136,7 +136,7 @@ export interface DiffRecord {
   readonly afterMode?: number
 }
 
-/** Per-mount merge outcome; conflicts are data, not thrown exceptions. */
+/** Per-mount merge outcome governed by architecture §4.3 and §9; conflicts are data, not thrown exceptions. */
 export type MergeResult =
   | 'merged'
   | 'unauthorized'
@@ -1464,6 +1464,26 @@ export function createSessionApi(kernel: SessionKernel, options: TuddoFsOptions)
               continue
             }
             if (sameHead(o, t)) continue
+            conflicts.push({
+              path,
+              ...(b ? { baseSha: b.sha256 } : {}),
+              ...(o ? { oursSha: o.sha256 } : {}),
+              ...(t ? { theirsSha: t.sha256 } : {}),
+            })
+          }
+          if (conflicts.length) {
+            await client.query('ROLLBACK')
+            return { conflicts }
+          }
+          const collidingPaths = new Set<string>()
+          for (const collision of findTreeCoherenceCollisions(merged.keys())) {
+            collidingPaths.add(collision.path)
+            collidingPaths.add(collision.collidingPath)
+          }
+          for (const path of [...collidingPaths].sort()) {
+            const b = base.get(path)
+            const o = ours.get(path)
+            const t = theirsTree.get(path)
             conflicts.push({
               path,
               ...(b ? { baseSha: b.sha256 } : {}),

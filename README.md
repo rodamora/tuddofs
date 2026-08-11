@@ -144,6 +144,10 @@ A mount is addressed as `mount-key:/absolute/path`, for example `project:notes:/
 
 Writes create immutable content-addressed blobs, trees, and commits. Tree and commit hashes are deterministic and the golden vectors in `fixtures/golden-hashes.json` pin their byte formats. Optimistic concurrency is available through `ifSha`, so a caller can reject an edit when the file changed since it was read.
 
+### Tree coherence
+
+Directories are implicit: trees store files only, and path segments synthesize the directory view. A tree cannot contain both a file and a descendant beneath that file, such as `/a` and `/a/x.md`. `write` and `edit` reject either direction of this collision with `InvalidPathError` naming the existing entry; delete the existing file first when intentionally replacing a file with a directory-shaped path or the reverse. A merge that would combine two coherent trees into an incoherent result returns conflicts for both paths and commits nothing. `verify()` reports incoherent ref-tip trees created before this enforcement.
+
 ### Branches and sessions
 
 `fork` creates or reuses a tenant-and-mount branch for an agent session. The branch records provenance such as agent kind, thread ID, run ID, and author. An opened session gives the executing agent only the mounts and paths granted to its actor; it does not expose the host application's other data.
@@ -166,7 +170,7 @@ The package entry point exports:
 - `createDirectAdapter(session)` — expose the session's basic file operations as direct tool-shaped functions for an agent loop.
 - `BlobStore` and related types — integrate object storage for blobs that do not fit the inline threshold.
 - Deterministic hashing helpers — `sha256`, `treePreimage`, `hashTree`, `commitPreimage`, and `hashCommit`.
-- Typed errors — including `PermissionDeniedError`, `PreconditionFailedError`, `NotFoundError`, `RefConflictError`, `SchemaDriftError`, and `StorageError`.
+- Typed errors — including `InvalidPathError`, `PermissionDeniedError`, `PreconditionFailedError`, `NotFoundError`, `RefConflictError`, `SchemaDriftError`, and `StorageError`.
 
 The TypeScript declarations in `dist/index.d.ts` are the authoritative details for option and result shapes.
 

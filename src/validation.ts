@@ -2,7 +2,7 @@ import { TuddoFsError } from './errors.js'
 import type { ErrorContext } from './errors.js'
 
 /**
- * Error raised when a file path violates the kernel path contract.
+ * Error raised when a file path violates architecture §4.3 syntax or tree coherence.
  */
 export class InvalidPathError extends TuddoFsError {
   constructor(path: unknown, reason: string, context?: Partial<ErrorContext>) {
@@ -47,7 +47,7 @@ export class InvalidCommitTimestampError extends TuddoFsError {
 }
 
 /**
- * Normalize a path to NFC, then validate it without repairing invalid syntax.
+ * Normalize and validate a path under the architecture §4.3 contract without repairing invalid syntax.
  */
 export function validatePath(path: string, context?: Partial<ErrorContext>): string {
   if (typeof path !== 'string') {
@@ -77,6 +77,61 @@ export function validatePath(path: string, context?: Partial<ErrorContext>): str
   }
 
   return normalized
+}
+
+type PathCollection = {
+  has(path: string): boolean
+  keys(): IterableIterator<string>
+}
+
+export type TreeCoherenceCollision = {
+  readonly path: string
+  readonly collidingPath: string
+}
+
+/**
+ * Find the existing file that would make `path` incoherent under architecture
+ * §4.3, whether the existing file is an ancestor or a descendant.
+ */
+export function findPathCollision(path: string, paths: PathCollection): string | undefined {
+  for (let separator = path.indexOf('/', 1); separator !== -1; separator = path.indexOf('/', separator + 1)) {
+    const ancestor = path.slice(0, separator)
+    if (paths.has(ancestor)) return ancestor
+  }
+
+  const directoryPrefix = `${path}/`
+  let descendant: string | undefined
+  for (const candidate of paths.keys()) {
+    if (candidate.startsWith(directoryPrefix) && (descendant === undefined || candidate < descendant)) {
+      descendant = candidate
+    }
+  }
+  return descendant
+}
+
+/**
+ * Return every file-prefix pair that violates the flat-tree coherence
+ * invariant in architecture §4.3.
+ */
+export function findTreeCoherenceCollisions(paths: Iterable<string>): readonly TreeCoherenceCollision[] {
+  const pathSet = new Set(paths)
+  const collisions: TreeCoherenceCollision[] = []
+  for (const collidingPath of pathSet) {
+    for (
+      let separator = collidingPath.indexOf('/', 1);
+      separator !== -1;
+      separator = collidingPath.indexOf('/', separator + 1)
+    ) {
+      const path = collidingPath.slice(0, separator)
+      if (pathSet.has(path)) collisions.push({ path, collidingPath })
+    }
+  }
+  collisions.sort((left, right) => {
+    if (left.path !== right.path) return left.path < right.path ? -1 : 1
+    if (left.collidingPath === right.collidingPath) return 0
+    return left.collidingPath < right.collidingPath ? -1 : 1
+  })
+  return collisions
 }
 
 /**
