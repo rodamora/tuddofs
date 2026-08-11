@@ -67,8 +67,9 @@ test('a failed capture releases the slot, reports the attempt, and never wedges'
 test('a non-Error rejection still reaches the failure callback as an Error', async () => {
   const failures: Error[] = []
   const slot = new CaptureSlot(
-    // eslint-disable-next-line @typescript-eslint/only-throw-error
     async () => {
+      // A dying sandbox rejects with whatever it has; the slot must normalize it.
+      // eslint-disable-next-line @typescript-eslint/only-throw-error
       throw 'target vanished'
     },
     (_attempt, error) => failures.push(error),
