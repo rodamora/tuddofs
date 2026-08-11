@@ -281,7 +281,7 @@ The claimed sha is bound to the bytes that actually landed, never trusted: a sto
 
 Which transport to use is the host's call and cannot be detected from here: SigV4 presigned URLs embed the endpoint host, so target-direct upload requires the blob endpoint to be reachable from the _target's_ network. A LAN-only MinIO behind a remote sandbox is exactly the case `'relay'` exists for. A `'presigned'` engine whose store cannot presign fails the capture loudly rather than quietly relaying gigabytes the host did not ask to pay for.
 
-**The local-directory target confines the filesystem, not the host.** Its `readFile`, `writeFile`, and `mkdir` refuse any path outside the workspace root and never follow a symlink out of it, so a governed mount cannot be used to read or overwrite host files. `exec` has no such protection: it runs a real shell as the host process user, with that user's environment, filesystem, and network. Anything that user can do, this target can do. Use it for agents and code you already trust on a machine you already trust; run untrusted code in a sandbox and give it its own target.
+**The local-directory target confines the filesystem, not the host.** Its `readFile`, `writeFile`, and `mkdir` refuse any path outside the workspace root and never follow a symlink out of it, so a governed mount cannot be used to read or overwrite host files. `exec` has no such protection: it runs a real shell as the host process user, with that user's environment, filesystem, and network. Anything that user can do through this target can do. Use it for agents and code you already trust on a machine you already trust; run untrusted code in a sandbox and give it its own target.
 
 ## Integration tests
 
