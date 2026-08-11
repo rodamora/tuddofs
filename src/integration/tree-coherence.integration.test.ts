@@ -3,7 +3,8 @@ import test, { after, before, beforeEach } from 'node:test'
 
 import { Pool } from 'pg'
 
-import { InvalidPathError, NotFoundError, createTuddoFs, migrate } from '../index.js'
+import { InvalidPathError, NotFoundError } from '../index.js'
+import { createTuddoFs, migrate } from '../internal.js'
 
 const pool = new Pool({ connectionString: process.env.TUDDOFS_DATABASE_URL })
 const tenant = 'tree-coherence-tenant'
@@ -69,7 +70,7 @@ test('write rejects file-as-directory and directory-as-file collisions, then per
 test('merge returns conflicts on both paths when coherent trees have a prefix collision', async () => {
   const fs = createTuddoFs({ pool, grants })
   const session = await fs.open({ actor, sessionId: 'merge-collision', mounts: [{ key: mount }] })
-  const ours = await session.write(`${mount}:/a`, 'ours')
+  const ours = await session.mount(mount).write('/a', 'ours')
   const theirs = await fs.write({
     tenant,
     mount,
@@ -83,7 +84,9 @@ test('merge returns conflicts on both paths when coherent trees have a prefix co
     [tenant, `mount/${mount}`],
   )
 
-  assert.deepEqual(await session.resolveMerge(mount), {
+  const mergeResult = await session.merge({ mounts: [mount] })
+  assert.deepEqual(mergeResult[mount], {
+    status: 'conflicts',
     conflicts: [
       { path: '/a', oursSha: ours.sha256 },
       { path: '/a/x.md', theirsSha: theirs.sha256 },
@@ -179,7 +182,7 @@ test('seeded randomized writes stay coherent and colliding coherent merges alway
       })
       const oursPath = next() % 2 === 0 ? ancestor : descendant
       const theirsPath = oursPath === ancestor ? descendant : ancestor
-      await session.write(`${propertyMount}:${oursPath}`, `ours-${iteration}`)
+      await session.mount(propertyMount).write(oursPath, `ours-${iteration}`)
       await fs.write({
         tenant,
         mount: propertyMount,
@@ -188,8 +191,11 @@ test('seeded randomized writes stay coherent and colliding coherent merges alway
         bytes: `theirs-${iteration}`,
         authorUser,
       })
-      const result = await session.resolveMerge(propertyMount)
-      assert.ok(typeof result === 'object' && 'conflicts' in result, `seed=${initialSeed} merge=${iteration}`)
+      const mergeResult = await session.merge({ mounts: [propertyMount] })
+      const result = mergeResult[propertyMount]
+      if (!result || result.status !== 'conflicts') {
+        throw new Error(`unexpected merge result: ${result ? result.status : 'missing'}`)
+      }
       assert.deepEqual(
         result.conflicts.map(conflict => conflict.path).sort(),
         [ancestor, descendant].sort(),
