@@ -1,28 +1,53 @@
 import assert from 'node:assert/strict'
 import test, { after, before, beforeEach } from 'node:test'
 
+import { CreateBucketCommand, S3Client } from '@aws-sdk/client-s3'
 import { Pool } from 'pg'
 
 import { S3BlobStore } from '../../packages/s3/src/index.js'
 import { createTuddoFs, migrate } from '../index.js'
 
 const endpoint = process.env.TUDDOFS_S3_ENDPOINT
+const databaseUrl = process.env.TUDDOFS_DATABASE_URL
+const missingEnvironment = [!endpoint && 'TUDDOFS_S3_ENDPOINT', !databaseUrl && 'TUDDOFS_DATABASE_URL'].filter(
+  (name): name is string => Boolean(name),
+)
 
-if (endpoint) {
-  const pool = new Pool({ connectionString: process.env.TUDDOFS_DATABASE_URL })
-  const storage = new S3BlobStore({
-    bucket: process.env.TUDDOFS_S3_BUCKET ?? 'tuddofs',
-    endpoint,
-    region: process.env.TUDDOFS_S3_REGION ?? 'us-east-1',
-    forcePathStyle: process.env.TUDDOFS_S3_FORCE_PATH_STYLE !== 'false',
-    credentials: {
-      accessKeyId: process.env.TUDDOFS_S3_ACCESS_KEY_ID ?? 'minioadmin',
-      secretAccessKey: process.env.TUDDOFS_S3_SECRET_ACCESS_KEY ?? 'minioadmin',
-    },
+if (missingEnvironment.length > 0) {
+  test.skip(`S3 core wiring requires ${missingEnvironment.join(' and ')}`, {
+    skip: `set ${missingEnvironment.join(' and ')} to run the S3 integration test`,
   })
+} else {
+  const bucket = process.env.TUDDOFS_S3_BUCKET ?? 'tuddofs'
+  const region = process.env.TUDDOFS_S3_REGION ?? 'us-east-1'
+  const accessKeyId = process.env.TUDDOFS_S3_ACCESS_KEY_ID ?? 'minioadmin'
+  const secretAccessKey = process.env.TUDDOFS_S3_SECRET_ACCESS_KEY ?? 'minioadmin'
+  const forcePathStyle = process.env.TUDDOFS_S3_FORCE_PATH_STYLE !== 'false'
+  const pool = new Pool({ connectionString: databaseUrl })
+  const admin = new S3Client({
+    endpoint,
+    region,
+    forcePathStyle,
+    credentials: { accessKeyId, secretAccessKey },
+  })
+  const storage = new S3BlobStore({
+    bucket,
+    endpoint,
+    region,
+    forcePathStyle,
+    credentials: { accessKeyId, secretAccessKey },
+  })
+  const tenant = `s3-wiring-${process.pid}`
+  const objectPrefix = `tuddo/${tenant}/`
 
   before(async () => {
     await migrate(pool)
+    try {
+      await admin.send(new CreateBucketCommand({ Bucket: bucket }))
+    } catch (error) {
+      const name = error instanceof Error ? error.name : ''
+      if (name !== 'BucketAlreadyOwnedByYou' && name !== 'BucketAlreadyExists') throw error
+    }
   })
 
   beforeEach(async () => {
@@ -32,11 +57,17 @@ if (endpoint) {
   })
 
   after(async () => {
-    await pool.end()
+    try {
+      const objects = await storage.list(objectPrefix)
+      await Promise.all(objects.map(object => storage.delete(object.key)))
+    } finally {
+      storage.destroy()
+      admin.destroy()
+      await pool.end()
+    }
   })
 
   test('core can read a large blob through the injected S3 adapter', async () => {
-    const tenant = `s3-wiring-${process.pid}`
     const mount = 'project:s3-wiring'
     const fs = createTuddoFs({
       pool,
