@@ -22,6 +22,7 @@ export class GrantController {
   private readonly timeoutMs: number
   private readonly now: () => number
   private readonly cache = new Map<string, CacheEntry>()
+  private nextReapAt = 0
 
   constructor(options: GrantControllerOptions | GrantResolver) {
     this.resolveFn = options.resolve
@@ -37,12 +38,16 @@ export class GrantController {
   async resolve(actor: Actor, mount: { key: string }, options: { bypassCache?: boolean } = {}): Promise<Grant> {
     const key = `${actor.tenant}\u0000${actor.id}\u0000${mount.key}`
     const now = this.now()
-    for (const [cachedKey, cached] of this.cache) {
-      if (cached.expiresAt <= now) this.cache.delete(cachedKey)
+    if (now >= this.nextReapAt) {
+      for (const [cachedKey, cached] of this.cache) {
+        if (cached.expiresAt <= now) this.cache.delete(cachedKey)
+      }
+      this.nextReapAt = now + Math.max(1, Math.min(this.ttlMs, 1_000))
     }
-    if (!options.bypassCache) {
-      const cached = this.cache.get(key)
-      if (cached) return cached.grant
+    const cached = this.cache.get(key)
+    if (cached) {
+      if (cached.expiresAt <= now) this.cache.delete(key)
+      else if (!options.bypassCache) return cached.grant
     }
     let result: Grant
     try {

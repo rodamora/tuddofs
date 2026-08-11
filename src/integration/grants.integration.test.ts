@@ -7,12 +7,7 @@ import { GrantResolverError, PermissionDeniedError, createAgentFs, migrate } fro
 const pool = new Pool({ connectionString: process.env.AGENT_FS_DATABASE_URL })
 const tenant = 'grants-integration'
 const actor = { id: 'user-grants', tenant }
-const never = (() => {
-  const promiseConstructor = Promise as typeof Promise & {
-    withResolvers<T>(): { promise: Promise<T> }
-  }
-  return promiseConstructor.withResolvers<never>().promise
-})()
+const never = new Promise<never>(() => undefined)
 
 before(async () => migrate(pool))
 beforeEach(async () => {

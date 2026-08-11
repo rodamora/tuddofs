@@ -150,7 +150,7 @@ for (const [mountKey, r] of Object.entries(results)) {
 ```
 
 - Merges are **per mount, all-or-nothing per mount**; a conflict in mount P never blocks mount Q (§4.7).
-- Session-wide `merge()` skips virtual mounts because they have no branches; addressing one directly with `resolveMerge()` still throws `NotFoundError` (§6.1).
+- Session-wide `merge()` skips virtual and pinned mounts because neither has a writable branch. Addressing a virtual mount with `resolveMerge()` throws `NotFoundError`; addressing a pinned mount throws `PermissionDeniedError` (§6.1).
 - Conflict resolution: an authorized actor writes the resolved content to the mount, then `fs.resolveMerge(mountKey)` — which literally re-runs the merge; converged rows classify clean (§4.7).
 - Merge is idempotent: re-running a completed merge produces no new commit.
 - `fs.discard()` abandons all of the session's branches — nothing touches the mounts, GC reclaims later.

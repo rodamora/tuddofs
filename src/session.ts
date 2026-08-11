@@ -152,7 +152,7 @@ export interface SessionFileSystem {
   history(path: string): Promise<readonly HistoryRecord[]>
   timeline(filter?: TimelineFilter): Promise<readonly TimelineRecord[]>
   diff(a: string, b: string): Promise<readonly DiffRecord[]>
-  merge(options?: { approver?: Actor }): Promise<Readonly<Record<string, MergeResult>>>
+  merge(options?: { approver?: Actor }): Promise<Readonly<Partial<Record<string, MergeResult>>>>
   resolveMerge(mountKey: string, options?: { approver?: Actor }): Promise<MergeResult>
   restore(mountKey: string, at: string): Promise<RestoreResult>
   tag(mountKey: string, label: string): Promise<string>
@@ -215,6 +215,9 @@ function globRegex(pattern: string): RegExp {
     else source += /[\\^$+?.()|[\]{}]/u.test(char) ? `\\${char}` : char
   }
   return new RegExp(`${source}$`, 'u')
+}
+function escapeLike(value: string): string {
+  return value.replace(/[\\%_]/gu, character => `\\${character}`)
 }
 
 function changedPaths(before: Map<string, Head>, after: Map<string, Head>): string[] {
@@ -320,8 +323,8 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
              WHERE r.tenant = $1
                AND (
                  r.name = $2
-                 OR (r.kind = 'tag' AND r.name LIKE $3)
-                 OR (r.kind = 'branch' AND r.name LIKE $4)
+                 OR (r.kind = 'tag' AND r.name LIKE $3 ESCAPE E'\\\\')
+                 OR r.name = $4
                )
              UNION
              SELECT parent_id
@@ -334,7 +337,13 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
            JOIN afs_commits c ON c.id = lineage.id
            WHERE c.tenant = $1 AND c.commit_sha = $5
            LIMIT 1`,
-          [input.actor.tenant, `mount/${mountKey}`, `tag/${mountKey}/%`, `agent/%/${mountKey}`, commitSha],
+          [
+            input.actor.tenant,
+            `mount/${mountKey}`,
+            `tag/${escapeLike(mountKey)}/%`,
+            `agent/${input.sessionId}/${mountKey}`,
+            commitSha,
+          ],
         )
         const row = result.rows[0]
         if (!row)
@@ -358,10 +367,16 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
                WHERE r.tenant = $1 AND r.name = $2
                  AND (
                    r.name = $3
-                   OR (r.kind = 'tag' AND r.name LIKE $4)
-                   OR (r.kind = 'branch' AND r.name LIKE $5)
+                   OR (r.kind = 'tag' AND r.name LIKE $4 ESCAPE E'\\\\')
+                   OR r.name = $5
                  )`,
-              [input.actor.tenant, pin, `mount/${mount.key}`, `tag/${mount.key}/%`, `agent/%/${mount.key}`],
+              [
+                input.actor.tenant,
+                pin,
+                `mount/${mount.key}`,
+                `tag/${escapeLike(mount.key)}/%`,
+                `agent/${input.sessionId}/${mount.key}`,
+              ],
             )
             row = result.rows[0]
           } else {
@@ -372,8 +387,7 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
               tenant: input.actor.tenant,
               mount: mount.key,
             })
-          const confined = await assertCommitInMountLineage(client, mount.key, row.commit_sha)
-          return { ref: `__pin/${input.sessionId}/${mount.key}`, commitId: confined.id }
+          return { ref: `__pin/${input.sessionId}/${mount.key}`, commitId: row.id }
         } finally {
           client.release()
         }
@@ -550,7 +564,7 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
             if (entry.type === 'directory' && !visited.has(entry.path)) pending.push(entry.path)
           }
         }
-        return [...entries.values()].sort((a, b) => a.path.localeCompare(b.path))
+        return [...entries.values()].sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))
       }
 
       const resolveCommit = async (
@@ -624,6 +638,7 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
         const candidates = [...mounts.values()].filter((mount): mount is RefMount => !('virtual' in mount))
         for (const mount of candidates) {
           if (preferredMountKey !== undefined && preferredMountKey !== mount.key) continue
+          if (optionsForResolution.checkRead !== false) await ensureRead(mount, { bypassCache: true })
           const client = await options.pool.connect()
           try {
             let candidateSha = value
@@ -644,7 +659,6 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
               if (error instanceof NotFoundError) continue
               throw error
             }
-            if (optionsForResolution.checkRead !== false) await ensureRead(mount, { bypassCache: true })
             return { id: confined.id, sha: confined.commit_sha, mountKey: mount.key }
           } finally {
             client.release()
@@ -683,6 +697,39 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
         )
       }
 
+      const readTrees = async (
+        client: AgentFsClient,
+        commitIds: readonly string[],
+      ): Promise<Map<string, Map<string, Head>>> => {
+        const trees = new Map<string, Map<string, Head>>()
+        for (const commitId of commitIds) trees.set(commitId, new Map())
+        if (commitIds.length === 0) return trees
+        const result = await client.query<{
+          commit_id: string
+          path: string
+          blob_id: string
+          sha256: string
+          size_bytes: string
+          mode: number
+        }>(
+          `SELECT c.id::text AS commit_id, e.path, e.blob_id::text, b.sha256, b.size_bytes::text, e.mode
+           FROM afs_commits c
+           JOIN afs_tree_entries e ON e.tree_id = c.tree_id
+           JOIN afs_blobs b ON b.id = e.blob_id
+           WHERE c.tenant = $1 AND c.id = ANY($2::bigint[])`,
+          [input.actor.tenant, [...commitIds]],
+        )
+        for (const row of result.rows) {
+          trees.get(row.commit_id)?.set(row.path, {
+            path: row.path,
+            sha256: row.sha256,
+            sizeBytes: BigInt(row.size_bytes),
+            mode: row.mode,
+            blobId: row.blob_id,
+          })
+        }
+        return trees
+      }
       const unsupportedVirtual = (mountKey: string, path?: string): never => {
         throw new NotFoundError('Virtual mount has no history or branches', {
           tenant: input.actor.tenant,
@@ -858,24 +905,37 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
                  CROSS JOIN LATERAL unnest(c.parents) AS parent_id
                )
                SELECT c.id::text, c.commit_sha, c.parents, c.op, c.author_user, c.agent_kind, c.thread_id, c.run_id, c.created_at,
-                      COALESCE((SELECT array_agg(p.commit_sha ORDER BY p.id) FROM afs_commits p WHERE p.id = ANY(c.parents)), '{}') AS parent_shas
+                      COALESCE(
+                        (SELECT array_agg(p.commit_sha ORDER BY array_position(c.parents, p.id))
+                         FROM afs_commits p WHERE p.id = ANY(c.parents)),
+                        '{}'
+                      ) AS parent_shas
                FROM lineage JOIN afs_commits c ON c.id = lineage.id
                WHERE c.tenant = $1
-                 AND EXISTS (
-                   SELECT 1
-                   FROM unnest(c.parents) AS parent_id
-                   LEFT JOIN afs_commits parent ON parent.id = parent_id
-                   LEFT JOIN afs_tree_entries current_entry
-                     ON current_entry.tree_id = c.tree_id AND current_entry.path = $3
-                   LEFT JOIN afs_blobs current_blob ON current_blob.id = current_entry.blob_id
-                   LEFT JOIN afs_tree_entries parent_entry
-                     ON parent_entry.tree_id = parent.tree_id AND parent_entry.path = $3
-                   LEFT JOIN afs_blobs parent_blob ON parent_blob.id = parent_entry.blob_id
-                  WHERE (current_entry.path = $3 OR parent_entry.path = $3)
-                    AND (
-                      current_blob.sha256 IS DISTINCT FROM parent_blob.sha256
-                      OR current_entry.mode IS DISTINCT FROM parent_entry.mode
-                    )
+                 AND (
+                   (
+                     cardinality(c.parents) = 0
+                     AND EXISTS (
+                       SELECT 1 FROM afs_tree_entries current_entry
+                       WHERE current_entry.tree_id = c.tree_id AND current_entry.path = $3
+                     )
+                   )
+                   OR EXISTS (
+                     SELECT 1
+                     FROM unnest(c.parents) AS parent_id
+                     LEFT JOIN afs_commits parent ON parent.id = parent_id
+                     LEFT JOIN afs_tree_entries current_entry
+                       ON current_entry.tree_id = c.tree_id AND current_entry.path = $3
+                     LEFT JOIN afs_blobs current_blob ON current_blob.id = current_entry.blob_id
+                     LEFT JOIN afs_tree_entries parent_entry
+                       ON parent_entry.tree_id = parent.tree_id AND parent_entry.path = $3
+                     LEFT JOIN afs_blobs parent_blob ON parent_blob.id = parent_entry.blob_id
+                    WHERE (current_entry.path = $3 OR parent_entry.path = $3)
+                      AND (
+                        current_blob.sha256 IS DISTINCT FROM parent_blob.sha256
+                        OR current_entry.mode IS DISTINCT FROM parent_entry.mode
+                      )
+                   )
                  )
                ORDER BY c.id DESC`,
               [input.actor.tenant, ref, path],
@@ -897,6 +957,7 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
         },
         async timeline(filter: TimelineFilter = {}) {
           const records = new Map<string, TimelineRecord>()
+          const commitIds = new Map<string, bigint>()
           for (const mount of mounts.values()) {
             if ('virtual' in mount) continue
             await ensureRead(mount, { bypassCache: true })
@@ -924,7 +985,11 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
                    CROSS JOIN LATERAL unnest(c.parents) AS parent_id
                  )
                  SELECT c.id::text, c.commit_sha, c.parents, c.op, c.author_user, c.agent_kind, c.thread_id, c.run_id, c.created_at,
-                        COALESCE((SELECT array_agg(p.commit_sha ORDER BY p.id) FROM afs_commits p WHERE p.id = ANY(c.parents)), '{}') AS parent_shas
+                        COALESCE(
+                          (SELECT array_agg(p.commit_sha ORDER BY array_position(c.parents, p.id))
+                           FROM afs_commits p WHERE p.id = ANY(c.parents)),
+                          '{}'
+                        ) AS parent_shas
                  FROM lineage JOIN afs_commits c ON c.id = lineage.id
                  WHERE c.tenant = $1
                    AND ($3::text IS NULL OR c.run_id = $3)
@@ -933,10 +998,16 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
                  ORDER BY c.id`,
                 [input.actor.tenant, ref, filter.runId ?? null, filter.agentKind ?? null, filter.threadId ?? null],
               )
+              const treeIds = new Set<string>()
               for (const row of result.rows) {
-                const after = await readTree(client, row.id)
+                treeIds.add(row.id)
+                for (const parent of asParentArray(row.parents)) treeIds.add(parent)
+              }
+              const trees = await readTrees(client, [...treeIds])
+              for (const row of result.rows) {
+                const after = trees.get(row.id) ?? new Map<string, Head>()
                 const parents = asParentArray(row.parents)
-                const before = parents[0] ? await readTree(client, parents[0]) : new Map<string, Head>()
+                const before = parents[0] ? (trees.get(parents[0]) ?? new Map<string, Head>()) : new Map<string, Head>()
                 records.set(row.commit_sha, {
                   commitSha: row.commit_sha,
                   parentShas: row.parent_shas ?? [],
@@ -948,21 +1019,24 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
                   runId: row.run_id,
                   createdAt: new Date(row.created_at),
                 })
+                commitIds.set(row.commit_sha, BigInt(row.id))
               }
             } finally {
               client.release()
             }
           }
-          return [...records.values()]
+          return [...records.entries()]
+            .sort((left, right) => {
+              const leftId = commitIds.get(left[0])!
+              const rightId = commitIds.get(right[0])!
+              return leftId < rightId ? -1 : leftId > rightId ? 1 : 0
+            })
+            .map(([, record]) => record)
         },
         async diff(a: string, b: string) {
           const first = resolveCommit(a)
           const second = resolveCommit(b)
           const [left, right] = await Promise.all([first, second])
-          if (left.mountKey && mounts.get(left.mountKey) && 'virtual' in mounts.get(left.mountKey)!)
-            unsupportedVirtual(left.mountKey)
-          if (right.mountKey && mounts.get(right.mountKey) && 'virtual' in mounts.get(right.mountKey)!)
-            unsupportedVirtual(right.mountKey)
           const client = await options.pool.connect()
           try {
             const before = await readTree(client, left.id)
@@ -979,11 +1053,21 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
           }
         },
         async merge(mergeOptions = {}) {
-          const results: Record<string, MergeResult> = {}
+          const results: Partial<Record<string, MergeResult>> = {}
+          let firstSettled: BranchSettledError | undefined
           for (const mount of mounts.values()) {
-            if ('virtual' in mount) continue
-            results[mount.key] = await this.resolveMerge(mount.key, mergeOptions)
+            if ('virtual' in mount || mount.mode !== 'follow') continue
+            try {
+              results[mount.key] = await this.resolveMerge(mount.key, mergeOptions)
+            } catch (error) {
+              if (error instanceof BranchSettledError) {
+                firstSettled ??= error
+                continue
+              }
+              throw error
+            }
           }
+          if (firstSettled && Object.keys(results).length === 0) throw firstSettled
           return results
         },
         async resolveMerge(mountKey: string, mergeOptions = {}) {
@@ -991,6 +1075,11 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
           if (!mount)
             throw new NotFoundError(`Mount not found: ${mountKey}`, { tenant: input.actor.tenant, mount: mountKey })
           if ('virtual' in mount) return unsupportedVirtual(mount.key)
+          if (mount.mode !== 'follow')
+            throw new PermissionDeniedError('Pinned mount is read-only', {
+              tenant: input.actor.tenant,
+              mount: mount.key,
+            })
           return mergeRef(mount, mergeOptions)
         },
         async restore(mountKey: string, at: string) {
@@ -1115,9 +1204,27 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
           }
         },
       } as SessionFileSystem
-
       async function mergeRef(mount: RefMount, mergeOptions: { approver?: Actor } = {}): Promise<MergeResult> {
         if (!mount.fork || !mount.ref) return 'merged'
+        if (mergeOptions.approver && mergeOptions.approver.tenant !== input.actor.tenant)
+          throw new PermissionDeniedError('Approver tenant does not match session tenant', {
+            tenant: input.actor.tenant,
+            mount: mount.key,
+          })
+        // Grant resolvers are host callbacks and may borrow this pool. Resolve all
+        // grants before opening the merge transaction so a saturated pool cannot
+        // deadlock; the transaction immediately re-checks branch state and locks
+        // the refs before applying any merge writes.
+        const actorGrant = await kernel.resolveGrant(input.actor, { key: mount.key }, { bypassCache: true })
+        if (actorGrant.write === 'staged') {
+          if (!mergeOptions.approver) return 'pendingApproval'
+          const approverGrant = await kernel.resolveGrant(
+            mergeOptions.approver,
+            { key: mount.key },
+            { bypassCache: true },
+          )
+          if (approverGrant.write !== 'direct') return 'unauthorized'
+        }
         const client = await options.pool.connect()
         try {
           await client.query('BEGIN')
@@ -1138,38 +1245,30 @@ export function createSessionApi(kernel: SessionKernel, options: AgentFsOptions)
             await client.query('ROLLBACK')
             return 'merged'
           }
-          const actorGrant = await kernel.resolveGrant(input.actor, { key: mount.key }, { bypassCache: true })
+          if (branch.state === 'unauthorized') {
+            await client.query('ROLLBACK')
+            return 'unauthorized'
+          }
           if (actorGrant.write === 'none') {
-            if (branch.state === 'open') {
-              await client.query(
-                `UPDATE afs_refs SET state = 'unauthorized', settled_at = now()
-                 WHERE tenant = $1 AND name = $2`,
-                [input.actor.tenant, mount.ref],
-              )
-              await client.query('COMMIT')
-            } else {
+            if (branch.state !== 'open') {
               await client.query('ROLLBACK')
+              throw new BranchSettledError(branch.state, {
+                tenant: input.actor.tenant,
+                mount: mount.key,
+                ref: mount.ref,
+              })
             }
+            await client.query(
+              `UPDATE afs_refs SET state = 'unauthorized', settled_at = now()
+               WHERE tenant = $1 AND name = $2`,
+              [input.actor.tenant, mount.ref],
+            )
+            await client.query('COMMIT')
             return 'unauthorized'
           }
           if (branch.state !== 'open')
             throw new BranchSettledError(branch.state, { tenant: input.actor.tenant, mount: mount.key, ref: mount.ref })
 
-          if (actorGrant.write === 'staged') {
-            if (!mergeOptions.approver) {
-              await client.query('ROLLBACK')
-              return 'pendingApproval'
-            }
-            const approverGrant = await kernel.resolveGrant(
-              mergeOptions.approver,
-              { key: mount.key },
-              { bypassCache: true },
-            )
-            if (approverGrant.write !== 'direct') {
-              await client.query('ROLLBACK')
-              return 'unauthorized'
-            }
-          }
           const mountResult = await client.query<{ commit_id: string; commit_sha: string }>(
             'SELECT r.commit_id::text, c.commit_sha FROM afs_refs r JOIN afs_commits c ON c.id = r.commit_id WHERE r.tenant = $1 AND r.name = $2 FOR UPDATE',
             [input.actor.tenant, `mount/${mount.key}`],

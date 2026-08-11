@@ -4,7 +4,14 @@ import test, { after, before, beforeEach } from 'node:test'
 
 import { Pool } from 'pg'
 
-import { BranchSettledError, PreconditionFailedError, RefConflictError, createAgentFs, migrate } from '../index.js'
+import {
+  BranchSettledError,
+  NotFoundError,
+  PreconditionFailedError,
+  RefConflictError,
+  createAgentFs,
+  migrate,
+} from '../index.js'
 
 const pool = new Pool({ connectionString: process.env.AGENT_FS_DATABASE_URL })
 const tenant = 'integration-tenant'
@@ -492,4 +499,72 @@ test('read validates a supplied mount key before resolving grants', async () => 
     error => error instanceof Error && error.name === 'InvalidMountKeyError',
   )
   assert.deepEqual(seen, [])
+})
+
+test('restore rejects unknown and cross-tenant source commits without changing refs or heads', async () => {
+  const fs = createAgentFs({ pool })
+  const branch = await fs.fork({ tenant, mount, sessionId: 'restore-source-check', authorUser: actor })
+  assert.ok(branch)
+  await fs.write({
+    tenant,
+    mount,
+    ref: branch.ref,
+    path: '/one.txt',
+    bytes: Buffer.from('one'),
+    authorUser: actor,
+  })
+  await fs.write({
+    tenant,
+    mount,
+    ref: branch.ref,
+    path: '/two.txt',
+    bytes: Buffer.from('two'),
+    authorUser: actor,
+  })
+  const beforeRef = await pool.query<{ commit_id: string }>(
+    'SELECT commit_id::text FROM afs_refs WHERE tenant = $1 AND name = $2',
+    [tenant, branch.ref],
+  )
+  const beforeHeads = await pool.query<{ path: string; sha256: string }>(
+    'SELECT path, sha256 FROM afs_heads WHERE tenant = $1 AND ref_name = $2 ORDER BY path',
+    [tenant, branch.ref],
+  )
+  await assert.rejects(
+    fs.restore({
+      tenant,
+      mount,
+      ref: branch.ref,
+      sourceCommitId: '999999999',
+      authorUser: actor,
+    }),
+    NotFoundError,
+  )
+  const foreign = await fs.fork({
+    tenant: 'restore-foreign-tenant',
+    mount,
+    sessionId: 'foreign-source',
+    authorUser: 'foreign',
+  })
+  assert.ok(foreign)
+  const foreignId = foreign.commitId.toString()
+  await assert.rejects(
+    fs.restore({
+      tenant,
+      mount,
+      ref: branch.ref,
+      sourceCommitId: foreignId,
+      authorUser: actor,
+    }),
+    NotFoundError,
+  )
+  const afterRef = await pool.query<{ commit_id: string }>(
+    'SELECT commit_id::text FROM afs_refs WHERE tenant = $1 AND name = $2',
+    [tenant, branch.ref],
+  )
+  const afterHeads = await pool.query<{ path: string; sha256: string }>(
+    'SELECT path, sha256 FROM afs_heads WHERE tenant = $1 AND ref_name = $2 ORDER BY path',
+    [tenant, branch.ref],
+  )
+  assert.deepEqual(afterRef.rows, beforeRef.rows)
+  assert.deepEqual(afterHeads.rows, beforeHeads.rows)
 })

@@ -1535,6 +1535,11 @@ export function createAgentFs(options: AgentFsOptions): AgentFsKernel {
           asBigInt(ref.commit_id, 'afs_refs.commit_id', context),
           context,
         )
+        const source = await client.query<{ id: string }>(
+          'SELECT id::text FROM afs_commits WHERE tenant = $1 AND id = $2::bigint',
+          [input.tenant, input.sourceCommitId],
+        )
+        if (!source.rows[0]) throw new NotFoundError(`Source commit not found: ${input.sourceCommitId}`, context)
         const restored = await loadTreeEntries(client, input.tenant, input.sourceCommitId, context)
         if (sameEntries(current, restored)) {
           await client.query('ROLLBACK')

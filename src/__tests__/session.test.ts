@@ -72,3 +72,39 @@ test('virtual mounts are read-only when handler write is absent and have no hist
   assert.deepEqual(await session.merge(), {})
   await assert.rejects(session.resolveMerge('live:data'), NotFoundError)
 })
+test('virtual glob entries use UTF-16 code-unit ordering', async () => {
+  const fs = createAgentFs({
+    pool: {
+      connect: async () => {
+        throw new Error('not expected')
+      },
+    },
+  })
+  const session = await fs.open({
+    actor: { id: 'user-1', tenant: 'tenant-1' },
+    sessionId: 'session-glob-order',
+    mounts: [
+      {
+        key: 'live:data',
+        virtual: {
+          async list(dir) {
+            return dir === '/'
+              ? [
+                  { path: '/😀', type: 'file' },
+                  { path: '/z', type: 'file' },
+                ]
+              : []
+          },
+          async read() {
+            return Buffer.from('value')
+          },
+        },
+      },
+    ],
+  })
+
+  assert.deepEqual(
+    (await session.glob('live:data:/*')).map(entry => entry.path),
+    ['/z', '/😀'],
+  )
+})
