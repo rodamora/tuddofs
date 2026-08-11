@@ -95,6 +95,28 @@ test('session merge skips virtual mounts and is idempotent after completion', as
   const second = await session.merge()
   assert.deepEqual(second, first)
 })
+
+test('string mount shorthand and mount handles preserve per-mount merge results', async () => {
+  const fs = createTuddoFs({
+    pool,
+    grants: { resolve: async () => ({ read: true, write: 'direct' }) },
+  })
+  const session = await fs.open({
+    actor,
+    sessionId: 'session-mount-handles',
+    mounts: ['project:docs', 'project:other'],
+  })
+
+  await session.mount('project:docs').write('/notes.md', 'docs')
+  await session.mount('project:other').write('/notes.md', 'other')
+
+  assert.deepEqual(await session.merge({ mounts: ['project:docs'] }), {
+    'project:docs': { status: 'merged' },
+  })
+  assert.deepEqual(await session.merge({ mounts: ['project:other'] }), {
+    'project:other': { status: 'merged' },
+  })
+})
 test('ref mount listings use UTF-16 code-unit ordering', async () => {
   const fs = createTuddoFs({
     pool,
