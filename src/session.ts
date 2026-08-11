@@ -82,10 +82,9 @@ export interface TextEdit {
   readonly end: number
   readonly text: string
 }
-/** Optional metadata carried by host adapters alongside a write. */
+/** Optimistic concurrency options for `write`. @see spec §4.5 */
 export interface WriteOptions {
   readonly ifSha?: string | null
-  readonly mimeType?: string
 }
 
 /** Optimistic precondition options for `edit`. @see spec §6 */

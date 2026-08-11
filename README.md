@@ -122,12 +122,13 @@ const stat = await fs.stat('project:crm:/notes/plan.md') // { path, sha256, size
 const files = await fs.list('project:crm:/notes') // direct children
 const hits = await fs.glob('project:crm:/**/*.md')
 
-// Writes — every write is a commit on the session's private branch
+// Writes — every write is a commit on the session's private branch.
+// The session API accepts only the CAS option; MIME metadata is a host-level
+// concern and is not stored in afs_blobs.
 const w = await fs.write('project:crm:/notes/plan.md', 'v2', {
   ifSha: stat.sha256, // optimistic concurrency: mismatch → PreconditionFailedError, re-read and retry
 })
 // w: { path, sha256, sizeBytes, commitSha }
-
 // edit = read head → apply structured edits → write with ifSha of what was read (§6)
 // TextEdit is { start, end, text }; start/end are half-open UTF-16 code-unit offsets.
 await fs.edit('project:crm:/notes/plan.md', [{ start: 0, end: 2, text: 'V2' }])
