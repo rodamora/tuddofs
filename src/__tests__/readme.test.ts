@@ -43,3 +43,7 @@ test('README TypeScript quickstart compiles against the public entry', async () 
 test('README sync-engine example compiles against the internal entry', async () => {
   await compileReadmeBlock(/## Sync engine[\s\S]*?```ts\n([\s\S]*?)\n```/u, '.readme-sync.ts')
 })
+
+test('README SSH target example compiles against the internal entry', async () => {
+  await compileReadmeBlock(/### SSH target[\s\S]*?```ts\n([\s\S]*?)\n```/u, '.readme-ssh.ts')
+})
