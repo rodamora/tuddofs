@@ -44,7 +44,15 @@ if (!endpoint) {
         forcePathStyle: process.env.TUDDOFS_S3_FORCE_PATH_STYLE !== 'false',
         credentials: { accessKeyId, secretAccessKey },
       })
-      return { store, close: () => store.destroy() }
+      return {
+        store,
+        request: (url, init, checksumSha256) => {
+          const headers = new Headers(init?.headers)
+          headers.set('x-amz-checksum-sha256', checksumSha256)
+          return fetch(url, { ...init, headers })
+        },
+        close: () => store.destroy(),
+      }
     },
   })
 }

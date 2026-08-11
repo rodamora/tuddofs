@@ -43,7 +43,7 @@ Presigned URLs embed the configured endpoint host. Target-direct I/O therefore r
 
 ## BlobStore conformance kit
 
-The `@tuddofs/s3/conformance` export provides `defineBlobStoreConformanceSuite` and its fixture types for any adapter implementing the same BlobStore SPI. The suite only checks SPI behavior; S3-specific SigV4 assertions remain in this package's tests.
+The `@tuddofs/s3/conformance` export provides `defineBlobStoreConformanceSuite` and its fixture types for any adapter implementing the same BlobStore SPI. The suite checks SPI behavior, including checksum enforcement through a presigned PUT. Adapters whose presigned transport needs request metadata may provide the fixture's generic `request` callback; protocol-specific details stay outside the kit. Set `presignPutChecksumEnforced: false` only when the adapter's declared SPI capability cannot enforce checksums.
 
 ## MinIO contract tests
 

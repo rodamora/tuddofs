@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { Readable } from 'node:stream'
 import test, { after, afterEach, before, describe } from 'node:test'
 
@@ -12,10 +13,19 @@ export interface ConformanceBlobStore {
   presignPut(key: string, opts: { ttlSeconds: number; checksumSha256: string }): Promise<string>
   presignGet(key: string, opts: { ttlSeconds: number }): Promise<string>
 }
+export type ConformanceRequest = (
+  url: string,
+  init: RequestInit | undefined,
+  checksumSha256: string,
+) => Promise<Response>
 
 export interface ConformanceStoreFixture {
   readonly store: ConformanceBlobStore
   readonly close?: () => void | Promise<void>
+  /** Transport used to exercise presigned URLs; defaults to the Node fetch API. */
+  readonly request?: ConformanceRequest
+  /** Stores that cannot enforce the checksum may opt out of this assertion. */
+  readonly presignPutChecksumEnforced?: boolean
 }
 
 export interface BlobStoreConformanceOptions {
@@ -87,15 +97,31 @@ export function defineBlobStoreConformanceSuite(options: BlobStoreConformanceOpt
       assert.equal(await store.head(key), null)
       await assert.rejects(() => store.get(key))
     })
-    void test('issues presigned PUT and GET URLs', async () => {
+    void test('presigned PUT enforces checksum and preserves failed uploads', async () => {
+      const currentFixture = requireFixture(fixture)
+      if (currentFixture.presignPutChecksumEnforced === false) return
+
+      const store = currentFixture.store
+      const request = currentFixture.request ?? ((url, init) => fetch(url, init))
+      const key = `${options.prefix}presigned-put`
+      const expected = Buffer.from('expected bytes')
+      const wrong = Buffer.from('wrong bytes')
+      const checksum = createHash('sha256').update(expected).digest('base64')
+      const url = await store.presignPut(key, { ttlSeconds: 300, checksumSha256: checksum })
+
+      const wrongResponse = await request(url, { method: 'PUT', body: wrong }, checksum).catch(() => undefined)
+      assert.ok(wrongResponse === undefined || !wrongResponse.ok)
+      assert.equal(await store.head(key), null)
+      await assert.rejects(() => store.get(key))
+
+      const rightResponse = await request(url, { method: 'PUT', body: expected }, checksum)
+      assert.ok(rightResponse.ok)
+      assert.deepEqual(await collect(await store.get(key)), expected)
+    })
+    void test('issues a presigned GET URL', async () => {
       const store = requireStore(fixture)
-      const putUrl = await store.presignPut(`${options.prefix}presigned-put`, {
-        ttlSeconds: 300,
-        checksumSha256: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=',
-      })
       const getUrl = await store.presignGet(`${options.prefix}presigned-get`, { ttlSeconds: 300 })
 
-      assert.ok(putUrl)
       assert.ok(getUrl)
     })
   })
