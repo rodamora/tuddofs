@@ -3,6 +3,7 @@ import test from 'node:test'
 
 import * as publicApi from '../index.js'
 import { EditMatchError, createTuddoFs } from '../index.js'
+import type { DeleteResult, RestoreResult, WriteResult } from '../index.js'
 import { InvalidPathError } from '../internal.js'
 
 const TIER_ONE_EXPORTS = [
@@ -23,6 +24,8 @@ const TIER_ONE_EXPORTS = [
   'createDirectAdapter',
   'createTuddoFs',
 ] as const
+
+const publicResultTypes: [WriteResult?, DeleteResult?, RestoreResult?] = []
 
 function createFs() {
   return createTuddoFs({
@@ -74,7 +77,7 @@ test('edit reports zero string matches', async () => {
   const { session } = await openVirtualSession('hello')
 
   await assert.rejects(
-    session.edit('live:data:/note.txt', [{ oldText: 'missing', newText: 'replacement' }]),
+    session.mount('live:data').edit('/note.txt', [{ oldText: 'missing', newText: 'replacement' }]),
     (error: unknown) => error instanceof EditMatchError && error.matchCount === 0,
   )
 })
@@ -83,9 +86,21 @@ test('edit reports multiple string matches unless replaceAll is set', async () =
   const { session } = await openVirtualSession('repeat repeat')
 
   await assert.rejects(
-    session.edit('live:data:/note.txt', [{ oldText: 'repeat', newText: 'done' }]),
+    session.mount('live:data').edit('/note.txt', [{ oldText: 'repeat', newText: 'done' }]),
     (error: unknown) => error instanceof EditMatchError && error.matchCount === 2,
   )
+})
+
+test('edit handles an empty oldText without blocking the event loop', async () => {
+  const { session } = await openVirtualSession('ab')
+  const mount = session.mount('live:data')
+
+  await assert.rejects(
+    mount.edit('/note.txt', [{ oldText: '', newText: '-' }]),
+    (error: unknown) => error instanceof EditMatchError && error.matchCount === 3,
+  )
+  await mount.edit('/note.txt', [{ oldText: '', newText: '-', replaceAll: true }])
+  assert.equal(await mount.read('/note.txt'), '-a-b-')
 })
 
 test('mount handles use plain absolute paths without repairing relative paths', async () => {
@@ -95,4 +110,16 @@ test('mount handles use plain absolute paths without repairing relative paths', 
   assert.equal(await mount.read('/note.txt'), 'hello')
   assert.deepEqual(paths, ['/note.txt'])
   await assert.rejects(mount.read('note.txt'), InvalidPathError)
+})
+
+test('opened sessions do not expose compound-address file methods', async () => {
+  const { session } = await openVirtualSession('hello')
+
+  for (const operation of ['read', 'readBytes', 'write', 'edit', 'list', 'glob', 'stat', 'delete', 'history']) {
+    assert.equal(operation in session, false, operation)
+  }
+})
+
+test('Tier-1 result types are nameable from the main entry', () => {
+  assert.equal(publicResultTypes.length, 0)
 })
