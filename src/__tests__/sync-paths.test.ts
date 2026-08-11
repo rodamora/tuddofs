@@ -57,7 +57,7 @@ test('destructive execs refuse a mirror directory that does not resolve under th
 
 test('scan and stamp commands quote every interpolated value and gate on find success', () => {
   const command = scanCommand({
-    root: "/work space",
+    root: '/work space',
     mirrorDirs: ['project%3Anotes', 'refs'],
     newerThanStamp: true,
   })
@@ -95,7 +95,7 @@ test('scan records map mirror paths back to mount keys and kernel paths', () => 
 
 test('scan records survive hostile filenames that break naive parsers', () => {
   const dirs = new Map([['notes', 'notes']])
-  const names = ['spaces  everywhere.md', 'line\nbreak.md', 'astral \u{1F600}.md', "quote'and\"quote.md", '-dash.md']
+  const names = ['spaces  everywhere.md', 'line\nbreak.md', 'astral \u{1F600}.md', 'quote\'and"quote.md', '-dash.md']
   const output = names.map((name, index) => record(sha(String(index)), `notes/${name}`)).join('')
 
   assert.deepEqual(
