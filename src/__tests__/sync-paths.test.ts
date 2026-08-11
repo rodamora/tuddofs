@@ -70,7 +70,12 @@ test('scan and stamp commands quote every interpolated value and gate on find su
   // error event, never an empty diff (architecture §7.2).
   assert.ok(!command.includes('|'))
   assert.ok(scanCommand({ root: '/work', mirrorDirs: ['a'], newerThanStamp: false }).includes('-newer') === false)
-  assert.equal(stampCommand('/work', 1_700_000_000_500), "touch -d '@1700000000.500' '/work/.tuddofs-stamp'")
+  // The stamp trails the scan start by one granularity margin: filesystem
+  // timestamps come from a coarse clock, so an exact stamp silently loses
+  // writes that land after it. Over-capture is a sha no-op (§7.4).
+  assert.equal(stampCommand('/work', 1_700_000_000_500), "touch -d '@1699999999.500' '/work/.tuddofs-stamp'")
+  assert.equal(stampCommand('/work', 1_700_000_000_050), "touch -d '@1699999999.050' '/work/.tuddofs-stamp'")
+  assert.equal(stampCommand('/work', 1_700_000_000_000), "touch -d '@1699999999.000' '/work/.tuddofs-stamp'")
   assert.equal(probeCommand(), 'sha256sum --version && find --version')
 })
 

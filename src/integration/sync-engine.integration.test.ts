@@ -242,6 +242,7 @@ test('a tool write commits before it mirrors and survives an instant target kill
 
   controls.killed = false
   await engine.exec('true')
+  await engine.settle()
   assert.equal(await readFile(join(docsDir(root), 'a.md'), 'utf8'), 'v2')
 })
 
@@ -368,7 +369,7 @@ test('filenames with spaces, newlines, and astral-plane characters round-trip th
 })
 
 test('capturing a path that implies a directory deletes the masked head file in the same commit', async () => {
-  const { session, engine, engine: _e, root } = await setup('engine-coherence')
+  const { session, engine, root } = await setup('engine-coherence')
   await session.mount('project:docs').write('/a', 'file first')
   await engine.materialize()
   assert.equal(await readFile(join(docsDir(root), 'a'), 'utf8'), 'file first')

@@ -46,6 +46,14 @@ const COLON_ENCODING = '%3A'
 const HEX_SHA256 = /^[0-9a-f]{64}$/u
 
 /**
+ * How far behind the scan start the stamp is set. Filesystem timestamps come
+ * from a coarse clock, so an exact stamp can be newer than a write that follows
+ * it; §7.4 demands that under-capture be impossible and accepts over-capture as
+ * a sha no-op. One second covers every filesystem granularity in practice.
+ */
+export const STAMP_GRANULARITY_MARGIN_MS = 1_000
+
+/**
  * Mirror directory for a mount key. `:` is legal in a mount key (§4.4) and
  * illegal in a Windows filename, so it is encoded deterministically; `%` cannot
  * appear in a mount key, which keeps the encoding reversible (§7.4, §15.1).
@@ -101,6 +109,32 @@ export function chmodReadOnlyCommand(root: string, mirrorDir: string): string {
 }
 
 /**
+ * Unfreeze a read-only mirror before re-hydrating it; the same root guard runs
+ * first, because this is destructive to whatever it points at (§7.4).
+ */
+export function chmodWritableCommand(root: string, mirrorDir: string): string {
+  return `chmod -R u+w ${quoteShellArg(resolveUnderRoot(root, mirrorDir))}`
+}
+
+/**
+ * Create the engine state directory and report the acquire state in one exec:
+ * the stamp filename if the watermark exists, then one hydrated mount key per
+ * line. Mount keys cannot contain a newline (§4.4), so the framing is safe.
+ *
+ * This is the warm/cold decision (§7.3 phase 1 step 3) and it costs one round
+ * trip, not one per file.
+ */
+export function hydrationManifestCommand(root: string): string {
+  const quotedRoot = quoteShellArg(root)
+  return (
+    `mkdir -p ${quoteShellArg(`${root}/${STATE_DIRNAME}`)} && cd ${quotedRoot} && ` +
+    `{ [ -f ${quoteShellArg(STAMP_FILENAME)} ] && echo ${quoteShellArg(STAMP_FILENAME)}; ` +
+    `[ -f ${quoteShellArg(`${STATE_DIRNAME}/hydrated`)} ] && cat ${quoteShellArg(`${STATE_DIRNAME}/hydrated`)}; ` +
+    `true; }`
+  )
+}
+
+/**
  * The capture scan (§7.3 phase 3 step 1). `find` writes its NUL-terminated list
  * to an engine-owned file and `xargs` reads it back in the same exec, so a
  * failing `find` fails the whole command: the spec's illustrative pipeline would
@@ -119,13 +153,23 @@ export function scanCommand(input: ScanCommandInput): string {
 }
 
 /**
- * Move the stamp to the instant the scan started, so files written during the
- * scan re-appear next cycle and sha-diffing makes the re-capture a no-op
+ * Move the stamp back to the instant the scan started, so files written during
+ * the scan re-appear next cycle and sha-diffing makes the re-capture a no-op
  * (§7.3 phase 3 step 6).
+ *
+ * The stamp is set one {@link STAMP_GRANULARITY_MARGIN_MS} EARLIER than the
+ * scan start. §7.4 requires under-capture to be impossible and accepts
+ * over-capture as a sha no-op, and an exact stamp does not deliver that:
+ * filesystem timestamps come from a coarse clock (Linux rounds down to the last
+ * tick; older filesystems to the last second) while the engine's clock is
+ * fine-grained, so a write that happens AFTER an exact stamp can still record
+ * an mtime BEFORE it and vanish from `find -newer`. The margin covers every
+ * such clock, including 1s-granularity filesystems.
  */
 export function stampCommand(root: string, scanStartEpochMs: number): string {
-  const seconds = Math.floor(scanStartEpochMs / 1000)
-  const millis = Math.abs(scanStartEpochMs % 1000)
+  const stampEpochMs = scanStartEpochMs - STAMP_GRANULARITY_MARGIN_MS
+  const seconds = Math.floor(stampEpochMs / 1000)
+  const millis = stampEpochMs - seconds * 1000
   const stamp = `@${seconds}.${String(millis).padStart(3, '0')}`
   return `touch -d ${quoteShellArg(stamp)} ${quoteShellArg(resolveUnderRoot(root, STAMP_FILENAME))}`
 }
