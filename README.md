@@ -253,15 +253,15 @@ Requirements, none of them a package dependency:
 
 - An `ssh` client binary on the machine running `tuddofs` (`sshBinary` selects a specific one). The package spawns it rather than bundling a protocol implementation, which is how the core keeps zero runtime dependencies.
 - Key-based, non-interactive authentication. `BatchMode=yes`, `PasswordAuthentication=no`, and `KbdInteractiveAuthentication=no` are fixed and cannot be overridden: an agent runtime that can block on a password prompt is a hung agent runtime. Host-key checking defaults to `StrictHostKeyChecking=yes`.
-- A POSIX `sh` login shell and GNU coreutils on the remote host. A busybox host fails at `materialize()`, loudly, rather than silently capturing nothing later.
+- A POSIX `sh` login shell, GNU coreutils, and GNU `tar` on the remote host. A busybox host fails at `materialize()`, loudly, rather than silently capturing nothing later.
 
 Every interpolated value — path, filename, command — is single-quoted for the remote shell, and paths are checked twice: lexically before anything reaches the network, and again on the host with `pwd -P`, which is what catches a symlinked directory pointing out of the workspace. The remote exit status is reported by the remote itself behind a per-exec nonce, because OpenSSH reports both "the command was killed by a signal" and "the transport failed" as exit 255; a command that never reported its status is a target error, never a plausible exit code. `exec` is bounded on the remote side with `timeout -s KILL`, since killing the local client leaves the remote command running.
 
-There is no connection pooling: one ssh invocation per verb. A host that wants multiplexing passes it through as ordinary ssh configuration, for example `sshOptions: ['ControlMaster=auto', 'ControlPath=/tmp/tuddofs-%C', 'ControlPersist=60']`.
+There is no connection pooling: one ssh invocation per verb, and one per 32 MiB batch for bulk transfers — hydrate, restage, and capture fetch ride tar-based batch verbs rather than a round trip per file. A host that wants multiplexing passes it through as ordinary ssh configuration, for example `sshOptions: ['ControlMaster=auto', 'ControlPath=/tmp/tuddofs-%C', 'ControlPersist=60']`.
 
-### Large blobs in capture
+### Large-blob transport
 
-By default every changed file is pulled back through the server with `readFile`. Set `largeBlobs.transport` to `'presigned'` and files at or above `largeBlobs.thresholdBytes` (8 MiB by default) instead go straight from the target to object storage, over a presigned PUT run by `curl` inside the target — the server only ever holds the sha:
+By default every byte moves through the server: changed files are pulled back over the seam — per-file reads, or batched tar reads on targets that implement them — and hydration pushes blob bytes down the same channel. Set `largeBlobs.transport` to `'presigned'` and the flag governs both directions. In capture, files at or above `largeBlobs.thresholdBytes` (8 MiB by default) go straight from the target to object storage, over a presigned PUT run by `curl` inside the target — the server only ever holds the sha. In hydration, object-backed files flow store → target over parallel presigned GETs in one `curl` exec; the server ships only URLs and inline blobs:
 
 ```ts
 import { createLocalDirectoryTarget, createSyncEngine } from 'tuddofs/internal'
@@ -283,7 +283,7 @@ await engine.exec('curl -sSL https://example.invalid/dataset.tar > dataset.tar')
 
 The claimed sha is bound to the bytes that actually landed, never trusted: a store that enforces `x-amz-checksum-sha256` refuses any other body at the PUT, and a store that cannot enforce it receives the upload at a quarantine key that is re-hashed server-side before a server-side copy places it in the CAS. Existence and size are not verification. The commit takes its length from the store, so a target cannot lie about size either, and a sha already in the CAS skips the transfer entirely. `materialize()` extends its probe to `stat` and `curl` when this transport is selected.
 
-Which transport to use is the host's call and cannot be detected from here: SigV4 presigned URLs embed the endpoint host, so target-direct upload requires the blob endpoint to be reachable from the _target's_ network. A LAN-only MinIO behind a remote sandbox is exactly the case `'relay'` exists for. A `'presigned'` engine whose store cannot presign fails the capture loudly rather than quietly relaying gigabytes the host did not ask to pay for.
+Which transport to use is the host's call and cannot be detected from here: SigV4 presigned URLs embed the endpoint host, so target-direct transfer — upload and download alike — requires the blob endpoint to be reachable from the _target's_ network. A LAN-only MinIO behind a remote sandbox is exactly the case `'relay'` exists for. A `'presigned'` engine whose store cannot presign fails loudly — capture at the upload, hydration at acquire — rather than quietly relaying gigabytes the host did not ask to pay for.
 
 **The local-directory target confines the filesystem, not the host.** Its `readFile`, `writeFile`, and `mkdir` refuse any path outside the workspace root and never follow a symlink out of it, so a governed mount cannot be used to read or overwrite host files. `exec` has no such protection: it runs a real shell as the host process user, with that user's environment, filesystem, and network. Anything that user can do through this target can do. Use it for agents and code you already trust on a machine you already trust; run untrusted code in a sandbox and give it its own target.
 

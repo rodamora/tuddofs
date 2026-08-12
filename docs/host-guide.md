@@ -288,8 +288,8 @@ Handler rules:
 Core ships no storage SDK. `BlobStore` is a five-verb SPI; the reference implementation is [`@tuddo/s3`](../packages/s3/README.md).
 
 - **Without `storage`, everything is inline.** Blobs above `inlineMaxBytes` (128 KiB) are rejected rather than stuffed into Postgres. Any deployment expecting real files wants a store.
-- **Presigned URLs embed the endpoint host (§8.3).** SigV4 signs the host, so a URL your server can use is not automatically a URL your _target_ or _browser client_ can use. A LAN-only MinIO means client-direct I/O and target-direct capture are both unavailable, and the honest configuration is the server-relay path.
-- **Decide the transport, do not detect it.** The sync engine's `largeBlobs.transport` defaults to `'relay'`. Set `'presigned'` only when the blob endpoint is reachable from the target's network; a `'presigned'` engine whose store cannot presign fails the capture loudly instead of quietly relaying gigabytes.
+- **Presigned URLs embed the endpoint host (§8.3).** SigV4 signs the host, so a URL your server can use is not automatically a URL your _target_ or _browser client_ can use. A LAN-only MinIO means client-direct I/O and target-direct transfer — capture and hydration both — are unavailable, and the honest configuration is the server-relay path.
+- **Decide the transport, do not detect it.** The sync engine's `largeBlobs.transport` defaults to `'relay'`. One declaration governs both directions: presigned PUTs in capture and presigned GETs in hydration. Set `'presigned'` only when the blob endpoint is reachable from the target's network; a `'presigned'` engine whose store cannot presign fails capture loudly instead of quietly relaying gigabytes, and hydration fails at acquire.
 - **Checksum enforcement is the identity binding.** A PUT presign pins `x-amz-checksum-sha256` as a signed header, so the store itself rejects bytes that hash differently. On a store that cannot enforce it, uploads land at a quarantine key and are re-hashed server-side before the CAS copy. Existence and size are never verification.
 - **Never delete keys outside `tuddo/`.** GC's orphan-object sweep only ever lists and deletes under `tuddo/<tenant>/`; a bucket lifecycle rule you add yourself has no such restraint.
 
@@ -298,7 +298,7 @@ Core ships no storage SDK. `BlobStore` is a five-verb SPI; the reference impleme
 The engine (`tuddofs/internal`) materializes governed mounts onto a real disk. See the README for the API; the host-side obligations are:
 
 - **`exec` confines the filesystem, not the host.** `readFile`, `writeFile`, and `mkdir` refuse paths outside the workspace root and never follow a symlink out of it. `exec` runs a real shell as the target's user, with that user's network and credentials. For the local target, that user is your server process. Untrusted code gets a sandbox and its own target — this is a deployment decision the package cannot make for you.
-- **Targets need GNU coreutils.** `materialize()` probes for them and fails at acquire rather than capturing nothing later. Busybox images do not qualify.
+- **Targets need GNU coreutils.** `materialize()` probes for them and fails at acquire rather than capturing nothing later. Busybox images do not qualify. A target may declare extra binaries (the SSH target requires GNU `tar` for batch transfers), and `curl` joins the probe under the `'presigned'` transport — all folded into the same acquire-time check.
 - **Call `reconcile()` at turn end.** Deletions are applied only there. An agent loop that never reconciles accumulates files the kernel still believes exist.
 - **Handle `onCaptureFailed`.** A failed scan is an error event, never an empty diff. Surface it; a target that has stopped capturing looks exactly like an agent that stopped writing.
 - **One workspace per session.** Warm re-acquire is index-driven and cheap; sharing a root between sessions is not a supported configuration.
