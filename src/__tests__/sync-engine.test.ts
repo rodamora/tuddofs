@@ -316,7 +316,9 @@ test('presigned hydration refuses an existing directory symlink in the output hi
 
     await assert.rejects(
       engine.materialize(),
-      error => error instanceof SyncTargetError && /presigned hydration guard failed|presigned hydration failed/.test(error.message),
+      error =>
+        error instanceof SyncTargetError &&
+        /presigned hydration guard failed|presigned hydration failed/.test(error.message),
     )
     await assert.rejects(readFile(outside))
     assert.equal((await lstat(join(mountDir, 'nested'))).isSymbolicLink(), true)

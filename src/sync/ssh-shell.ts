@@ -256,7 +256,11 @@ export function buildPresignedGuardInput(input: RemoteBatchPathScriptInput): str
     parents.add(posix.dirname(resolved))
     members.push(`F:${resolved}`)
   }
-  return [...parents].map(path => `P:${path}`).concat(members).join('\0').concat('\0')
+  return [...parents]
+    .map(path => `P:${path}`)
+    .concat(members)
+    .join('\0')
+    .concat('\0')
 }
 
 /**
@@ -296,11 +300,11 @@ export function remotePresignedGuardScript(root: string): string {
     `cd ${quoteShellArg(root)}`,
     'tmp=$(mktemp)',
     'trap \'rm -f -- "$tmp"\' EXIT HUP INT TERM',
+    'cat > "$tmp"',
     `xargs -0 -r -n 32 sh -c ${quoteShellArg(guardChild)} sh < "$tmp"`,
     `xargs -0 -r -n 32 sh -c ${quoteShellArg(unlinkChild)} sh < "$tmp"`,
   ].join(' && ')
 }
-
 
 /** Extract a PAX archive into the guarded workspace root. */
 export function remoteWriteFilesScript(input: RemoteBatchPathScriptInput): string {
