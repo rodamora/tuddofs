@@ -101,10 +101,10 @@ test('gc keeps every commit reachable from refs and tags while collecting unreac
   const unreachable = await pool.query<{ id: string }>(
     `INSERT INTO tuddo_commits
        (tenant, commit_sha, tree_id, parents, author_user, op, created_at)
-     SELECT tenant, repeat('f', 64), tree_id, '{}', $2, 'write', now() - interval '2 days'
+     SELECT tenant, repeat('f', 64), tree_id, '{}', $2, 'write', $3
      FROM tuddo_commits WHERE tenant = $1 ORDER BY id LIMIT 1
      RETURNING id::text AS id`,
-    [tenant, actor],
+    [tenant, actor, new Date(now.getTime() - 2 * 24 * 60 * 60 * 1000)],
   )
   assert.equal(unreachable.rows.length, 1)
   const result = await fs.gc({ tenant, graceMs: 0 })
