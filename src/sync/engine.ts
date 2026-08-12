@@ -42,7 +42,7 @@
 import posix from 'node:path/posix'
 
 import { sha256 } from '../hashing.js'
-import { InvariantError, NotFoundError } from '../errors.js'
+import { InvariantError, NotFoundError, StorageError } from '../errors.js'
 import { InvalidPathError, validateMountKey, validatePath } from '../validation.js'
 import type { DiffRecord, HistoryRecord, SessionFileSystem, SessionMount, WriteOptions } from '../session.js'
 import type { CaptureWrite, TuddoFsLogger, WriteResult } from '../kernel.js'
@@ -57,6 +57,7 @@ import {
   parseScanRecords,
   parseSizeRecords,
   probeCommand,
+  quoteShellArg,
   resolveUnderRoot,
   scanCommand,
   sizeCommand,
@@ -156,6 +157,27 @@ const MAX_BATCH_PAYLOAD_BYTES = 32 * 1024 * 1024
 
 /** One upload exec may be moving gigabytes over an arbitrary link; an hour, not the two-minute exec default. */
 const DEFAULT_UPLOAD_TIMEOUT_MS = 3_600_000
+export interface CurlGetConfigEntry {
+  readonly url: string
+  readonly output: string
+}
+
+/**
+ * Build curl's line-oriented config for parallel presigned GETs.
+ *
+ * Curl config values are double-quoted; only backslash, double quote, and
+ * newline need escaping in this format. The caller must root-check output
+ * paths before passing them here. The returned text is intended for curl's
+ * stdin, never for shell interpolation as individual values.
+ */
+export function buildCurlGetConfig(entries: readonly CurlGetConfigEntry[]): string {
+  const escape = (value: string): string =>
+    value.replaceAll('\\', '\\\\').replaceAll('"', '\\"').replaceAll('\n', '\\n')
+  return entries
+    .flatMap(entry => [`url = "${escape(entry.url)}"`, `output = "${escape(entry.output)}"`])
+    .join('\n')
+    .concat(entries.length > 0 ? '\n' : '')
+}
 
 type IndexEntry = {
   /** Sha the engine believes the mirror holds. */
@@ -450,38 +472,62 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
       await runExec(chmodWritableCommand(root, mirrorDirName(mount.key)), 'read-only unfreeze')
 
     const seeded = new Map<string, IndexEntry>()
-    if (!target.writeFiles) {
-      for (const entry of entries) {
-        if (entry.sha256 === undefined) {
-          throw new InvariantError(`Branch view entry without a sha: ${entry.path}`, { mount: mount.key })
+    const relay: { readonly path: string; readonly mirror: string }[] = []
+    const presigned: CurlGetConfigEntry[] = []
+    for (const entry of entries) {
+      if (entry.sha256 === undefined) {
+        throw new InvariantError(`Branch view entry without a sha: ${entry.path}`, { mount: mount.key })
+      }
+      const mirror = resolveUnderRoot(root, posix.join(mirrorDirName(mount.key), entry.path.slice(1)))
+      seeded.set(entry.path, { sha256: entry.sha256 })
+      if (!directUpload) {
+        relay.push({ path: entry.path, mirror })
+        continue
+      }
+
+      try {
+        const url = await handle.presign(
+          entry.path,
+          uploadTtlSeconds === undefined ? { method: 'GET' } : { method: 'GET', ttlSeconds: uploadTtlSeconds },
+        )
+        if (typeof url !== 'string')
+          throw new StorageError('GET presign did not return a URL', { mount: mount.key, path: entry.path })
+        presigned.push({ url, output: mirror })
+      } catch (error: unknown) {
+        // Inline blobs are expected to have no object-store URL. Every other
+        // refusal (including missing storage or GET presigning support) is a
+        // host misconfiguration and must fail acquire loudly.
+        if (error instanceof StorageError && error.message === 'Inline blobs do not have presigned URLs') {
+          relay.push({ path: entry.path, mirror })
+          continue
         }
-        const mirror = resolveUnderRoot(root, posix.join(mirrorDirName(mount.key), entry.path.slice(1)))
-        const bytes = await handle.readBytes(entry.path)
-        await writeFilesBatched([{ path: mirror, bytes }])
-        seeded.set(entry.path, { sha256: entry.sha256 })
+        throw error
       }
-    } else {
-      let chunk: { path: string; bytes: Buffer }[] = []
-      let chunkBytes = 0
-      const flush = async (): Promise<void> => {
-        if (chunk.length === 0) return
-        await writeFilesBatched(chunk)
-        chunk = []
-        chunkBytes = 0
-      }
-      for (const entry of entries) {
-        if (entry.sha256 === undefined) {
-          throw new InvariantError(`Branch view entry without a sha: ${entry.path}`, { mount: mount.key })
-        }
-        const mirror = resolveUnderRoot(root, posix.join(mirrorDirName(mount.key), entry.path.slice(1)))
-        const bytes = await handle.readBytes(entry.path)
-        if (chunk.length > 0 && chunkBytes + bytes.length > MAX_BATCH_PAYLOAD_BYTES) await flush()
-        chunk.push({ path: mirror, bytes })
-        chunkBytes += bytes.length
-        seeded.set(entry.path, { sha256: entry.sha256 })
-        if (bytes.length >= MAX_BATCH_PAYLOAD_BYTES) await flush()
-      }
-      await flush()
+    }
+
+    let relayChunk: { path: string; bytes: Buffer }[] = []
+    let relayChunkBytes = 0
+    const flushRelay = async (): Promise<void> => {
+      if (relayChunk.length === 0) return
+      await writeFilesBatched(relayChunk)
+      relayChunk = []
+      relayChunkBytes = 0
+    }
+    for (const file of relay) {
+      const bytes = await handle.readBytes(file.path)
+      if (relayChunk.length > 0 && relayChunkBytes + bytes.length > MAX_BATCH_PAYLOAD_BYTES) await flushRelay()
+      relayChunk.push({ path: file.mirror, bytes })
+      relayChunkBytes += bytes.length
+      if (bytes.length >= MAX_BATCH_PAYLOAD_BYTES) await flushRelay()
+    }
+    await flushRelay()
+
+    if (presigned.length > 0) {
+      const config = buildCurlGetConfig(presigned)
+      const command =
+        `cd ${quoteShellArg(root)} && ` +
+        `printf %s ${quoteShellArg(config)} | curl --parallel --fail --create-dirs --config -`
+      await runExec(command, 'presigned hydration', { timeoutMs: uploadTimeoutMs })
     }
 
     // Spot-check the transfer rather than trusting the target's write (§7.3).

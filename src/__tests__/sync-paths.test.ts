@@ -119,6 +119,12 @@ test('probe checks several required binaries exactly once alongside engine check
     assert.equal(command.match(new RegExp(`(?:^| && )${binary} --version(?:$| && )`, 'gu'))?.length, 1)
   }
 })
+test('probe rejects shell metacharacters in required binary names', () => {
+  assert.throws(
+    () => probeCommand({ requiredBinaries: ['tar; echo INJECTED'] }),
+    InvalidPathError,
+  )
+})
 
 test('scan records map mirror paths back to mount keys and kernel paths', () => {
   const dirs = new Map([

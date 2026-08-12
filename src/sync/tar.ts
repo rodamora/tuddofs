@@ -53,7 +53,7 @@ export function writePaxTar(entries: readonly PaxTarEntry[]): Buffer {
     }
     seen.add(entry.path)
     if (!Buffer.isBuffer(entry.bytes)) {
-      throw new TarParseError('writer input bytes must be a Buffer', undefined, entry.path)
+      throw new TypeError('writer input bytes must be a Buffer')
     }
 
     const paxPayload = paxPathRecord(entry.path)

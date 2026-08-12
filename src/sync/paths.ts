@@ -64,6 +64,7 @@ export interface UploadCommandInput {
 const COLON_ENCODING = '%3A'
 const HEX_SHA256 = /^[0-9a-f]{64}$/u
 const DECIMAL_SIZE = /^(?:0|[1-9][0-9]*)$/u
+const REQUIRED_BINARY_NAME = /^[A-Za-z0-9._+-]+$/u
 
 /**
  * How far behind the scan start the stamp is set. Filesystem timestamps come
@@ -132,6 +133,12 @@ export function probeCommand(options: { directUpload?: boolean; requiredBinaries
   const checks = ['sha256sum --version', 'find --version']
   if (options.directUpload) checks.push('stat --version', 'curl --version')
   for (const binary of new Set(options.requiredBinaries ?? [])) {
+    if (typeof binary !== 'string' || !REQUIRED_BINARY_NAME.test(binary)) {
+      throw new InvalidPathError(
+        binary,
+        'required binary name must match /^[A-Za-z0-9._+-]+$/',
+      )
+    }
     const check = `${binary} --version`
     if (!checks.includes(check)) checks.push(check)
   }

@@ -38,6 +38,25 @@ test('PAX writer emits a deterministic always-PAX ustar sequence', () => {
   assert.equal(paxPayload.subarray(0, 25).toString(), '25 path=mirror/hello.txt\n')
 })
 
+test('PAX writer rejects non-Buffer entry bytes as a TypeError', () => {
+  assert.throws(
+    () => writePaxTar([{ path: 'mirror/not-bytes', bytes: 'not a Buffer' as unknown as Buffer }]),
+    TypeError,
+  )
+})
+
+test('PAX writer emits canonical length prefixes across a digit boundary', () => {
+  const firstPath = `mirror/${'a'.repeat(83)}`
+  const secondPath = `mirror/${'b'.repeat(84)}`
+  const archive = writePaxTar([
+    { path: firstPath, bytes: Buffer.alloc(0) },
+    { path: secondPath, bytes: Buffer.alloc(0) },
+  ])
+
+  assert.equal(archive.subarray(512, 512 + 99).toString(), `99 path=${firstPath}\n`)
+  assert.equal(archive.subarray(2048, 2048 + 101).toString(), `101 path=${secondPath}\n`)
+})
+
 test('PAX parser accepts GNU tar output and extracts regular file bytes', () => {
   const root = mkdtempSync(join(tmpdir(), 'tuddofs-tar-'))
   try {
@@ -86,6 +105,26 @@ test('PAX parser invokes caller validation and expected-prefix guard', () => {
   )
 })
 
+test('PAX size records override the ustar size field', () => {
+  const archive = makePaxSizeOverrideArchive()
+  const parsed = parsePaxTar(archive, { expectedPrefix: 'mirror' })
+
+  assert.deepEqual(parsed.get('mirror/size'), Buffer.from('bytes'))
+})
+
+test('PAX parser rejects a multi-member archive truncated after the first member', () => {
+  const archive = writePaxTar([
+    { path: 'mirror/first', bytes: Buffer.from('first') },
+    { path: 'mirror/second', bytes: Buffer.from('second') },
+  ])
+
+  // The first member ends immediately before the second PAX header. It is
+  // complete, but there is no archive terminator, so no partial map is valid.
+  const secondPaxHeader = archive.indexOf(Buffer.from('PaxHeaders.0/1', 'ascii'))
+  assert.ok(secondPaxHeader > 0)
+  assert.throws(() => parsePaxTar(archive.subarray(0, secondPaxHeader)), TarParseError)
+})
+
 test('PAX parser rejects truncated and malformed archives with typed errors', () => {
   const archive = writePaxTar([{ path: 'mirror/file', bytes: Buffer.from('bytes') }])
   assert.throws(() => parsePaxTar(archive.subarray(0, -1)), TarParseError)
@@ -105,13 +144,31 @@ test('PAX parser rejects out-of-root paths and non-regular members', () => {
   }
 })
 
+function makePaxSizeOverrideArchive(): Buffer {
+  const bytes = Buffer.from('bytes')
+  const paxPayload = Buffer.from('10 size=5\n', 'ascii')
+  return Buffer.concat([
+    makeTarHeader('PaxHeaders.0/member', 'x', paxPayload.length),
+    paxPayload,
+    zeroPadding(paxPayload.length),
+    makeTarHeader('mirror/size', '0', 999),
+    bytes,
+    zeroPadding(bytes.length),
+    Buffer.alloc(1024),
+  ])
+}
+
 function makeSingleMemberArchive(path: string, typeflag: string): Buffer {
+  return Buffer.concat([makeTarHeader(path, typeflag, 0), Buffer.alloc(1024)])
+}
+
+function makeTarHeader(path: string, typeflag: string, size: number): Buffer {
   const header = Buffer.alloc(512)
   header.write(path, 0, 'utf8')
   header.write('0000644\0', 100, 'ascii')
   header.write('0000000\0', 108, 'ascii')
   header.write('0000000\0', 116, 'ascii')
-  header.write('00000000000\0', 124, 'ascii')
+  header.write(`${size.toString(8).padStart(11, '0')}\0`, 124, 'ascii')
   header.write('00000000000\0', 136, 'ascii')
   header[156] = typeflag.charCodeAt(0)
   header.write('ustar\0', 257, 'ascii')
@@ -120,5 +177,9 @@ function makeSingleMemberArchive(path: string, typeflag: string): Buffer {
   let checksum = 0
   for (const byte of header) checksum += byte
   header.write(`${checksum.toString(8).padStart(6, '0')}\0 `, 148, 'ascii')
-  return Buffer.concat([header, Buffer.alloc(1024)])
+  return header
+}
+
+function zeroPadding(size: number): Buffer {
+  return Buffer.alloc((512 - (size % 512)) % 512)
 }
