@@ -1,9 +1,8 @@
 import test from 'node:test'
 
-import { CreateBucketCommand, S3Client } from '@aws-sdk/client-s3'
-
 import { S3BlobStore } from '../src/index.js'
 import { defineBlobStoreConformanceSuite } from '../src/conformance.js'
+import { ensureBucket } from './bucket.js'
 
 const endpoint = process.env.TUDDOFS_S3_ENDPOINT
 const bucket = process.env.TUDDOFS_S3_BUCKET ?? 'tuddofs'
@@ -20,22 +19,13 @@ if (!endpoint) {
     name: 'S3 BlobStore SPI',
     prefix: `tuddo/conformance-${process.pid}-${Date.now()}/`,
     createStore: async () => {
-      const admin = new S3Client({
+      await ensureBucket({
+        bucket,
         endpoint,
         region,
         forcePathStyle: process.env.TUDDOFS_S3_FORCE_PATH_STYLE !== 'false',
         credentials: { accessKeyId, secretAccessKey },
       })
-      try {
-        try {
-          await admin.send(new CreateBucketCommand({ Bucket: bucket }))
-        } catch (error) {
-          const name = error instanceof Error ? error.name : ''
-          if (name !== 'BucketAlreadyOwnedByYou' && name !== 'BucketAlreadyExists') throw error
-        }
-      } finally {
-        admin.destroy()
-      }
 
       const store = new S3BlobStore({
         bucket,

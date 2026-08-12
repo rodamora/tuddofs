@@ -31,9 +31,10 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json --incremental false",
-    "test": "node --import tsx --test test/*.test.ts",
+    "test": "node ../../scripts/run-tests.mjs s3",
     "test:contract": "node --import tsx --test test/contract.test.ts",
-    "typecheck": "tsc --noEmit -p tsconfig.json"
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "prepublishOnly": "npm run build && npm run typecheck && npm test"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "3.879.0",

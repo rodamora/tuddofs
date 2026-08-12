@@ -1,13 +1,13 @@
 # tuddofs — Architecture & Roadmap Spec
 
 **Date:** 2026-08-11
-**Status:** Kernel and session layers SHIPPED (unit + real-Postgres integration tests). This document specifies the remaining roadmap: sync engine and large-blob streaming.
+**Status:** The whole roadmap is SHIPPED — kernel, session, authorization, sync engine with local and SSH targets, large blobs, the `@tuddofs/s3` adapter, and the S4 hardening pass (host guide, release pipeline, docs gate, measured budgets). Every layer carries unit, real-Postgres integration, and acceptance evidence. What remains normative here are the invariants, not a plan.
 **Positioning:** A product of its own — the `tuddofs` npm package. Any application that supplies a Postgres pool, actor identity, and a grant resolver is a consumer.
 
 **How to read this document if you are implementing:**
 
 - §4–§6 and §9 describe the **shipped** system. Their invariants remain normative, but the pin is now the code: `src/migration.ts` (frozen-schema check), `fixtures/golden-hashes.json` (hash preimages), and the integration suites. If this document and the shipped behavior disagree, the code + tests win and this document has a bug — fix the document.
-- §7 (sync engine) and §8 (large blobs) are **NORMATIVE for unbuilt work** — the algorithms, tables, and invariants are the answer; do not improvise alternatives.
+- §7 (sync engine) and §8 (large blobs) were normative for work that is now BUILT; their algorithms, tables, and invariants remain the answer, and the same rule applies as above — where the document and the code disagree, the code and its tests win and the document has a bug.
 - §13 tells you how to work. When this document is ambiguous, STOP and ask; do not fill gaps with guesses.
 
 ---
@@ -25,16 +25,16 @@ The moat: competitors treat files as agent scratch. Here files are **governed us
 | #   | Requirement                                                                                                            | Status                                                   |
 | --- | ---------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------- |
 | R1  | Concurrent agents on the same user's data — isolated, merge with honest conflicts                                      | shipped                                                  |
-| R2  | One FS contract for both runtimes: in-process agent AND sandboxed/remote agent                                         | session API shipped; remote half is the sync engine (§7) |
-| R3  | Real files inside a workspace so shell tools (bash, grep, any binary) work natively                                    | sync engine (§7)                                         |
-| R4  | Durable per operation; workspace death loses at most the exec in flight                                                | sync engine (§7)                                         |
+| R2  | One FS contract for both runtimes: in-process agent AND sandboxed/remote agent                                         | shipped (session API + sync engine, §7)                  |
+| R3  | Real files inside a workspace so shell tools (bash, grep, any binary) work natively                                    | shipped (§7)                                             |
+| R4  | Durable per operation; workspace death loses at most the exec in flight                                                | shipped (§7.5 kill matrix, both targets)                 |
 | R5  | Multi-source mounts in one agent view; mount vocabulary is the host's                                                  | shipped                                                  |
 | R6  | Agent confined to the executing user's grants, resolved live, on every operation                                       | shipped                                                  |
 | R7  | Versioned + attributed (user, agent, run) + restorable — structurally                                                  | shipped                                                  |
 | R8  | Small working sets (dozens of files); correctness over throughput                                                      | design stance, unchanged                                 |
 | R9  | Standalone npm package, zero hard runtime deps; pool/storage/logger/grants injected                                    | shipped                                                  |
 | R10 | Coexists with host product surfaces via events (`onCommit`) and virtual mounts — the package never knows its listeners | shipped                                                  |
-| R11 | Large binaries/media streamed via presigned object-storage I/O, never through server memory                            | §8                                                       |
+| R11 | Large binaries/media streamed via presigned object-storage I/O, never through server memory                            | shipped (§8)                                             |
 
 ## 3. Architecture — five layers
 
@@ -171,14 +171,14 @@ The block above is the surface as SHIPPED. §6.2 narrows and amends it at S1 —
 
 Host-managed `list/read/write?` handlers serve live host data through the same file surface. No refs, no commits, no merge/history/restore/tag (those throw, never return silently empty). Authorization is the handler's job, invoked with the executing actor; handlers MUST fail closed. Virtual mounts are tool-level only: the sync engine (§7) MUST skip them at materialize and reject them in mirror-path mapping — a copy of live data is stale by definition, and capture would try to commit it.
 
-### 6.2 Consumer surface — API tiers (NORMATIVE; specced, NOT YET CUT — gates S1)
+### 6.2 Consumer surface — API tiers (NORMATIVE; CUT at S1, asserted by `surface.test.ts`)
 
 The required concepts are five and irreducible: pool, grant resolver, actor, mounts, sessionId — a governed FS without them is a KV store. The complexity that IS removable is surface leakage, and it gets cut before new features are built on the wide surface:
 
 1. **Tier 1 — main entry (`tuddofs`), all most hosts ever see:** `createTuddoFs` returning `{ migrate, open, gc, verify, invalidate }` only; `createDirectAdapter`; typed errors (§9); public types. Nothing else.
 2. **Tier 2 — `tuddofs/internal` subpath:** kernel ref-level ops (`fork`/`read`/`write`/`delete`/`restore` taking raw tenant+ref), hashing helpers (`sha256`, `treePreimage`, `hashTree`, `commitPreimage`, `hashCommit`), `GrantController`, validation functions. Same code, out of the storefront. Rationale: kernel `write` takes a raw ref — usable only by callers who understand §4.4 naming, and it sidesteps session addressing; two same-named `write`s at different abstraction levels on one object is a foot-gun. No §10 host obligation requires any Tier-2 symbol.
 3. **Mount handles for typed host code:** `session.mount(key)` returns the file ops bound to one mount, taking plain `/paths`. Compound `mountKey:/path` addressing remains the adapter/tool contract ONLY — one string per path is a feature at the LLM-tool boundary, noise in host code. One convention per audience.
-   - **Engine surface on the mount handle (AMENDED at S1).** `session.mounts()` and `session.mount(key).capture({writes, deletes})` are reachable from the Tier-1 `open()` result and are named here so the tier boundary stays exhaustive. They exist for the sync engine (§7.3 phase 3 step 5) and are NOT tool verbs: `mounts()` is the server-derived mount table the engine reads instead of trusting a host list or the target (§5 rule 7), and `capture()` commits one scan of one mount as a single commit with bytes the caller has already fetched and re-hashed. `createDirectAdapter` does not expose either. The engine itself — `createSyncEngine`, `createLocalDirectoryTarget`, the `SyncTarget` seam, `SyncTargetError` — stays in Tier 2 (`tuddofs/internal`) until §15.4 closes.
+   - **Engine surface on the mount handle (AMENDED at S1).** `session.mounts()` and `session.mount(key).capture({writes, deletes})` are reachable from the Tier-1 `open()` result and are named here so the tier boundary stays exhaustive. They exist for the sync engine (§7.3 phase 3 step 5) and are NOT tool verbs: `mounts()` is the server-derived mount table the engine reads instead of trusting a host list or the target (§5 rule 7), and `capture()` commits one scan of one mount as a single commit with bytes the caller has already fetched and re-hashed. `createDirectAdapter` does not expose either. The engine itself — `createSyncEngine`, `createLocalDirectoryTarget`, the `SyncTarget` seam, `SyncTargetError` — stays in Tier 2 (`tuddofs/internal`). CLOSED at S4 (§15.4): the engine lives in core and ships from `tuddofs/internal`; promotion to Tier 1 is a separate, additive question deliberately left unmade while most hosts never run an engine.
 4. **Contract fixes riding the same cut:**
    - `edit()` drops offset-based `TextEdit` (`{start, end, text}`, UTF-16 code units — the most error-prone contract an LLM harness can receive) for str-replace: `{oldText, newText, replaceAll?}`; zero or multiple matches without `replaceAll` → `EditMatchError` (§9, added at S1, carries the match count); `ifSha` concurrency unchanged.
    - `resolveMerge` is removed — it is by definition (§4.5) a re-run of `merge`; the surviving method is `merge({mounts?, approver?})`, returning per mount a discriminated `{status: 'merged'|'unauthorized'|'pendingApproval'|'conflicts', conflicts?}` instead of the string-or-object union.
@@ -190,7 +190,7 @@ This is a breaking cut taken deliberately now, while adoption is zero and versio
 
 ---
 
-## 7. Layer 4 — sync engine (NORMATIVE, UNBUILT)
+## 7. Layer 4 — sync engine (NORMATIVE; SHIPPED at S1 with the local target, S2 over SSH)
 
 Purpose: real files on a disk somewhere (local machine, SSH host, sandbox provider), so any binary works natively, with the kernel remaining the source of truth.
 
@@ -272,7 +272,7 @@ A failed scan is an error event, never an empty diff. Silently treating exec fai
 - Capture failure re-triggers and surfaces via `onCaptureFailed`; N failures never wedge the slot.
 - Hostile-input suite: path escapes, quoting collapse, symlink exfiltration attempt, mount-escape in scan output.
 
-## 8. Large blobs (NORMATIVE, UNBUILT)
+## 8. Large blobs (NORMATIVE; SHIPPED at S3)
 
 Two independent halves. The `BlobStore` SPI already declares `presignPut(key, {ttlSeconds, checksumSha256})` / `presignGet(key, {ttlSeconds})` — **declared but exercised nowhere today**, which makes them an untested contract; both halves below put them under test.
 
@@ -319,7 +319,7 @@ Mode-only changes count as content changes (mode is in the tree entry).
 
 Exported errors (hosts and tools switch on these; never swallowed, never wrapped generic): `InvalidPathError`, `InvalidMountKeyError`, `InvalidCommitTimestampError`, `PermissionDeniedError`, `PreconditionFailedError`, `RefConflictError`, `NotFoundError`, `BranchSettledError` (message prescribes recovery: open a new session — never a dead end), `MergePendingApprovalError`, `GrantResolverError` (failed CLOSED), `SchemaDriftError`, `StorageError`, `InvariantError`; at S1, `EditMatchError` (str-replace `edit()` found zero or multiple matches without `replaceAll`; carries the match count — §6.2). Every error carries `{tenant, mount?, path?, ref?}` context. Conflicts are a merge RESULT, not an exception.
 
-**AMENDED at S1 — `SyncTargetError`.** The sync engine adds one typed error to the taxonomy: a `SyncTarget` operation failed — a probe, a scan, a stamp update, a verification read — carrying the exit code and output alongside the usual context. It exists because §7.2 forbids the alternative: a failed scan MUST surface as an error, never as an empty diff, and a generic `Error` gives the host nothing to switch on. It ships from `tuddofs/internal` beside `createSyncEngine`, not from the Tier-1 entry, and moves to Tier 1 with the engine when §15.4 closes.
+**AMENDED at S1 — `SyncTargetError`.** The sync engine adds one typed error to the taxonomy: a `SyncTarget` operation failed — a probe, a scan, a stamp update, a verification read — carrying the exit code and output alongside the usual context. It exists because §7.2 forbids the alternative: a failed scan MUST surface as an error, never as an empty diff, and a generic `Error` gives the host nothing to switch on. It ships from `tuddofs/internal` beside `createSyncEngine`, not from the Tier-1 entry, and stays there: §15.4 closed with the engine in core on the internal subpath, so this error moves to Tier 1 only if and when the engine itself is promoted.
 
 Decision: there is no merge-policy hook. `onCommit` covers eventing, and merge policy is the host's decision about _when to call_ `merge()` and with which approver — a second hook adds surface for zero value.
 
@@ -332,12 +332,12 @@ Boundary rules (already enforced):
 3. **Object storage is the 5-verb `BlobStore` SPI**; adapters live in their own packages (§8.4). Core ships no storage SDK.
 4. **Product hooks are events:** `onCommit(event)` post-commit, queued, failures logged and never fail the write. The package never knows its listeners.
 
-Host obligations — these go in a **host integration guide** (S4 deliverable):
+Host obligations — SHIPPED at S4 as the host integration guide, [`docs/host-guide.md`](docs/host-guide.md):
 
 - Schedule `gc()` and `verify()`; nothing runs them for you. A `verify()` that has never run is a receipt chain nobody audits.
 - Wire `invalidate()` to permission revocations; understand the multi-worker TTL bound (§5).
 - Grant-resolver patterns (fail closed, keep it close to your authz system, treat inputs/outputs as security-sensitive).
-- README is the consumer-facing API contract: any PR changing an exported signature, error, or behavior updates it in the SAME PR; README examples compile in a test.
+- README is the consumer-facing API contract and the host guide is the operational one: any PR changing an exported signature, error, or behavior updates them in the SAME PR. Both are gated — every TypeScript example in either document compiles against the shipped surface, and the two programs they hand out verbatim (README quickstart, guide maintenance job) are executed against real PostgreSQL and again inside a clean container built from the packed tarball.
 
 ## 11. Roadmap
 
@@ -349,25 +349,35 @@ Shipped work (kernel, session, grants, merge/staged/approver, restore, tags, pin
 | S1  | Pre-work, lands FIRST: API surface diet (§6.2) + tree-coherence enforcement (§4.3: write rejection, merge-conflict validation, `verify()` audit). Then sync engine core (§7.1–7.4) + **local-directory target**; engine events | main entry exports exactly the §6.2 Tier-1 set (asserted by a test); README quickstart compiles against it; coherence property test (no op sequence yields an incoherent tree; merge of colliding coherent trees conflicts); kill matrix (§7.5) green in CI with zero infrastructure; §12 budgets measured and asserted against the local target |
 | S2  | SSH reference target; hostile-input suite at full strength                                                                                                                                                                     | same kill matrix over a real network target; quoting/escape tests                                                                                                                                                                                                                                                                                |
 | S3  | Large blobs (§8): session streaming + presign issuance; sync capture path; `@tuddofs/s3` reference adapter                                                                                                                     | 2 GB MinIO round-trip, flat RSS, both paths; presign contract tests                                                                                                                                                                                                                                                                              |
-| S4  | Standalone hardening: host integration guide, GC/verify scheduling doc, semver/release pipeline, README↔`.d.ts` drift check                                                                                                    | published release; docs gate in CI                                                                                                                                                                                                                                                                                                               |
+| S4  | Standalone hardening: host integration guide, GC/verify scheduling doc, semver/release pipeline, README↔`.d.ts` drift check; §12 measured on both targets; §15 closed | docs gate in CI (every doc example compiles; the documented programs run in a scratch container off the packed tarball); tag-driven release workflow gated on the Tier-1 export-set test, the docs gate, and a skip-free suite; §12 table carries measured local and network numbers |
 
 Dependencies: S1→S2; S1→S3(capture half); S3(streaming half) is independent of S1; S0 first so tasks are cut against this spec.
 
-## 12. Performance budgets (absolute; ASSERTED from S1)
+## 12. Performance budgets (absolute; ASSERTED from S1, re-measured over the network at S2, CLOSED at S4)
 
 Assumptions: PG stmt 0.3–1ms; S3 20–80ms; remote exec 150–500ms; LLM step 1–10s.
 
-Every row is asserted by `src/integration/sync-budgets.integration.test.ts` against real PostgreSQL and the local-directory target, and every measurement is printed by that suite. Method: warm up, run N times, judge the BEST run — a budget describes what the system costs, not what a shared CI runner schedules, and the minimum is the only statistic that survives an unrelated process stealing the core mid-measurement. "As measured" below is the S1 local figure; treat it as the regression line, not the ceiling.
+Every row is asserted and printed by one of two suites:
 
-| Op              | Budget                                               | As measured (S1) |
-| --------------- | ---------------------------------------------------- | ---------------- |
-| Session read    | 1–3 ms (heads index; no per-read provider I/O)       | 0.6 ms           |
-| Session write   | 8–20 ms visible (mirror write off the critical path) | 1.9 ms           |
-| Exec capture    | 0 visible (async; one exec per cycle)                | 0.02 ms trigger  |
-| Warm re-acquire | ≤ 0.1 s (index-driven; never a full reseed)          | 3.5 ms           |
-| Fork / merge    | 10–100 ms once per mount / < 1 s at 100 paths        | 1.6 ms / 13 ms   |
+- `src/integration/sync-budgets.integration.test.ts` — real PostgreSQL and the local-directory target. Runs in CI on every PR.
+- `src/integration/sync-budgets-ssh.ssh.test.ts` — the target-touching rows over a real network target (containerized sshd, one ssh invocation per verb). Runs in the SSH CI job and under `npm run test:ssh`.
 
-The two shape claims are asserted as shapes, not as latencies: "exec capture 0 visible" means the Phase-3 trigger returns before its scan commits anything, and "mirror write off the critical path" means a Phase-2 write resolves on the durable commit while the target's `writeFile` is still blocked. S2 re-measures the same rows over a real network target, where remote exec dominates.
+Method (both suites): warm up, run N times, judge the BEST run — a budget describes what the system costs, not what a shared CI runner schedules, and the minimum is the only statistic that survives an unrelated process stealing the core mid-measurement. The numbers below are measurements, not estimates; treat them as the regression line, not the ceiling.
+
+| Op                      | Budget (asserted)                                                             | Local, measured | Network (ssh), measured |
+| ----------------------- | ----------------------------------------------------------------------------- | --------------- | ----------------------- |
+| Session read            | 1–3 ms (heads index; no per-read provider I/O)                                  | 0.41 ms         | target-independent      |
+| Session write           | 8–20 ms visible (mirror write off the critical path)                            | 1.61 ms         | 3.59 ms                 |
+| Exec capture            | 0 visible (async; one exec per cycle)                                           | 0.02 ms trigger | 0.04 ms trigger         |
+| Warm re-acquire         | ≤ 0.1 s local; one-to-two remote execs (asserted: ≤ 2 execs, 0 transfers, ≤ 1 s) on a network target      | 4.54 ms         | 244 ms                  |
+| Fork / merge            | 10–100 ms once per mount / < 1 s at 100 paths                                   | 1.63 / 9.17 ms  | target-independent      |
+| One remote exec         | assumption row: 150–500 ms on a real network (asserted ≤ 500 ms on the fixture)  | —               | 115 ms                  |
+
+Measured 2026-08-11 by a full `npm run test:integration` and `npm run test:ssh`, on a Ryzen 9 9950X3D with PostgreSQL 16 in Docker and the sshd fixture container over loopback. "Target-independent" rows never speak to a target — they are kernel-and-PostgreSQL work, and re-running them through an ssh suite would measure the same code twice and label the second number "SSH". Loopback is the FLOOR of the remote-exec assumption, never its ceiling: a WAN host adds its RTT to every remote-exec row, so the ssh assertions are ceilings on the fixture rather than promises about a datacenter.
+
+A second data point, from the same suites on a shared GitHub-hosted runner (CI run 31543027690): read 1.50 ms, write 5.26 ms, capture trigger 0.05 ms, warm re-acquire 10.98 ms, fork 3.62 ms, merge at 100 paths 63.05 ms; over ssh, one remote exec 162.98 ms, write 10.63 ms, warm re-acquire 330.30 ms. Every budget holds there too, which is what makes them budgets rather than descriptions of one workstation — and the narrowest margin, the visible write at roughly half its ceiling on the slowest environment observed, is the row to watch in review.
+
+The shape claims are asserted as shapes, not as latencies, and the network is what makes two of them mean something: "exec capture 0 visible" means the Phase-3 trigger returns before its scan commits anything, even when that scan is an ssh session; "mirror write off the critical path" means a Phase-2 write resolves on the durable commit while the target's `writeFile` is still in flight — measured at 3.59 ms against a target whose single round trip costs 115 ms, which is the proof that the network is not on the critical path. Warm re-acquire is the one row where the network legitimately shows up: it is one liveness probe plus one index check, so it costs remote execs rather than a reseed of the workspace — and that is asserted as a count at the §7.1 seam, not inferred from the clock. The ssh suite measures `{exec: 2, readFile: 0, writeFile: 0, mkdir: 0}` for a warm re-acquire against `{exec: 3, readFile: 3, writeFile: 26, mkdir: 26}` for a cold hydrate of the same 25-file workspace, and the counts are identical on the workstation and on a hosted runner (CI run 31549060984) even though the wall clock moves from 239 ms to 415 ms. A latency ceiling alone would have let a reseed pass on a fast loopback; the count cannot.
 
 ## 13. Working methodology (binding)
 
@@ -382,7 +392,7 @@ Strict roadmap order S1→S4 (S0 is this document); inside a stage: pure functio
 3. The decision table and error taxonomy are normative. If an implementation choice contradicts a table, the table wins; if the table seems wrong, STOP and ask.
 4. Integration tests against real Postgres; assert on state, never SQL strings. Sync-engine tests run against the local target in CI; SSH target behind an opt-in env flag.
 5. Run only this package's suite while iterating.
-6. No `xfail`/`skip` markers for known-broken invariants. CI reports skips distinctly from passes.
+6. No `xfail`/`skip` markers for known-broken invariants. CI reports skips distinctly from passes: every suite runs through `scripts/run-tests.mjs`, which scans the run's TAP stream for SKIP/TODO directives, prints them apart from the pass tail, and — with `TUDDOFS_NO_SKIPS=1`, which CI sets on every job whose environment is provisioned — fails the run.
 7. Docs are part of the contract: README updated in the same PR as any surface change; exported symbols carry TSDoc citing the governing spec section; kernel algorithm files open with a header naming their spec section and invariants; migrations immutable once merged; README examples compile in a test.
 
 ### Never-do list (each item has caused a production incident in systems like this)
@@ -409,13 +419,15 @@ Ambiguity or contradiction in this spec → stop, name the confusion, ask. Do no
 1. **Hash canonicalization drift** — mitigated by append-only golden tests pinning exact preimage bytes forever.
 2. **SyncTarget seam leaks provider assumptions** — mitigated by building local + SSH before any provider target; core never imports an SDK.
 3. **Presign contract divergence across stores** (checksum-header enforcement varies) — mitigated by the quarantine-key fallback (§8.2) and MinIO-based contract tests.
-4. **Perf budgets are estimates until measured** — CLOSED for the local target at S1: every §12 row is measured and asserted by `src/integration/sync-budgets.integration.test.ts`, and the numbers now stand as regressions. Still open for the network path until S2 re-measures over SSH, where remote exec (150–500 ms) dominates every row.
+4. **Perf budgets are estimates until measured** — CLOSED at S4. Every §12 row is measured and asserted: the local target since S1, the target-touching rows over a real network target since S2, both consolidated into the §12 table with the machine and method named. The numbers stand as regressions in CI, and the one row the network changes (warm re-acquire) is asserted as a remote-exec count — at most two execs and zero file transfers, counted at the §7.1 seam — and not only as a wall-clock figure that a fast loopback would satisfy on its own.
 
-## 15. Open decisions
+## 15. Decisions, closed
 
-1. Mirror-root naming inside targets (`/work/<mountKey>` placeholder; encoding of `:` for Windows targets pinned by tests).
-2. Conflict-resolution UX beyond returned conflict data (initial engine: data only; any UI is the host's).
-3. Scoped-package name for the reference storage adapter (`@tuddofs/s3` placeholder).
-4. Whether the sync engine lives in core or `@tuddofs/sync` (leaning core: it imports no SDKs, and the seam is the product's R2/R3/R4 answer).
+All four decisions this document opened at S0 are closed. They are recorded here with their reasoning, because the next person to ask "why is it like this?" deserves the argument and not just the outcome.
 
-Settled: product name (`tuddofs`, tables `tuddo_*`, keys `tuddo/<tenant>/…`) · packaging (standalone repo, published npm package) · no merge-policy hook (§9) · staged approval surface (`merge({approver})` API, shipped).
+1. **Mirror-root naming inside targets — CLOSED: `<root>/<mirrorDir>`, where `mirrorDir` percent-encodes `:` as `%3A`.** The engine takes `root` from the host (there is no `/work` default to disagree about) and derives one directory per mount below it. `:` is legal in a mount key (§4.4) and illegal in a Windows filename; `%` cannot appear in a mount key, which makes the encoding reversible, and the reverse mapping is what turns a scan record back into a mount key. Pinned by `mirrorDirName` / `mountKeyForMirrorDir` and their tests in `src/sync/paths.ts`.
+2. **Conflict-resolution UX — CLOSED: data only, permanently.** `merge()` returns `{status: 'conflicts', conflicts}`; the package ships no resolution UI, no three-way merge driver, and no conflict-marker format. Conflicts are the honest output of the §9 decision table, and every product that consumes them wants a different presentation — an in-package UX would be one product's opinion shipped inside everyone's dependency. Hosts resolve by writing the resolved bytes and merging again, which is why merge is idempotent.
+3. **Reference storage adapter name — CLOSED: `@tuddofs/s3`, shipped.** Separate package, zero dependency on core (it implements the structural SPI), and it carries the reusable `@tuddofs/s3/conformance` kit so a third-party adapter can prove itself against the same suite.
+4. **Sync engine placement — CLOSED: core, published through `tuddofs/internal`.** It imports no provider SDK and no target implementation, only the four-verb seam, so a separate `@tuddofs/sync` package would split the R2/R3/R4 answer across two release cadences for zero decoupling. Placement in core is not the same question as tier: the engine, its targets, and `SyncTargetError` stay on the `tuddofs/internal` subpath rather than the Tier-1 storefront (§6.2), because Tier 1 is the surface every host sees and most hosts never run an engine. Promoting the engine to Tier 1 later is an additive, semver-minor change; taking it back is not, so the small surface is the reversible choice.
+
+Settled earlier and unchanged: product name (`tuddofs`, tables `tuddo_*`, keys `tuddo/<tenant>/…`) · packaging (standalone repo, published npm package) · no merge-policy hook (§9) · staged approval surface (`merge({approver})` API, shipped).

@@ -1,0 +1,215 @@
+name: Release
+
+# Publishing is tag-driven and gated. `v1.2.3` publishes the core package;
+# `s3-v1.2.3` publishes `@tuddofs/s3`. Nothing publishes from a branch, and no
+# job publishes anything its gates did not just prove.
+#
+# The gates are the ones the README's versioning section names: format, lint,
+# typecheck, build, the Tier-1 export-set test, the documentation compilation
+# gate, every test suite the project has — units, the S3 adapter against MinIO,
+# the PostgreSQL integration suite, and the SSH target suite — all with skips
+# treated as failures, and, for core, the clean-container proof that the
+# published tarball plus the documents get a consumer from zero to governed
+# writes and scheduled maintenance.
+#
+# Two ordering rules this file has to keep, because both have already broken it:
+#
+#   1. Service teardown goes LAST. `npm publish` runs `prepublishOnly`, which
+#      runs the suite; tearing MinIO down before the publish steps kills that
+#      run with ECONNREFUSED while the job-level endpoint is still set.
+#   2. The dry run uses `--ignore-scripts`. It is a packing check, and its
+#      scripts are gates this job has already run — without the flag the suite
+#      runs a third time. The real publish deliberately keeps its scripts, so
+#      the artifact that reaches the registry was gated by the same process
+#      that uploaded it.
+#
+# `workflow_dispatch` exists so the pipeline can be exercised (dry-run defaults
+# to true) without minting a tag.
+
+on:
+  push:
+    tags:
+      - 'v*'
+      - 's3-v*'
+  workflow_dispatch:
+    inputs:
+      package:
+        description: Package to release
+        required: true
+        type: choice
+        options: [core, s3]
+      dry-run:
+        description: Run every gate but do not publish
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  core:
+    name: Publish tuddofs
+    if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.package == 'core'
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        ports:
+          - 5432:5432
+        env:
+          POSTGRES_USER: tuddofs
+          POSTGRES_PASSWORD: tuddofs
+          POSTGRES_DB: tuddofs_it
+        options: >-
+          --health-cmd "pg_isready -U tuddofs -d tuddofs_it"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      TUDDOFS_NO_SKIPS: '1'
+      TUDDOFS_S3_ENDPOINT: http://127.0.0.1:9000
+      TUDDOFS_S3_FORCE_PATH_STYLE: 'true'
+      TUDDOFS_DATABASE_URL: postgresql://tuddofs:tuddofs@127.0.0.1:5432/tuddofs_it
+      # Same hosted-runner sizes CI uses: the 2 GiB the spec names needs a
+      # scratch disk a hosted runner does not have, and the size is a knob.
+      TUDDOFS_MINIO_STREAM_BYTES: '268435456'
+      TUDDOFS_MINIO_CAPTURE_BYTES: '268435456'
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          registry-url: https://registry.npmjs.org
+      - name: Install dependencies
+        run: npm ci
+      - name: Tag matches package version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -eu
+          tagged="${GITHUB_REF_NAME#v}"
+          declared="$(node -p "require('./package.json').version")"
+          if [ "$tagged" != "$declared" ]; then
+            echo "tag $GITHUB_REF_NAME does not match package version $declared" >&2
+            exit 1
+          fi
+      - name: Check formatting
+        run: npm run format:check
+      - name: Lint
+        run: npm run lint
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Build
+        run: npm run build
+      - name: Tier-1 export-set gate
+        run: npm run gate:surface
+      # Compiles every documented example against the BUILT declarations
+      # through the exports map, so it needs the build step above.
+      - name: Documentation compilation gate
+        run: npm run gate:docs
+      - name: Start MinIO
+        run: docker run --detach --name tuddofs-s3-release --env MINIO_ROOT_USER=minioadmin --env MINIO_ROOT_PASSWORD=minioadmin --publish 9000:9000 minio/minio:RELEASE.2024-12-18T13-15-44Z server /data
+      - name: Wait for MinIO
+        run: |
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:9000/minio/health/live >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "MinIO did not become ready within 30 seconds" >&2
+          exit 1
+      - name: Unit and adapter tests (skips are failures)
+        run: npm test
+      - name: PostgreSQL integration tests
+        run: npm run test:integration
+      - name: MinIO streaming acceptance smoke test
+        run: npm run test:minio
+      # Builds fixtures/sshd and starts its own uniquely named container, so it
+      # needs no service block of its own.
+      - name: SSH target acceptance tests (§7.5 kill matrix, §12 network budgets)
+        run: npm run test:ssh
+      - name: Clean-container quickstart proof
+        run: npm run gate:quickstart
+      # A packing check only; the gates its scripts would run are the steps above.
+      - name: Publish dry run
+        run: npm publish --dry-run --ignore-scripts
+      # Keeps its scripts on purpose: `prepublishOnly` re-runs build and gates
+      # in the process that uploads, which is also what stops a laptop publish
+      # from skipping them. MinIO is still up for it — see the header.
+      - name: Publish
+        if: startsWith(github.ref, 'refs/tags/v') && github.event.inputs.dry-run != 'true'
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Stop MinIO
+        if: always()
+        run: docker rm --force tuddofs-s3-release
+
+  s3:
+    name: Publish @tuddofs/s3
+    if: startsWith(github.ref, 'refs/tags/s3-v') || github.event.inputs.package == 's3'
+    runs-on: ubuntu-latest
+    env:
+      TUDDOFS_NO_SKIPS: '1'
+      TUDDOFS_S3_ENDPOINT: http://127.0.0.1:9000
+      TUDDOFS_S3_FORCE_PATH_STYLE: 'true'
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          registry-url: https://registry.npmjs.org
+      - name: Install dependencies
+        run: npm ci
+      - name: Tag matches package version
+        if: startsWith(github.ref, 'refs/tags/s3-v')
+        run: |
+          set -eu
+          tagged="${GITHUB_REF_NAME#s3-v}"
+          declared="$(node -p "require('./packages/s3/package.json').version")"
+          if [ "$tagged" != "$declared" ]; then
+            echo "tag $GITHUB_REF_NAME does not match @tuddofs/s3 version $declared" >&2
+            exit 1
+          fi
+      - name: Check formatting
+        run: npm run format:check
+      - name: Lint
+        run: npm run lint
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Build
+        run: npm run build
+      - name: Start MinIO
+        run: docker run --detach --name tuddofs-s3-release --env MINIO_ROOT_USER=minioadmin --env MINIO_ROOT_PASSWORD=minioadmin --publish 9000:9000 minio/minio:RELEASE.2024-12-18T13-15-44Z server /data
+      - name: Wait for MinIO
+        run: |
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:9000/minio/health/live >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "MinIO did not become ready within 30 seconds" >&2
+          exit 1
+      - name: Adapter conformance suite against MinIO
+        run: npm run test:s3
+      - name: Publish dry run
+        run: npm publish --workspace @tuddofs/s3 --dry-run --ignore-scripts
+      # Keeps its scripts: the package's own `prepublishOnly` re-runs the
+      # adapter's build and conformance suite against the MinIO still running
+      # below, which is what a manual publish from a laptop also gets.
+      - name: Publish
+        if: startsWith(github.ref, 'refs/tags/s3-v') && github.event.inputs.dry-run != 'true'
+        run: npm publish --workspace @tuddofs/s3 --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Stop MinIO
+        if: always()
+        run: docker rm --force tuddofs-s3-release

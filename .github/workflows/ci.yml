@@ -16,6 +16,12 @@ jobs:
       fail-fast: false
       matrix:
         node: ['20', '22']
+    env:
+      # Every suite this job runs has its environment provisioned below, so a
+      # skipped test is a broken gate rather than a missing service (§13.6).
+      TUDDOFS_NO_SKIPS: '1'
+      TUDDOFS_S3_ENDPOINT: http://127.0.0.1:9000
+      TUDDOFS_S3_FORCE_PATH_STYLE: 'true'
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -34,8 +40,10 @@ jobs:
         run: npm run typecheck
       - name: Build
         run: npm run build
-      - name: Unit tests
-        run: npm test
+      - name: Tier-1 export-set gate
+        run: npm run gate:surface
+      - name: Documentation compilation gate
+        run: npm run gate:docs
       - name: Start MinIO
         run: docker run --detach --name tuddofs-s3-ci --env MINIO_ROOT_USER=minioadmin --env MINIO_ROOT_PASSWORD=minioadmin --publish 9000:9000 minio/minio:RELEASE.2024-12-18T13-15-44Z server /data
       - name: Wait for MinIO
@@ -48,11 +56,10 @@ jobs:
           done
           echo "MinIO did not become ready within 30 seconds" >&2
           exit 1
-      - name: Full S3 package tests
-        env:
-          TUDDOFS_S3_ENDPOINT: http://127.0.0.1:9000
-          TUDDOFS_S3_FORCE_PATH_STYLE: 'true'
-        run: npm run test:s3
+      # Unit tests run after MinIO so the S3 package's contract cases have their
+      # endpoint and the whole run is skip-free.
+      - name: Unit tests
+        run: npm test
       - name: Stop MinIO
         if: always()
         run: docker rm --force tuddofs-s3-ci
@@ -76,6 +83,7 @@ jobs:
           --health-retries 5
     env:
       TUDDOFS_DATABASE_URL: postgresql://tuddofs:tuddofs@127.0.0.1:5432/tuddofs_it
+      TUDDOFS_NO_SKIPS: '1'
       TUDDOFS_MINIO_STREAM_BYTES: '268435456'
       TUDDOFS_S3_ENDPOINT: http://127.0.0.1:9000
       TUDDOFS_S3_FORCE_PATH_STYLE: 'true'
@@ -114,7 +122,7 @@ jobs:
         run: docker rm --force tuddofs-s3-integration
 
   ssh-target:
-    name: SSH target acceptance (§7.5 kill matrix)
+    name: SSH target acceptance (§7.5 kill matrix, §12 network budgets)
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -132,6 +140,7 @@ jobs:
           --health-retries 5
     env:
       TUDDOFS_DATABASE_URL: postgresql://tuddofs:tuddofs@127.0.0.1:5432/tuddofs_it
+      TUDDOFS_NO_SKIPS: '1'
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -148,6 +157,35 @@ jobs:
       # the kill matrix can kill the real daemon.
       - name: SSH target acceptance tests
         run: npm run test:ssh
+      # The same job measures the §12 budgets over the network target; the
+      # suite prints every measurement and asserts the documented ceilings.
+
+  docs:
+    name: Docs gate (clean-container quickstart)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      # The docs gate compiles every documented example against the BUILT
+      # declarations, through the packages' exports maps, exactly as a consumer
+      # resolves them — so the build has to come first.
+      - name: Build
+        run: npm run build
+      - name: Documentation compilation gate
+        run: npm run gate:docs
+      # The acceptance claim for the documents: a consumer with only README.md
+      # and docs/host-guide.md gets from zero to governed writes and scheduled
+      # GC/verify. Proven against the packed tarball in a scratch container that
+      # never sees this checkout.
+      - name: Clean-container quickstart proof
+        run: npm run gate:quickstart
 
   package:
     name: Packed package smoke test
@@ -164,6 +202,8 @@ jobs:
         run: npm ci
       - name: Build
         run: npm run build
+      - name: Core package publish dry run
+        run: npm publish --dry-run --ignore-scripts
       - name: S3 package publish dry run
         run: npm publish --workspace @tuddofs/s3 --dry-run --ignore-scripts
       - name: Pack S3 package
