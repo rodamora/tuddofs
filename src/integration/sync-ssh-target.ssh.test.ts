@@ -348,6 +348,37 @@ test('[ssh] batch verbs round-trip hostile paths, replace symlinks, and reject s
 
   await outside.exec(`rm -rf ${quoteShellArg(root)} ${quoteShellArg(outsidePath)}`)
 })
+test('[ssh] batch verbs refuse directory symlink traversal without touching the target', async () => {
+  const sshHost = await host()
+  const base = posix.join(sshHost.workspaceBase, `batch-symlink-${randomUUID()}`)
+  const root = posix.join(base, 'workspace')
+  const outsideDir = posix.join(base, 'outside')
+  const outsideFile = posix.join(outsideDir, 'secret.txt')
+  const link = posix.join(root, 'mnt', 'outside')
+  const target = createSshTarget(sshHost.targetOptions(root))
+  const outside = createSshTarget(sshHost.targetOptions(base))
+
+  try {
+    await target.mkdir(posix.join(root, 'mnt'))
+    await outside.mkdir(outsideDir)
+    await outside.writeFile(outsideFile, Buffer.from('outside bytes'))
+    assert.equal(
+      (await outside.exec(`ln -s ${quoteShellArg(outsideDir)} ${quoteShellArg(link)}`)).exitCode,
+      0,
+    )
+
+    await assert.rejects(
+      target.writeFiles!([{ path: posix.join(link, 'written.txt'), bytes: Buffer.from('must not escape') }]),
+      InvalidPathError,
+    )
+    assert.equal((await outside.exec(`test ! -e ${quoteShellArg(posix.join(outsideDir, 'written.txt'))}`)).exitCode, 0)
+
+    await assert.rejects(target.readFiles!([posix.join(link, 'secret.txt')]), InvalidPathError)
+  } finally {
+    await outside.exec(`rm -rf ${quoteShellArg(base)}`).catch(() => undefined)
+  }
+})
+
 
 test('[ssh] batch verbs reject a failed tar and probe tar as a required binary', async () => {
   const sshHost = await host()

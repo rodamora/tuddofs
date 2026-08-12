@@ -246,17 +246,23 @@ export function createSshTarget(options: SshTargetOptions): SshTarget {
       batchOptions: { timeoutMs?: number } = {},
     ): Promise<void> {
       if (files.length === 0) return
-      await ensureRoot()
+      const resolvedRoot = await ensureRoot()
       const entries = files.map(file => ({
         path: posix.relative(root, resolveUnderRoot(root, file.path)),
         bytes: file.bytes,
       }))
       const run = await runSsh({
-        script: remoteWriteFilesScript(root),
+        script: remoteWriteFilesScript({
+          root,
+          realRoot: resolvedRoot,
+          paths: files.map(file => file.path),
+        }),
         stdin: writePaxTar(entries),
         timeoutMs: batchOptions.timeoutMs ?? defaultTimeoutMs,
       })
       if (run.exitCode === 0 && !run.timedOut) return
+      const refusal = guardFailure(root, run.exitCode, run.stderr)
+      if (refusal) throw refusal
       throw new SyncTargetError(
         run.timedOut ? `write batch timed out on ${destination}` : `write batch failed on ${destination}`,
         { exitCode: run.exitCode, output: run.stderr || run.stdout.toString('utf8') },
@@ -269,7 +275,7 @@ export function createSshTarget(options: SshTargetOptions): SshTarget {
       batchOptions: { timeoutMs?: number } = {},
     ): Promise<ReadonlyMap<string, Buffer>> {
       if (paths.length === 0) return new Map()
-      await ensureRoot()
+      const resolvedRoot = await ensureRoot()
       const requested = new Map<string, string[]>()
       for (const path of paths) {
         const relative = posix.relative(root, resolveUnderRoot(root, path))
@@ -280,11 +286,17 @@ export function createSshTarget(options: SshTargetOptions): SshTarget {
       }
       const stdin = Buffer.from([...requested.keys()].map(path => `${path}\0`).join(''), 'utf8')
       const run = await runSsh({
-        script: remoteReadFilesScript(root),
+        script: remoteReadFilesScript({
+          root,
+          realRoot: resolvedRoot,
+          paths: [...requested.keys()],
+        }),
         stdin,
         timeoutMs: batchOptions.timeoutMs ?? defaultTimeoutMs,
       })
       if (run.exitCode !== 0 || run.timedOut) {
+        const refusal = guardFailure(root, run.exitCode, run.stderr)
+        if (refusal) throw refusal
         throw new SyncTargetError(
           run.timedOut ? `read batch timed out on ${destination}` : `read batch failed on ${destination}`,
           { exitCode: run.exitCode, output: run.stderr || run.stdout.toString('utf8') },

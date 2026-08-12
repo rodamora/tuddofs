@@ -36,7 +36,7 @@ export {
   EXEC_SENTINEL_PREFIX,
   GUARD_EXIT,
 } from './ssh-shell.js'
-export type { RemotePathScriptInput, SshConnectionOptions } from './ssh-shell.js'
+export type { RemoteBatchPathScriptInput, RemotePathScriptInput, SshConnectionOptions } from './ssh-shell.js'
 export { SyncTargetError } from './errors.js'
 export type { ExecOptions, ExecResult, SyncTarget } from './target.js'
 export {

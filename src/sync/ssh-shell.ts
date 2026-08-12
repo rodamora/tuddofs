@@ -62,6 +62,16 @@ export interface SshConnectionOptions {
   readonly sshOptions?: readonly string[]
 }
 
+/** Inputs for one guarded remote batch file operation. */
+export interface RemoteBatchPathScriptInput {
+  /** Workspace root as the caller spelled it; used for lexical guards. */
+  readonly root: string
+  /** Workspace root as the remote resolved it (`pwd -P`). */
+  readonly realRoot: string
+  /** Absolute or root-relative file paths whose parent directories are guarded. */
+  readonly paths: readonly string[]
+}
+
 /** Inputs for one guarded remote file operation. */
 export interface RemotePathScriptInput {
   /** Workspace root as the caller spelled it; used for the lexical guard. */
@@ -207,14 +217,32 @@ export function remoteGuardScript(input: RemotePathScriptInput): string {
   return lines.join('\n')
 }
 
+/**
+ * Guard every existing ancestor of each batch member in one remote script.
+ * Keeping the checks in the same shell invocation preserves the one-exec
+ * property while applying the per-file remote realpath taxonomy to batches.
+ */
+function remoteBatchGuardScript(input: RemoteBatchPathScriptInput): string {
+  return input.paths
+    .map(path =>
+      remoteGuardScript({
+        root: input.root,
+        realRoot: input.realRoot,
+        path,
+        refuseSymlink: false,
+      }),
+    )
+    .join('\n')
+}
+
 /** Extract a PAX archive into the guarded workspace root. */
-export function remoteWriteFilesScript(root: string): string {
-  return `cd ${quoteShellArg(root)} && tar -x --unlink-first -f -`
+export function remoteWriteFilesScript(input: RemoteBatchPathScriptInput): string {
+  return `${remoteBatchGuardScript(input)}\ncd ${quoteShellArg(input.root)} && tar -x --unlink-first -f -`
 }
 
 /** Create a NUL-list-driven POSIX PAX archive from the guarded workspace root. */
-export function remoteReadFilesScript(root: string): string {
-  return `cd ${quoteShellArg(root)} && tar -c --format=posix --null --files-from=- -f -`
+export function remoteReadFilesScript(input: RemoteBatchPathScriptInput): string {
+  return `${remoteBatchGuardScript(input)}\ncd ${quoteShellArg(input.root)} && tar -c --format=posix --null --files-from=- -f -`
 }
 
 /** Guarded `cat`: the file's bytes are the remote command's stdout, unmodified. */
