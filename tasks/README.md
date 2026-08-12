@@ -1,6 +1,6 @@
 # tuddofs task board
 
-Execution briefs for the remaining roadmap. The normative source for every algorithm, invariant, and table is `../architecture.md` — briefs carry scope, sequencing, and acceptance only, and deliberately do NOT restate spec content. If a brief and the spec disagree, the spec wins; fix the brief.
+Execution briefs recording the shipped roadmap. The normative source for every algorithm, invariant, and table is `../architecture.md` — briefs carry scope, sequencing, and acceptance only, and deliberately do NOT restate spec content. If a brief and the spec disagree, the spec wins; fix the brief.
 
 Shipped work (kernel, session, grants, merge/staged/approver, restore, tags, pin, virtual mounts, GC, verify, direct adapter) is done with test evidence and has no task file.
 
@@ -35,13 +35,13 @@ flowchart LR
 
 ## Board
 
-| Task                                            | Stage       | Status | Depends on                         |
-| ----------------------------------------------- | ----------- | ------ | ---------------------------------- |
-| [s1-surface-diet](s1-surface-diet.md)           | S1 pre-work | done   | —                                  |
-| [s1-tree-coherence](s1-tree-coherence.md)       | S1 pre-work | done   | —                                  |
-| [s1-sync-core](s1-sync-core.md)                 | S1          | done   | s1-surface-diet, s1-tree-coherence |
-| [s2-ssh-target](s2-ssh-target.md)               | S2          | done   | s1-sync-core                       |
-| [s3-session-streaming](s3-session-streaming.md) | S3          | done   | —                                  |
-| [s3-capture-blobs](s3-capture-blobs.md)         | S3          | done   | s1-sync-core                       |
-| [s3-s3-adapter](s3-s3-adapter.md)               | S3          | done   | —                                  |
-| [s4-hardening](s4-hardening.md)                 | S4          | done   | everything above                   |
+| Task                                            | Stage       | Status     | Depends on                         |
+| ----------------------------------------------- | ----------- | ---------- | ---------------------------------- |
+| [s1-surface-diet](s1-surface-diet.md)           | S1 pre-work | done (#4)  | —                                  |
+| [s1-tree-coherence](s1-tree-coherence.md)       | S1 pre-work | done (#1)  | —                                  |
+| [s1-sync-core](s1-sync-core.md)                 | S1          | done (#5)  | s1-surface-diet, s1-tree-coherence |
+| [s2-ssh-target](s2-ssh-target.md)               | S2          | done (#9)  | s1-sync-core                       |
+| [s3-session-streaming](s3-session-streaming.md) | S3          | done (#2)  | —                                  |
+| [s3-capture-blobs](s3-capture-blobs.md)         | S3          | done (#10) | s1-sync-core                       |
+| [s3-s3-adapter](s3-s3-adapter.md)               | S3          | done (#8)  | —                                  |
+| [s4-hardening](s4-hardening.md)                 | S4          | done (#11) | everything above                   |
