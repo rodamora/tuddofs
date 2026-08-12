@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -213,5 +213,116 @@ test('failed presigned hydration leaves the marker absent and retries cleanly', 
   } finally {
     await rm(root, { recursive: true, force: true })
     await rm(sourceDir, { recursive: true, force: true })
+  }
+})
+test('presigned hydration replaces an existing member symlink without escaping the root', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'tuddofs-presigned-file-link-'))
+  const sourceDir = await mkdtemp(join(tmpdir(), 'tuddofs-presigned-file-link-source-'))
+  const outsideDir = await mkdtemp(join(tmpdir(), 'tuddofs-presigned-file-link-outside-'))
+  try {
+    const path = '/member.txt'
+    const bytes = Buffer.from('safe payload')
+    const source = join(sourceDir, 'member.txt')
+    const outside = join(outsideDir, 'outside.txt')
+    await writeFile(source, bytes)
+    await writeFile(outside, 'must remain unchanged')
+    const mountDir = join(root, 'project%3Adocs')
+    await mkdir(mountDir, { recursive: true })
+    await symlink(outside, join(mountDir, 'member.txt'))
+    const mount = {
+      key: 'project:docs',
+      virtual: false,
+      pinned: false,
+      write: 'direct' as const,
+      async glob() {
+        return [{ path, sha256: sha256(bytes), sizeBytes: BigInt(bytes.length) }]
+      },
+      async readBytes() {
+        throw new Error('presigned hydration must not relay')
+      },
+      async presign() {
+        return pathToFileURL(source).href
+      },
+    }
+    const session = {
+      async mounts() {
+        return [mount]
+      },
+      mount() {
+        return mount
+      },
+    } as unknown as SessionFileSystem
+    const engine = createSyncEngine({
+      session,
+      target: createLocalDirectoryTarget({ root }),
+      root,
+      largeBlobs: { transport: 'presigned' },
+    })
+
+    await engine.materialize()
+
+    assert.equal(await readFile(engine.mirrorPath('project:docs', path), 'utf8'), bytes.toString('utf8'))
+    assert.equal((await lstat(join(mountDir, 'member.txt'))).isSymbolicLink(), false)
+    assert.equal(await readFile(outside, 'utf8'), 'must remain unchanged')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+    await rm(sourceDir, { recursive: true, force: true })
+    await rm(outsideDir, { recursive: true, force: true })
+  }
+})
+
+test('presigned hydration refuses an existing directory symlink in the output hierarchy', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'tuddofs-presigned-dir-link-'))
+  const sourceDir = await mkdtemp(join(tmpdir(), 'tuddofs-presigned-dir-link-source-'))
+  const outsideDir = await mkdtemp(join(tmpdir(), 'tuddofs-presigned-dir-link-outside-'))
+  try {
+    const path = '/nested/member.txt'
+    const bytes = Buffer.from('must not escape')
+    const source = join(sourceDir, 'member.txt')
+    const outside = join(outsideDir, 'member.txt')
+    await writeFile(source, bytes)
+    const mountDir = join(root, 'project%3Adocs')
+    await mkdir(mountDir, { recursive: true })
+    await symlink(outsideDir, join(mountDir, 'nested'))
+    const mount = {
+      key: 'project:docs',
+      virtual: false,
+      pinned: false,
+      write: 'direct' as const,
+      async glob() {
+        return [{ path, sha256: sha256(bytes), sizeBytes: BigInt(bytes.length) }]
+      },
+      async readBytes() {
+        throw new Error('presigned hydration must not relay')
+      },
+      async presign() {
+        return pathToFileURL(source).href
+      },
+    }
+    const session = {
+      async mounts() {
+        return [mount]
+      },
+      mount() {
+        return mount
+      },
+    } as unknown as SessionFileSystem
+    const engine = createSyncEngine({
+      session,
+      target: createLocalDirectoryTarget({ root }),
+      root,
+      largeBlobs: { transport: 'presigned' },
+    })
+
+    await assert.rejects(
+      engine.materialize(),
+      error => error instanceof SyncTargetError && /presigned hydration guard failed|presigned hydration failed/.test(error.message),
+    )
+    await assert.rejects(readFile(outside))
+    assert.equal((await lstat(join(mountDir, 'nested'))).isSymbolicLink(), true)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+    await rm(sourceDir, { recursive: true, force: true })
+    await rm(outsideDir, { recursive: true, force: true })
   }
 })

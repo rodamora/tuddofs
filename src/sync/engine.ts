@@ -64,6 +64,7 @@ import {
   stampCommand,
   uploadCommand,
 } from './paths.js'
+import { buildPresignedGuardInput, remotePresignedGuardScript } from './ssh-shell.js'
 import { CaptureSlot } from './slot.js'
 import type { ExecOptions, ExecResult, SyncTarget } from './target.js'
 
@@ -518,8 +519,22 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
       if (bytes.length >= MAX_BATCH_PAYLOAD_BYTES) await flushRelay()
     }
     await flushRelay()
-
     if (presigned.length > 0) {
+      // Guard parent directories and unlink final members before curl. The
+      // list rides stdin, so argv stays O(1) in the batch size. The two execs
+      // leave only the same guard-then-write TOCTOU window as tar's
+      // guard-then-extract path.
+      await runExec(remotePresignedGuardScript(root), 'presigned hydration guard', {
+        timeoutMs: uploadTimeoutMs,
+        stdin: Buffer.from(
+          buildPresignedGuardInput({
+            root,
+            realRoot: root,
+            paths: presigned.map(entry => entry.output),
+          }),
+          'utf8',
+        ),
+      })
       const config = buildCurlGetConfig(presigned)
       const command = `cd ${quoteShellArg(root)} && curl --parallel --fail --create-dirs --config -`
       await runExec(command, 'presigned hydration', {

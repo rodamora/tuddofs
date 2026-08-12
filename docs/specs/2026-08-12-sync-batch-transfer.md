@@ -102,10 +102,10 @@ Per mount, cold path:
 
 1. For each branch-view entry, `session.mount(key).presign(path, { method: 'GET' })`. SigV4 signing is local computation plus one PG row lookup (~0.3–1 ms each; accepted). An inline blob throws the documented `StorageError` and falls into the **relay set**.
 2. Relay set (inline blobs, typically < 128 KiB each) rides the Level-1 tar path.
-3. Presigned set: one exec — `cd <root> && curl --parallel --fail --create-dirs --config -` with a curl config on **stdin**: one `url = "…"` / `output = "…"` pair per file, values quoted per curl config escaping rules (`\"`, `\\`, `\n`). URLs (which carry `&`) and paths (which may carry quotes/newlines) never meet a shell. Output paths are `resolveUnderRoot`-checked before the config is built.
-4. Any failed transfer fails the exec (`--fail`), which fails `materialize()` loudly; the mount's hydration marker is not yet written, so the retry re-hydrates it — existing crash semantics.
+3. Presigned set: two O(1)-argv execs. First, `cd <root>` reads a NUL-delimited stdin list, dedupes parent-directory guards, refuses directory symlink escapes with `pwd -P`, and unlinks existing member paths (including final symlinks). Second, `cd <root> && curl --parallel --fail --create-dirs --config -` reads the curl config on **stdin**: one `url = "…"` / `output = "…"` pair per file, values quoted per curl config escaping rules (`\"`, `\\`, `\n`). URLs (which carry `&`) and paths (which may carry quotes/newlines) never meet a shell. Output paths are `resolveUnderRoot`-checked before either stream is built.
+4. Any failed guard or transfer fails `materialize()` loudly; the mount's hydration marker is not yet written, so the retry re-hydrates it — existing crash semantics.
 5. The verify sample runs unchanged: re-read from the target, re-hash, compare against branch-view shas. Trust model identical to relay hydration.
-6. For a read-only mount, both the tar exec and the curl exec run inside the existing unfreeze → freeze bracket (`chmodWritableCommand` before, `chmodReadOnlyCommand` after), exactly where per-file writes run today.
+6. For a read-only mount, the tar exec and both presigned execs run inside the existing unfreeze → freeze bracket (`chmodWritableCommand` before, `chmodReadOnlyCommand` after), exactly where per-file writes run today. The gap between the guard/unlink exec and curl has the same guard-then-write TOCTOU shape as tar's guard-then-extract path.
 
 `probeCommand` already requires `curl` under the presigned transport; unreachable-store failures surface as a failed acquire with curl's error, not a hung capture.
 
@@ -121,8 +121,9 @@ server                    target                    store
   |   (2 execs)              |                        |
   |-- presign xN (local CPU + PG row each)            |
   |-- tar: inline blobs ----->|  (1 exec / 32 MiB)    |
+  |-- guard + unlink list --->|  (1 exec, NUL stdin)  |
   |-- curl config ----------->|== parallel GETs ======|
-  |   (1 exec)               |                        |
+  |   (1 exec, config stdin)  |                        |
   |-- verify sample <---------|  (1 readFiles exec)   |
   |-- marker + stamp -------->|  (2 writes/execs)     |
 ```

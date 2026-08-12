@@ -242,6 +242,66 @@ function remoteBatchGuardScript(input: RemoteBatchPathScriptInput): string {
     .join('\n')
 }
 
+/**
+ * Build the stdin list for presigned hydration's guard/unlink exec.
+ *
+ * Parent records are deduplicated before they cross the seam. Member records
+ * remain one per output so the same stream can unlink existing final symlinks.
+ */
+export function buildPresignedGuardInput(input: RemoteBatchPathScriptInput): string {
+  const parents = new Set<string>()
+  const members: string[] = []
+  for (const path of input.paths) {
+    const resolved = resolveUnderRoot(input.root, path)
+    parents.add(posix.dirname(resolved))
+    members.push(`F:${resolved}`)
+  }
+  return [...parents].map(path => `P:${path}`).concat(members).join('\0').concat('\0')
+}
+
+/**
+ * Guard parent directories and unlink existing presigned output members.
+ *
+ * The path list rides stdin, so argv stays O(1) in the number of files. The
+ * caller runs curl in a second exec; that leaves the same guard-then-write
+ * TOCTOU window as the tar path's guard-then-extract sequence.
+ */
+export function remotePresignedGuardScript(root: string): string {
+  const guardChild = [
+    'root=$(pwd -P)',
+    'guard_parent() {',
+    '  probe="$1"',
+    '  while :; do',
+    '    if resolved=$(cd -- "$probe" 2>/dev/null && pwd -P); then break; fi',
+    '    parent=$(dirname -- "$probe")',
+    `    if [ "$parent" = "$probe" ]; then exit ${GUARD_EXIT.noAncestor}; fi`,
+    '    probe=$parent',
+    '  done',
+    `  case "$resolved" in "$root"|"$root"/*) ;; *) exit ${GUARD_EXIT.escapesRoot} ;; esac`,
+    '}',
+    'for record do',
+    '  case "$record" in',
+    '    P:*) guard_parent "${record#P:}" || exit $? ;;',
+    '  esac',
+    'done',
+  ].join('\n')
+  const unlinkChild = [
+    'for record do',
+    '  case "$record" in',
+    '    F:*) rm -f -- "${record#F:}" || exit $? ;;',
+    '  esac',
+    'done',
+  ].join('\n')
+  return [
+    `cd ${quoteShellArg(root)}`,
+    'tmp=$(mktemp)',
+    'trap \'rm -f -- "$tmp"\' EXIT HUP INT TERM',
+    `xargs -0 -r -n 32 sh -c ${quoteShellArg(guardChild)} sh < "$tmp"`,
+    `xargs -0 -r -n 32 sh -c ${quoteShellArg(unlinkChild)} sh < "$tmp"`,
+  ].join(' && ')
+}
+
+
 /** Extract a PAX archive into the guarded workspace root. */
 export function remoteWriteFilesScript(input: RemoteBatchPathScriptInput): string {
   return `${remoteBatchGuardScript(input)}\ncd ${quoteShellArg(input.root)} && tar -x --unlink-first -f -`

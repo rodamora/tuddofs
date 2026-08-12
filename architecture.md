@@ -305,10 +305,14 @@ Two independent halves. The `BlobStore` SPI already declares `presignPut(key, {t
 
 Large changed files upload direct from the target via `exec(curl …)` against a presigned PUT with the claimed sha pinned as a signed checksum header (S3/MinIO enforce this). On a store without checksum enforcement: upload to a quarantine key, re-hash server-side via GET stream, then server-side copy to the CAS key. Existence+size alone is NOT verification — a lying target could otherwise poison the CAS entry for a sha other branches later dedupe against.
 
-**AMENDED at S4 — download symmetry:** hydration is the download half of the
+**AMENDED at S4 — download symmetry and write confinement:** hydration is the download half of the
 same transfer contract. With `transport: 'presigned'`, object-backed branch
 entries use target-direct presigned GETs and inline entries use the batch relay;
-the one transport declaration governs both upload and download. The target
+the one transport declaration governs both upload and download. Before curl,
+one O(1)-argv guard/unlink exec consumes a NUL-delimited list, dedupes parent
+guards with `pwd -P`, and removes existing member symlinks; curl then runs in a
+second exec with its config on stdin. The guard-to-curl gap has the same
+guard-then-write TOCTOU shape as tar's guard-then-extract path. The target
 still reads back the verify sample and re-hashes it before marking the mount
 hydrated.
 
