@@ -22,4 +22,15 @@ export default tseslint.config(
       '@typescript-eslint/require-await': 'off',
     },
   },
+  {
+    files: ['examples/**/*.ts'],
+    rules: {
+      '@typescript-eslint/no-unsafe-assignment': 'off',
+      '@typescript-eslint/no-unsafe-call': 'off',
+      '@typescript-eslint/no-unsafe-member-access': 'off',
+      '@typescript-eslint/no-unsafe-return': 'off',
+      '@typescript-eslint/no-unnecessary-type-assertion': 'off',
+      '@typescript-eslint/restrict-plus-operands': 'off',
+    },
+  },
 )

@@ -1,5 +1,5 @@
 {
   "extends": "./tsconfig.typecheck.json",
-  "include": ["src", "scripts", "packages/s3/src", "packages/s3/test"],
+  "include": ["src", "scripts", "examples", "packages/s3/src", "packages/s3/test"],
   "exclude": []
 }
