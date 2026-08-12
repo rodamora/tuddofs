@@ -90,7 +90,7 @@ export async function startContainerSshHost(variant: 'gnu' | 'busybox'): Promise
   const publicKey = await readFile(`${identityFile}.pub`, 'utf8')
 
   const image = await GenericContainer.fromDockerfile(DOCKERFILE_CONTEXT)
-    .withBuildArgs({ EXTRA_PACKAGES: variant === 'gnu' ? 'coreutils findutils' : '' })
+    .withBuildArgs({ EXTRA_PACKAGES: variant === 'gnu' ? 'coreutils findutils tar' : '' })
     .build(`tuddofs-sshd-${variant}:test`, { deleteOnExit: false })
   const container: StartedTestContainer = await image
     .withExposedPorts(22)

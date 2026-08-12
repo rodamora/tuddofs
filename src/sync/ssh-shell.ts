@@ -207,6 +207,16 @@ export function remoteGuardScript(input: RemotePathScriptInput): string {
   return lines.join('\n')
 }
 
+/** Extract a PAX archive into the guarded workspace root. */
+export function remoteWriteFilesScript(root: string): string {
+  return `cd ${quoteShellArg(root)} && tar -x --unlink-first -f -`
+}
+
+/** Create a NUL-list-driven POSIX PAX archive from the guarded workspace root. */
+export function remoteReadFilesScript(root: string): string {
+  return `cd ${quoteShellArg(root)} && tar -c --format=posix --null --files-from=- -f -`
+}
+
 /** Guarded `cat`: the file's bytes are the remote command's stdout, unmodified. */
 export function remoteReadScript(input: RemotePathScriptInput): string {
   return `${remoteGuardScript({ ...input, refuseSymlink: true })}\ncat -- "$p"`

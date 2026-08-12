@@ -151,6 +151,9 @@ const DEFAULT_VERIFY_SAMPLE_SIZE = 3
  */
 const DEFAULT_LARGE_BLOB_THRESHOLD_BYTES = 8 * 1024 * 1024
 
+/** One batch carries at most this many bytes, bounding target-transfer RSS. */
+const MAX_BATCH_PAYLOAD_BYTES = 32 * 1024 * 1024
+
 /** One upload exec may be moving gigabytes over an arbitrary link; an hour, not the two-minute exec default. */
 const DEFAULT_UPLOAD_TIMEOUT_MS = 3_600_000
 
@@ -200,8 +203,9 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
   const root = posix.resolve(options.root)
   const events = options.events ?? {}
   const now = options.now ?? (() => Date.now())
-  const verifySampleSize = options.verifySampleSize ?? DEFAULT_VERIFY_SAMPLE_SIZE
   const directUpload = options.largeBlobs?.transport === 'presigned'
+  const batchFetch = target.readFiles !== undefined
+  const verifySampleSize = options.verifySampleSize ?? DEFAULT_VERIFY_SAMPLE_SIZE
   const thresholdBytes = options.largeBlobs?.thresholdBytes ?? DEFAULT_LARGE_BLOB_THRESHOLD_BYTES
   const uploadTtlSeconds = options.largeBlobs?.ttlSeconds
   const uploadTimeoutMs = options.largeBlobs?.uploadTimeoutMs ?? DEFAULT_UPLOAD_TIMEOUT_MS
@@ -309,14 +313,132 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
     )
   }
 
-  /** Fetch a governed file and put it on disk, replacing whatever is there. */
-  const materializePath = async (mountKey: string, path: string): Promise<void> => {
-    const bytes = await session.mount(mountKey).readBytes(path)
-    const mirror = mirrorPath(mountKey, path)
-    await target.mkdir(posix.dirname(mirror))
-    await target.writeFile(mirror, bytes)
-    entriesFor(mountKey).set(path, { sha256: sha256(bytes) })
+  type MaterializeRequest = {
+    readonly mountKey: string
+    readonly path: string
   }
+
+  type MaterializedFile = MaterializeRequest & {
+    readonly mirror: string
+    readonly bytes: Buffer
+  }
+
+  /**
+   * Write a sequence of already-loaded files in bounded chunks. Targets that
+   * expose the optional batch verb own parent-directory creation; the
+   * fallback deliberately preserves the old mkdir/write loop.
+   */
+  const writeFilesBatched = async (files: readonly { path: string; bytes: Buffer }[]): Promise<void> => {
+    if (files.length === 0) return
+    if (!target.writeFiles) {
+      for (const file of files) {
+        await target.mkdir(posix.dirname(file.path))
+        await target.writeFile(file.path, file.bytes)
+      }
+      return
+    }
+
+    let chunk: { path: string; bytes: Buffer }[] = []
+    let chunkBytes = 0
+    const flush = async (): Promise<void> => {
+      if (chunk.length === 0) return
+      await target.writeFiles?.(chunk, { timeoutMs: uploadTimeoutMs })
+      chunk = []
+      chunkBytes = 0
+    }
+    for (const file of files) {
+      if (chunk.length > 0 && chunkBytes + file.bytes.length > MAX_BATCH_PAYLOAD_BYTES) await flush()
+      chunk.push(file)
+      chunkBytes += file.bytes.length
+      // A single file cannot be split at the seam. Keep it in its own chunk.
+      if (file.bytes.length >= MAX_BATCH_PAYLOAD_BYTES) await flush()
+    }
+    await flush()
+  }
+
+  type BatchReadRequest = {
+    readonly path: string
+    /** Target-reported size is a chunking hint, never a source of identity. */
+    readonly claimedSize?: number
+  }
+
+  /**
+   * Fetch files in size-steered chunks. The map is checked for every requested
+   * member so a malformed all-or-error target result cannot become an empty
+   * capture.
+   */
+  const readFilesBatched = async (requests: readonly BatchReadRequest[]): Promise<ReadonlyMap<string, Buffer>> => {
+    const fetched = new Map<string, Buffer>()
+    if (requests.length === 0) return fetched
+    if (!target.readFiles) {
+      for (const request of requests) fetched.set(request.path, await target.readFile(request.path))
+      return fetched
+    }
+
+    let chunk: BatchReadRequest[] = []
+    let chunkBytes = 0
+    const flush = async (): Promise<void> => {
+      if (chunk.length === 0) return
+      const paths = chunk.map(request => request.path)
+      const result = await target.readFiles?.(paths, { timeoutMs: uploadTimeoutMs })
+      for (const path of paths) {
+        const bytes = result?.get(path)
+        if (!Buffer.isBuffer(bytes)) throw new SyncTargetError(`Batch read did not return ${path}`)
+        fetched.set(path, bytes)
+      }
+      chunk = []
+      chunkBytes = 0
+    }
+    for (const request of requests) {
+      const claimedSize = request.claimedSize
+      const estimate =
+        claimedSize !== undefined && Number.isFinite(claimedSize) && claimedSize > 0 ? claimedSize : 0
+      if (chunk.length > 0 && chunkBytes + estimate > MAX_BATCH_PAYLOAD_BYTES) await flush()
+      chunk.push(request)
+      chunkBytes += estimate
+      if (estimate >= MAX_BATCH_PAYLOAD_BYTES) await flush()
+    }
+    await flush()
+    return fetched
+  }
+
+  /** Materialize requested branch files without retaining more than one chunk. */
+  const materializeRequests = async (requests: readonly MaterializeRequest[]): Promise<void> => {
+    if (!target.writeFiles) {
+      for (const request of requests) {
+        const bytes = await session.mount(request.mountKey).readBytes(request.path)
+        const mirror = mirrorPath(request.mountKey, request.path)
+        await writeFilesBatched([{ path: mirror, bytes }])
+        entriesFor(request.mountKey).set(request.path, { sha256: sha256(bytes) })
+      }
+      return
+    }
+
+    let chunk: MaterializedFile[] = []
+    let chunkBytes = 0
+    const flush = async (): Promise<void> => {
+      if (chunk.length === 0) return
+      await writeFilesBatched(chunk.map(file => ({ path: file.mirror, bytes: file.bytes })))
+      for (const file of chunk) entriesFor(file.mountKey).set(file.path, { sha256: sha256(file.bytes) })
+      chunk = []
+      chunkBytes = 0
+    }
+    for (const request of requests) {
+      const bytes = await session.mount(request.mountKey).readBytes(request.path)
+      const file: MaterializedFile = {
+        ...request,
+        mirror: mirrorPath(request.mountKey, request.path),
+        bytes,
+      }
+      if (chunk.length > 0 && chunkBytes + bytes.length > MAX_BATCH_PAYLOAD_BYTES) await flush()
+      chunk.push(file)
+      chunkBytes += bytes.length
+      if (bytes.length >= MAX_BATCH_PAYLOAD_BYTES) await flush()
+    }
+    await flush()
+  }
+
+
 
   const hydrate = async (mount: SessionMount): Promise<void> => {
     const handle = session.mount(mount.key)
@@ -328,14 +450,38 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
       await runExec(chmodWritableCommand(root, mirrorDirName(mount.key)), 'read-only unfreeze')
 
     const seeded = new Map<string, IndexEntry>()
-    for (const entry of entries) {
-      if (entry.sha256 === undefined) {
-        throw new InvariantError(`Branch view entry without a sha: ${entry.path}`, { mount: mount.key })
+    if (!target.writeFiles) {
+      for (const entry of entries) {
+        if (entry.sha256 === undefined) {
+          throw new InvariantError(`Branch view entry without a sha: ${entry.path}`, { mount: mount.key })
+        }
+        const mirror = resolveUnderRoot(root, posix.join(mirrorDirName(mount.key), entry.path.slice(1)))
+        const bytes = await handle.readBytes(entry.path)
+        await writeFilesBatched([{ path: mirror, bytes }])
+        seeded.set(entry.path, { sha256: entry.sha256 })
       }
-      const mirror = resolveUnderRoot(root, posix.join(mirrorDirName(mount.key), entry.path.slice(1)))
-      await target.mkdir(posix.dirname(mirror))
-      await target.writeFile(mirror, await handle.readBytes(entry.path))
-      seeded.set(entry.path, { sha256: entry.sha256 })
+    } else {
+      let chunk: { path: string; bytes: Buffer }[] = []
+      let chunkBytes = 0
+      const flush = async (): Promise<void> => {
+        if (chunk.length === 0) return
+        await writeFilesBatched(chunk)
+        chunk = []
+        chunkBytes = 0
+      }
+      for (const entry of entries) {
+        if (entry.sha256 === undefined) {
+          throw new InvariantError(`Branch view entry without a sha: ${entry.path}`, { mount: mount.key })
+        }
+        const mirror = resolveUnderRoot(root, posix.join(mirrorDirName(mount.key), entry.path.slice(1)))
+        const bytes = await handle.readBytes(entry.path)
+        if (chunk.length > 0 && chunkBytes + bytes.length > MAX_BATCH_PAYLOAD_BYTES) await flush()
+        chunk.push({ path: mirror, bytes })
+        chunkBytes += bytes.length
+        seeded.set(entry.path, { sha256: entry.sha256 })
+        if (bytes.length >= MAX_BATCH_PAYLOAD_BYTES) await flush()
+      }
+      await flush()
     }
 
     // Spot-check the transfer rather than trusting the target's write (§7.3).
@@ -343,12 +489,15 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
       (_path, position, all) =>
         position === 0 || position === all.length - 1 || position === Math.floor(all.length / 2),
     )
-    for (const path of sample.slice(0, verifySampleSize)) {
-      const observed = sha256(
-        await target.readFile(resolveUnderRoot(root, posix.join(mirrorDirName(mount.key), path.slice(1)))),
-      )
-      if (observed !== seeded.get(path)?.sha256) {
-        throw new SyncTargetError(`Materialized ${mount.key}:${path} does not match the branch view`)
+    const sampleMirrors = sample
+      .slice(0, verifySampleSize)
+      .map(path => resolveUnderRoot(root, posix.join(mirrorDirName(mount.key), path.slice(1))))
+    const observed = await readFilesBatched(sampleMirrors.map(path => ({ path })))
+    for (const path of sampleMirrors) {
+      const relativePath = posix.relative(mountDir, path)
+      const expectedPath = `/${relativePath}`
+      if (sha256(observed.get(path) as Buffer) !== seeded.get(expectedPath)?.sha256) {
+        throw new SyncTargetError(`Materialized ${mount.key}:${expectedPath} does not match the branch view`)
       }
     }
 
@@ -455,14 +604,14 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
   const guarded = (entry: IndexEntry): boolean => entry.unconfirmed === true && entry.writeEpoch === execEpoch
 
   const restageDirty = async (): Promise<void> => {
+    const requests: MaterializeRequest[] = []
     for (const [mountKey, entries] of index) {
       for (const [path, entry] of entries) {
-        if (entry.dirty) await materializePath(mountKey, path)
+        if (entry.dirty) requests.push({ mountKey, path })
       }
     }
+    await materializeRequests(requests)
   }
-
-  /** `path`'s before/after shas across one parent→commit step, memoized per pair. */
   const pathDelta = async (
     parent: string,
     commitSha: string,
@@ -614,12 +763,12 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
       }
       paths.set(record.path, record.sha256)
     }
-    // Sizes come from the same `find` list the scan hashed, and only when the
-    // §8.2 transport needs them to route a file. Like mtime, a target-reported
+    // Sizes come from the same `find` list the scan hashed whenever the engine
+    // will batch-fetch or route a direct upload. Like mtime, a target-reported
     // size is a prefilter and never commit identity (§7.4): the store reports
     // the length that reaches the tree.
     const sizes = new Map<string, Map<string, number>>()
-    if (directUpload && scan.output.length > 0) {
+    if ((directUpload || batchFetch) && scan.output.length > 0) {
       const measured = await runExec(sizeCommand(root), 'capture size probe')
       for (const record of parseSizeRecords(measured.output, mirrorDirs)) {
         let paths = sizes.get(record.mountKey)
@@ -696,7 +845,7 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
         }
         continue
       }
-      for (const path of restage) await materializePath(mount.key, path)
+      await materializeRequests(restage.map(path => ({ mountKey: mount.key, path })))
       if (changed.length === 0 && deletes.length === 0) continue
 
       // Small files come back through the server and the kernel re-hashes them;
@@ -707,25 +856,33 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
       const writes: CaptureWrite[] = []
       const capturedShas = new Map<string, string>()
       const mountSizes = sizes.get(mount.key)
+      const small = new Map<string, { mirror: string; claimedSize?: number }>()
       for (const path of changed) {
         const mirror = mirrorPath(mount.key, path)
         const claimedSha = seen.get(path) as string
         const claimedSize = mountSizes?.get(path)
-        if (directUpload && claimedSize === undefined) {
-          // The size probe read the very list the scan hashed, so a changed path
-          // missing from it means the two execs disagree about what is on disk.
-          // Guessing here would silently route a 2 GB file through readFile.
+        if ((directUpload || batchFetch) && claimedSize === undefined) {
+          // The size probe read the very list the scan hashed, so a changed
+          // path missing from it means the two execs disagree about disk.
           throw new InvariantError(`No size observed for changed path ${path}`, { mount: mount.key })
         }
-        if (claimedSize === undefined || claimedSize < thresholdBytes) {
-          const bytes = await target.readFile(mirror)
-          writes.push({ path, bytes })
-          capturedShas.set(path, sha256(bytes))
+        if (!directUpload || (claimedSize as number) < thresholdBytes) {
+          small.set(path, { mirror, ...(claimedSize === undefined ? {} : { claimedSize }) })
           continue
         }
-        const stored = await uploadCaptured(mount.key, path, mirror, claimedSha, BigInt(claimedSize))
+        const stored = await uploadCaptured(mount.key, path, mirror, claimedSha, BigInt(claimedSize as number))
         writes.push({ path, sha256: stored.sha256, sizeBytes: stored.sizeBytes })
         capturedShas.set(path, stored.sha256)
+      }
+
+      const fetched = await readFilesBatched(
+        [...small].map(([path, request]) => ({ path: request.mirror, claimedSize: request.claimedSize })),
+      )
+      for (const [path, request] of small) {
+        const bytes = fetched.get(request.mirror)
+        if (!bytes) throw new SyncTargetError(`Batch read did not return ${request.mirror}`)
+        writes.push({ path, bytes })
+        capturedShas.set(path, sha256(bytes))
       }
       const result = await session.mount(mount.key).capture({ writes, deletes })
       for (const path of result.changedPaths) {
