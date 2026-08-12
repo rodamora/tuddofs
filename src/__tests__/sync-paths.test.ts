@@ -96,6 +96,29 @@ test('scan and stamp commands quote every interpolated value and gate on find su
     'sha256sum --version && find --version && stat --version && curl --version',
   )
 })
+test('probe omits target-specific binary checks when none are required', () => {
+  assert.equal(probeCommand({ requiredBinaries: [] }), 'sha256sum --version && find --version')
+})
+
+test('probe checks one required binary exactly once', () => {
+  const command = probeCommand({ requiredBinaries: ['tar'] })
+  assert.equal(command, 'sha256sum --version && find --version && tar --version')
+  assert.equal(command.match(/(?:^| && )tar --version(?:$| && )/gu)?.length, 1)
+})
+
+test('probe checks several required binaries exactly once alongside engine checks', () => {
+  const command = probeCommand({
+    directUpload: true,
+    requiredBinaries: ['tar', 'curl-config', 'xz'],
+  })
+  assert.equal(
+    command,
+    'sha256sum --version && find --version && stat --version && curl --version && tar --version && curl-config --version && xz --version',
+  )
+  for (const binary of ['tar', 'curl-config', 'xz']) {
+    assert.equal(command.match(new RegExp(`(?:^| && )${binary} --version(?:$| && )`, 'gu'))?.length, 1)
+  }
+})
 
 test('scan records map mirror paths back to mount keys and kernel paths', () => {
   const dirs = new Map([

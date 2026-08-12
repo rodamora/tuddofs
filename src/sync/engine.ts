@@ -391,7 +391,7 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
     // GNU coreutils are required: busybox lacks `--zero`. With the §8.2
     // transport, `stat` and `curl` join them. Fail at acquire, not silently at
     // capture (§7.3 phase 1 step 1).
-    await runExec(probeCommand({ directUpload }), 'GNU coreutils probe')
+    await runExec(probeCommand({ directUpload, requiredBinaries: target.requiredBinaries ?? [] }), 'GNU coreutils probe')
     const state = await runExec(hydrationManifestCommand(root), 'workspace state probe')
     const lines = state.output.split('\n').filter(Boolean)
     const stampPresent = lines.includes(STAMP_FILENAME)
