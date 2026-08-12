@@ -8,8 +8,8 @@
  * — and the internal subpath is where it stays until a host case argues for
  * Tier 1, which would be an additive change.
  */
-export { createSyncEngine } from './engine.js'
-export type { SyncEngine, SyncEngineEvents, SyncEngineOptions } from './engine.js'
+export { buildCurlGetConfig, createSyncEngine } from './engine.js'
+export type { CurlGetConfigEntry, LargeBlobOptions, SyncEngine, SyncEngineEvents, SyncEngineOptions } from './engine.js'
 export { createLocalDirectoryTarget } from './local.js'
 export type { LocalDirectoryTarget, LocalDirectoryTargetOptions } from './local.js'
 export { createSshTarget } from './ssh.js'
@@ -20,15 +20,17 @@ export {
   remoteExecScript,
   remoteGuardScript,
   remoteMkdirScript,
+  remoteReadFilesScript,
   remoteReadScript,
   remoteRootScript,
+  remoteWriteFilesScript,
   remoteWriteScript,
   sshArgv,
   sshDestination,
   EXEC_SENTINEL_PREFIX,
   GUARD_EXIT,
 } from './ssh-shell.js'
-export type { RemotePathScriptInput, SshConnectionOptions } from './ssh-shell.js'
+export type { RemoteBatchPathScriptInput, RemotePathScriptInput, SshConnectionOptions } from './ssh-shell.js'
 export { SyncTargetError } from './errors.js'
 export type { ExecOptions, ExecResult, SyncTarget } from './target.js'
 export {

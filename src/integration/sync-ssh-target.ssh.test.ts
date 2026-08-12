@@ -14,10 +14,19 @@
  */
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
+import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import posix from 'node:path/posix'
 import test from 'node:test'
 
-import { InvalidPathError, SyncTargetError, createSshTarget, quoteShellArg, type SshTarget } from '../internal.js'
+import {
+  InvalidPathError,
+  SyncTargetError,
+  createSshTarget,
+  probeCommand,
+  quoteShellArg,
+  type SshTarget,
+} from '../internal.js'
 import { externalSshHost, remoteDisk, startContainerSshHost, type SshHost } from './ssh-host.js'
 import { controlledTarget, runKillMatrix, type KillMatrixWorkspace } from './sync-kill-matrix.js'
 
@@ -63,6 +72,12 @@ async function createSshWorkspace(): Promise<KillMatrixWorkspace> {
     },
     async mkdir(path) {
       return simulatedKill ? dead() : raw.mkdir(path)
+    },
+    async writeFiles(files, options) {
+      return simulatedKill ? dead() : raw.writeFiles!(files, options)
+    },
+    async readFiles(paths, options) {
+      return simulatedKill ? dead() : raw.readFiles!(paths, options)
     },
   }
   const controlled = controlledTarget(killable)
@@ -302,4 +317,174 @@ test('[ssh] a missing ssh client is reported as a target failure naming the requ
     assert.match(error.message, /ssh client .* is not available/u)
     return true
   })
+})
+
+test('[ssh] batch verbs round-trip hostile paths, replace symlinks, and reject symlink reads', async () => {
+  const sshHost = await host()
+  const root = posix.join(sshHost.workspaceBase, `batch-${randomUUID()}`)
+  const target = createSshTarget(sshHost.targetOptions(root))
+  assert.deepEqual(target.requiredBinaries, ['tar'])
+
+  const longPath = `${'a'.repeat(100)}/${'b'.repeat(100)}/${'c'.repeat(100)}.txt`
+  const files = [
+    { path: posix.join(root, 'newline\nname.txt'), bytes: Buffer.from('newline bytes') },
+    { path: posix.join(root, `quote'and"percent%.txt`), bytes: Buffer.from([0, 1, 2, 255]) },
+    { path: posix.join(root, 'non-\u00e9\u{1F600}.txt'), bytes: Buffer.from('unicode bytes') },
+    { path: posix.join(root, longPath), bytes: Buffer.from('long path bytes') },
+  ]
+
+  await target.writeFiles!(files, { timeoutMs: 30_000 })
+  const read = await target.readFiles!(
+    files.map(file => file.path),
+    { timeoutMs: 30_000 },
+  )
+  assert.equal(read.size, files.length)
+  for (const file of files) assert.deepEqual(read.get(file.path), file.bytes)
+
+  const symlinkPath = posix.join(root, 'replace-me.txt')
+  const outsidePath = posix.join(sshHost.workspaceBase, `batch-outside-${randomUUID()}.txt`)
+  const outside = createSshTarget(sshHost.targetOptions(sshHost.workspaceBase))
+  await outside.writeFile(outsidePath, Buffer.from('outside'))
+  assert.equal((await outside.exec(`ln -s ${quoteShellArg(outsidePath)} ${quoteShellArg(symlinkPath)}`)).exitCode, 0)
+  await target.writeFiles!([{ path: symlinkPath, bytes: Buffer.from('replaced') }])
+  assert.deepEqual(await target.readFile(symlinkPath), Buffer.from('replaced'))
+  assert.deepEqual(await outside.readFile(outsidePath), Buffer.from('outside'))
+
+  const swappedPath = posix.join(root, 'swapped.txt')
+  await target.writeFile(swappedPath, Buffer.from('regular'))
+  assert.equal(
+    (
+      await outside.exec(
+        `rm -f ${quoteShellArg(swappedPath)} && ln -s ${quoteShellArg(outsidePath)} ${quoteShellArg(swappedPath)}`,
+      )
+    ).exitCode,
+    0,
+  )
+  await assert.rejects(target.readFiles!([swappedPath]), SyncTargetError)
+
+  await outside.exec(`rm -rf ${quoteShellArg(root)} ${quoteShellArg(outsidePath)}`)
+})
+
+test('[ssh] batch guard script deduplicates repeated parent directories', async () => {
+  const sshHost = await host()
+  const root = posix.join(sshHost.workspaceBase, `batch-guard-scale-${randomUUID()}`)
+  const captureDir = await mkdtemp(posix.join(tmpdir(), 'tuddofs-ssh-guard-'))
+  const wrapper = posix.join(captureDir, 'ssh')
+  const captureScript = posix.join(captureDir, 'script')
+  const directories = Array.from({ length: 5 }, (_, index) => posix.join(root, `dir-${index}`))
+  const largeFiles = Array.from({ length: 200 }, (_, index) => ({
+    path: posix.join(directories[index % directories.length], `large-${index}.txt`),
+    bytes: Buffer.from([index % 256]),
+  }))
+  const smallFiles = Array.from({ length: 10 }, (_, index) => ({
+    path: posix.join(directories[index % directories.length], `small-${index}.txt`),
+    bytes: Buffer.from([index % 256]),
+  }))
+
+  await writeFile(
+    wrapper,
+    `#!/bin/sh
+script=
+for arg do script="$arg"; done
+case "$script" in
+  mkdir\\ -p\\ *) printf '%s\\n' "$TUDDOFS_CAPTURE_ROOT" ;;
+  *) printf '%s' "$script" > "$TUDDOFS_CAPTURE_SCRIPT" ;;
+esac
+`,
+  )
+  await chmod(wrapper, 0o755)
+
+  const target = createSshTarget({
+    ...sshHost.targetOptions(root),
+    sshBinary: wrapper,
+    env: {
+      ...process.env,
+      TUDDOFS_CAPTURE_ROOT: root,
+      TUDDOFS_CAPTURE_SCRIPT: captureScript,
+    },
+  })
+
+  try {
+    await target.writeFiles!(largeFiles)
+    const largeScript = await readFile(captureScript, 'utf8')
+    await target.writeFiles!(smallFiles)
+    const smallScript = await readFile(captureScript, 'utf8')
+
+    assert.equal(largeScript.length, smallScript.length)
+    assert.ok(largeScript.length < 10_000)
+  } finally {
+    await rm(captureDir, { recursive: true, force: true })
+  }
+})
+test('[ssh] batch verbs refuse directory symlink traversal without touching the target', async () => {
+  const sshHost = await host()
+  const base = posix.join(sshHost.workspaceBase, `batch-symlink-${randomUUID()}`)
+  const root = posix.join(base, 'workspace')
+  const outsideDir = posix.join(base, 'outside')
+  const outsideFile = posix.join(outsideDir, 'secret.txt')
+  const link = posix.join(root, 'mnt', 'outside')
+  const target = createSshTarget(sshHost.targetOptions(root))
+  const outside = createSshTarget(sshHost.targetOptions(base))
+
+  try {
+    await target.mkdir(posix.join(root, 'mnt'))
+    await outside.mkdir(outsideDir)
+    await outside.writeFile(outsideFile, Buffer.from('outside bytes'))
+    assert.equal((await outside.exec(`ln -s ${quoteShellArg(outsideDir)} ${quoteShellArg(link)}`)).exitCode, 0)
+
+    await assert.rejects(
+      target.writeFiles!([{ path: posix.join(link, 'written.txt'), bytes: Buffer.from('must not escape') }]),
+      InvalidPathError,
+    )
+    assert.equal((await outside.exec(`test ! -e ${quoteShellArg(posix.join(outsideDir, 'written.txt'))}`)).exitCode, 0)
+
+    await assert.rejects(target.readFiles!([posix.join(link, 'secret.txt')]), InvalidPathError)
+  } finally {
+    await outside.exec(`rm -rf ${quoteShellArg(base)}`).catch(() => undefined)
+  }
+})
+
+test('[ssh] batch verbs reject a failed tar and probe tar as a required binary', async () => {
+  const sshHost = await host()
+  const root = posix.join(sshHost.workspaceBase, `batch-failure-${randomUUID()}`)
+  const target = createSshTarget(sshHost.targetOptions(root))
+
+  await assert.rejects(target.readFiles!([posix.join(root, 'missing.txt')]), SyncTargetError)
+
+  const probe = await target.exec(`tar() { return 1; }; ${probeCommand({ requiredBinaries: target.requiredBinaries })}`)
+  assert.notEqual(probe.exitCode, 0)
+
+  await target.exec(`rm -rf ${quoteShellArg(root)}`)
+})
+
+test('[ssh] a truncated batch archive is a typed whole-call failure', async () => {
+  const sshHost = await host()
+  const root = posix.join(sshHost.workspaceBase, `batch-truncated-${randomUUID()}`)
+  const remotePath = posix.join(root, 'truncated.txt')
+  const target = createSshTarget(sshHost.targetOptions(root))
+  await target.writeFile(remotePath, Buffer.from('bytes'))
+
+  const wrapperDir = await mkdtemp(posix.join(tmpdir(), 'tuddofs-ssh-wrapper-'))
+  const wrapper = posix.join(wrapperDir, 'ssh')
+  await writeFile(
+    wrapper,
+    `#!/bin/sh
+case "$*" in
+  *"tar -c --format=posix"*) printf truncated; exit 0 ;;
+  *) exec /usr/bin/ssh "$@" ;;
+esac
+`,
+  )
+  await chmod(wrapper, 0o755)
+  const truncatedTarget = createSshTarget({ ...sshHost.targetOptions(root), sshBinary: wrapper })
+  try {
+    await assert.rejects(truncatedTarget.readFiles!([remotePath]), (error: unknown) => {
+      assert.ok(error instanceof SyncTargetError)
+      assert.equal(error.name, 'TarParseError')
+      return true
+    })
+  } finally {
+    await rm(wrapperDir, { recursive: true, force: true })
+    await target.exec(`rm -rf ${quoteShellArg(root)}`)
+  }
 })

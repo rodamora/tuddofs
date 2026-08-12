@@ -2,8 +2,8 @@
 # target 2, §13.4). Test infrastructure only — never a production image.
 #
 # EXTRA_PACKAGES selects the two hosts the suite needs:
-#   "coreutils findutils"  GNU host: `sha256sum --zero` and `find -print0` exist,
-#                          so the §7.3 phase-1 probe passes and the kill matrix runs.
+#   "coreutils findutils tar" GNU host: `sha256sum --zero`, `find -print0`, and
+#                          POSIX/GNU tar exist, so the §7.3 phase-1 probe passes.
 #   ""                     busybox host: the probe MUST fail loudly at acquire.
 #
 # Key-based auth only. Authorized keys are injected at container start from a

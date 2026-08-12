@@ -112,12 +112,14 @@ export function createLocalDirectoryTarget(options: LocalDirectoryTargetOptions)
         const child = spawn(shell, ['-c', cmd], {
           cwd: root,
           env: options.env ?? process.env,
-          stdio: ['ignore', 'pipe', 'pipe'],
+          stdio: ['pipe', 'pipe', 'pipe'],
           // Its own process group, so a timeout kills the command AND everything
           // it spawned. Killing only the shell leaves grandchildren holding the
           // stdio pipes open and the exec never settles.
           detached: true,
         })
+        child.stdin.on('error', () => undefined)
+        child.stdin.end(execOptions.stdin)
         // Buffers are concatenated only at close: decoding per chunk would split
         // a multi-byte filename across reads and corrupt scan output.
         const chunks: Buffer[] = []

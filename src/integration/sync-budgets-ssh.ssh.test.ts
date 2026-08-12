@@ -55,7 +55,7 @@ const mount = 'project:docs'
 /** Fewer samples than the local suite: every run here is a real ssh session. */
 const SAMPLES = 5
 const WARMUPS = 2
-
+const BATCH_BYTES = 32 * 1024 * 1024
 let sshHost: Promise<SshHost> | undefined
 const workspaces: string[] = []
 
@@ -177,6 +177,8 @@ interface VerbCounts {
   readFile: number
   writeFile: number
   mkdir: number
+  writeFiles: number
+  readFiles: number
 }
 
 /**
@@ -186,7 +188,38 @@ interface VerbCounts {
  * loopback"; the counts can.
  */
 function counting(target: SyncTarget): { readonly target: SyncTarget; readonly counts: VerbCounts; reset(): void } {
-  const counts = { exec: 0, readFile: 0, writeFile: 0, mkdir: 0 }
+  const counts: VerbCounts = { exec: 0, readFile: 0, writeFile: 0, mkdir: 0, writeFiles: 0, readFiles: 0 }
+  const wrapped: SyncTarget = {
+    ...target,
+    exec: (cmd, opts) => {
+      counts.exec += 1
+      return target.exec(cmd, opts)
+    },
+    readFile: path => {
+      counts.readFile += 1
+      return target.readFile(path)
+    },
+    writeFile: (path, bytes) => {
+      counts.writeFile += 1
+      return target.writeFile(path, bytes)
+    },
+    mkdir: path => {
+      counts.mkdir += 1
+      return target.mkdir(path)
+    },
+  }
+  if (target.writeFiles !== undefined) {
+    wrapped.writeFiles = (files, opts) => {
+      counts.writeFiles += 1
+      return target.writeFiles!(files, opts)
+    }
+  }
+  if (target.readFiles !== undefined) {
+    wrapped.readFiles = (paths, opts) => {
+      counts.readFiles += 1
+      return target.readFiles!(paths, opts)
+    }
+  }
   return {
     counts,
     reset() {
@@ -194,26 +227,16 @@ function counting(target: SyncTarget): { readonly target: SyncTarget; readonly c
       counts.readFile = 0
       counts.writeFile = 0
       counts.mkdir = 0
+      counts.writeFiles = 0
+      counts.readFiles = 0
     },
-    target: {
-      exec: (cmd, opts) => {
-        counts.exec += 1
-        return target.exec(cmd, opts)
-      },
-      readFile: path => {
-        counts.readFile += 1
-        return target.readFile(path)
-      },
-      writeFile: (path, bytes) => {
-        counts.writeFile += 1
-        return target.writeFile(path, bytes)
-      },
-      mkdir: path => {
-        counts.mkdir += 1
-        return target.mkdir(path)
-      },
-    },
+    target: wrapped,
   }
+}
+
+/** Count the probe/stamp execs and optional batch transfers, not marker writes. */
+function batchExecs(counts: VerbCounts): number {
+  return counts.exec + counts.writeFiles + counts.readFiles
 }
 
 test('§12 [ssh] warm re-acquire is one liveness probe, not a reseed', async () => {
@@ -232,11 +255,9 @@ test('§12 [ssh] warm re-acquire is one liveness probe, not a reseed', async () 
   // hydrate of this workspace really does transfer every file — plus the
   // hydration marker it writes last — so "zero transfers" is a property of the
   // warm path and not of the counter.
-  assert.equal(
-    cold.writeFile,
-    files + 1,
-    `cold hydrate must transfer ${files} files plus the hydration marker, counted ${cold.writeFile}`,
-  )
+  assert.equal(cold.writeFiles, 1, `cold hydrate must batch file transfers, counted ${cold.writeFiles} batches`)
+  assert.equal(cold.readFiles, 1, `cold hydrate must batch verification, counted ${cold.readFiles} batches`)
+  assert.equal(cold.writeFile, 1, `cold hydrate must write one hydration marker, counted ${cold.writeFile}`)
 
   const worst = { exec: 0, readFile: 0, writeFile: 0, mkdir: 0 }
   const elapsed = await best('warm re-acquire', async () => {
@@ -262,4 +283,74 @@ test('§12 [ssh] warm re-acquire is one liveness probe, not a reseed', async () 
   // And the wall clock stays the coarse backstop: well below a reseed, well
   // above one probe on a loopback fixture.
   assert.ok(elapsed <= 1_000, `warm re-acquire must stay near one remote exec, measured ${elapsed.toFixed(2)} ms`)
+})
+
+test('§12 [ssh] cold acquire exec count stays O(1) at 200 files', async () => {
+  const { root, target: real } = await freshWorkspace()
+  const probe = counting(real)
+  const target = probe.target
+  const session = await openSession('budget-ssh-cold-execs')
+  const engine = createSyncEngine({ session, target, root })
+  const files = 200
+  const bytes = Buffer.alloc(128 * 1024, 0x61)
+  for (let index = 0; index < files; index += 1) {
+    await session.mount(mount).write(`/cold-${index}.bin`, bytes)
+  }
+
+  await engine.materialize()
+
+  const totalBytes = files * bytes.length
+  const chunks = Math.ceil(totalBytes / BATCH_BYTES)
+  const measured = batchExecs(probe.counts)
+  console.log(
+    `§12 [ssh] cold acquire execs: ${measured} (${files} files, ${totalBytes} bytes, ${chunks} chunks; verbs ${JSON.stringify(probe.counts)})`,
+  )
+  assert.equal(probe.counts.exec, 3)
+  assert.equal(probe.counts.writeFiles, chunks)
+  assert.equal(probe.counts.readFiles, 1)
+  assert.equal(measured, 4 + chunks)
+  assert.ok(measured < files, `cold acquire must not execute once per file, measured ${measured}`)
+})
+
+test('§12 [ssh] capture cycle exec count stays bounded at 50 changed files', async () => {
+  const { root, target: real } = await freshWorkspace()
+  const probe = counting(real)
+  const target = probe.target
+  let captures = 0
+  const session = await openSession('budget-ssh-capture-execs')
+  const engine = createSyncEngine({
+    session,
+    target,
+    root,
+    events: { onCapture: () => (captures += 1) },
+  })
+  const files = 50
+  const before = Buffer.from('before')
+  for (let index = 0; index < files; index += 1) {
+    await session.mount(mount).write(`/changed-${index}.txt`, before)
+  }
+  await engine.materialize()
+  probe.reset()
+
+  const command = Array.from(
+    { length: files },
+    (_, index) => `printf changed > 'project%3Adocs/changed-${index}.txt'`,
+  ).join('; ')
+  assert.equal((await target.exec(command)).exitCode, 0)
+  probe.reset()
+
+  engine.captureAfterExec()
+  await engine.settle()
+
+  const bytes = Buffer.from('changed')
+  const totalBytes = files * bytes.length
+  const chunks = Math.ceil(totalBytes / BATCH_BYTES)
+  const measured = batchExecs(probe.counts)
+  console.log(
+    `§12 [ssh] capture cycle execs: ${measured} (${files} changed files, ${totalBytes} bytes, ${chunks} chunks; verbs ${JSON.stringify(probe.counts)})`,
+  )
+  assert.equal(captures, 1)
+  assert.equal(probe.counts.exec, 3)
+  assert.equal(measured, 3 + chunks)
+  assert.ok(measured <= 4, `capture cycle must stay at four execs, measured ${measured}`)
 })

@@ -64,6 +64,7 @@ export interface UploadCommandInput {
 const COLON_ENCODING = '%3A'
 const HEX_SHA256 = /^[0-9a-f]{64}$/u
 const DECIMAL_SIZE = /^(?:0|[1-9][0-9]*)$/u
+const REQUIRED_BINARY_NAME = /^[A-Za-z0-9._+-]+$/u
 
 /**
  * How far behind the scan start the stamp is set. Filesystem timestamps come
@@ -123,10 +124,22 @@ export function resolveUnderRoot(root: string, candidate: string): string {
  * `stat` sizes the changed set and `curl` performs the presigned PUT. A target
  * missing either would capture happily until the first large file, then fail
  * mid-turn — which is exactly the silence this probe exists to prevent.
+ *
+ * Target implementations may add their own acquire-time requirements through
+ * `requiredBinaries`; each is checked with `--version` beside the engine's
+ * checks (§Design 6 of the sync batching spec).
  */
-export function probeCommand(options: { directUpload?: boolean } = {}): string {
-  const base = 'sha256sum --version && find --version'
-  return options.directUpload ? `${base} && stat --version && curl --version` : base
+export function probeCommand(options: { directUpload?: boolean; requiredBinaries?: readonly string[] } = {}): string {
+  const checks = ['sha256sum --version', 'find --version']
+  if (options.directUpload) checks.push('stat --version', 'curl --version')
+  for (const binary of new Set(options.requiredBinaries ?? [])) {
+    if (typeof binary !== 'string' || !REQUIRED_BINARY_NAME.test(binary)) {
+      throw new InvalidPathError(binary, 'required binary name must match /^[A-Za-z0-9._+-]+$/')
+    }
+    const check = `${binary} --version`
+    if (!checks.includes(check)) checks.push(check)
+  }
+  return checks.join(' && ')
 }
 
 /**

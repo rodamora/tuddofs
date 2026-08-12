@@ -36,19 +36,24 @@ import { randomBytes } from 'node:crypto'
 import { constants as osConstants } from 'node:os'
 import posix from 'node:path/posix'
 
+import { InvalidPathError } from '../validation.js'
 import { SyncTargetError } from './errors.js'
 import {
   guardFailure,
   parseExecSentinel,
   remoteExecScript,
   remoteMkdirScript,
+  remoteReadFilesScript,
   remoteReadScript,
   remoteRootScript,
+  remoteWriteFilesScript,
   remoteWriteScript,
   sshArgv,
   sshDestination,
   type SshConnectionOptions,
 } from './ssh-shell.js'
+import { parsePaxTar, TarParseError, writePaxTar } from './tar.js'
+import { resolveUnderRoot } from './paths.js'
 import type { ExecOptions, ExecResult, SyncTarget } from './target.js'
 
 /** Construction options for {@link createSshTarget}. */
@@ -202,6 +207,7 @@ export function createSshTarget(options: SshTargetOptions): SshTarget {
   return {
     root,
     destination,
+    requiredBinaries: ['tar'],
 
     async exec(cmd: string, execOptions: ExecOptions = {}): Promise<ExecResult> {
       await ensureRoot()
@@ -209,6 +215,7 @@ export function createSshTarget(options: SshTargetOptions): SshTarget {
       const nonce = randomBytes(16).toString('hex')
       const run = await runSsh({
         script: remoteExecScript({ root, command: cmd, timeoutMs, nonce }),
+        ...(execOptions.stdin === undefined ? {} : { stdin: execOptions.stdin }),
         timeoutMs: timeoutMs + LOCAL_TIMEOUT_SLACK_MS,
       })
       const reported = parseExecSentinel(run.stdout.toString('utf8'), nonce)
@@ -233,6 +240,88 @@ export function createSshTarget(options: SshTargetOptions): SshTarget {
 
     async writeFile(path: string, bytes: Buffer): Promise<void> {
       await runGuarded(path, remoteWriteScript, 'write', bytes)
+    },
+
+    async writeFiles(
+      files: readonly { path: string; bytes: Buffer }[],
+      batchOptions: { timeoutMs?: number } = {},
+    ): Promise<void> {
+      if (files.length === 0) return
+      const resolvedRoot = await ensureRoot()
+      const entries = files.map(file => ({
+        path: posix.relative(root, resolveUnderRoot(root, file.path)),
+        bytes: file.bytes,
+      }))
+      const run = await runSsh({
+        script: remoteWriteFilesScript({
+          root,
+          realRoot: resolvedRoot,
+          paths: files.map(file => file.path),
+        }),
+        stdin: writePaxTar(entries),
+        timeoutMs: batchOptions.timeoutMs ?? defaultTimeoutMs,
+      })
+      if (run.exitCode === 0 && !run.timedOut) return
+      const refusal = guardFailure(root, run.exitCode, run.stderr)
+      if (refusal) throw refusal
+      throw new SyncTargetError(
+        run.timedOut ? `write batch timed out on ${destination}` : `write batch failed on ${destination}`,
+        { exitCode: run.exitCode, output: run.stderr || run.stdout.toString('utf8') },
+        { path: root },
+      )
+    },
+
+    async readFiles(
+      paths: readonly string[],
+      batchOptions: { timeoutMs?: number } = {},
+    ): Promise<ReadonlyMap<string, Buffer>> {
+      if (paths.length === 0) return new Map()
+      const resolvedRoot = await ensureRoot()
+      const requested = new Map<string, string[]>()
+      for (const path of paths) {
+        const relative = posix.relative(root, resolveUnderRoot(root, path))
+        if (relative.includes('\0')) throw new InvalidPathError(path, 'must not contain a NUL byte')
+        const originals = requested.get(relative)
+        if (originals === undefined) requested.set(relative, [path])
+        else originals.push(path)
+      }
+      const stdin = Buffer.from([...requested.keys()].map(path => `${path}\0`).join(''), 'utf8')
+      const run = await runSsh({
+        script: remoteReadFilesScript({
+          root,
+          realRoot: resolvedRoot,
+          paths: [...requested.keys()],
+        }),
+        stdin,
+        timeoutMs: batchOptions.timeoutMs ?? defaultTimeoutMs,
+      })
+      if (run.exitCode !== 0 || run.timedOut) {
+        const refusal = guardFailure(root, run.exitCode, run.stderr)
+        if (refusal) throw refusal
+        throw new SyncTargetError(
+          run.timedOut ? `read batch timed out on ${destination}` : `read batch failed on ${destination}`,
+          { exitCode: run.exitCode, output: run.stderr || run.stdout.toString('utf8') },
+          { path: root },
+        )
+      }
+
+      const archive = parsePaxTar(run.stdout, {
+        validatePath: memberPath => {
+          const relative = posix.relative(root, resolveUnderRoot(root, memberPath))
+          if (!requested.has(relative)) {
+            throw new TarParseError('member path was not requested', undefined, memberPath)
+          }
+        },
+      })
+      const result = new Map<string, Buffer>()
+      for (const [relative, originals] of requested) {
+        const bytes = archive.get(relative)
+        if (bytes === undefined) {
+          throw new TarParseError('requested member is missing', undefined, relative)
+        }
+        for (const original of originals) result.set(original, bytes)
+      }
+      return result
     },
 
     async mkdir(path: string): Promise<void> {
