@@ -4,7 +4,7 @@
  * Surface placement: §6.2 enumerates the Tier-1 main entry exhaustively and this
  * engine is not on that list, so it ships through `tuddofs/internal` until §6.2
  * is amended. §15.4 is CLOSED: the engine lives in core rather than a separate
- * `@tuddofs/sync` package — it imports no provider SDK, only the four-verb seam
+ * `sync` package — it imports no provider SDK, only the four-verb seam
  * — and the internal subpath is where it stays until a host case argues for
  * Tier 1, which would be an additive change.
  */

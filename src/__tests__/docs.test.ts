@@ -33,7 +33,7 @@ const DOCUMENTS = ['README.md', 'docs/host-guide.md', 'packages/s3/README.md'] a
 
 /**
  * No `paths` mapping, deliberately. The examples resolve `tuddofs`,
- * `tuddofs/internal`, and `@tuddofs/s3` exactly the way a consumer does —
+ * `tuddofs/internal`, and `@tuddo/s3` exactly the way a consumer does —
  * through each package's `exports` map, into the BUILT `.d.ts` files. A
  * mapping onto `src/*.ts` would compile every example against code no consumer
  * can import: it stays green when the exports map loses a subpath, and it

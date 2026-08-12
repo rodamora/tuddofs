@@ -285,7 +285,7 @@ Handler rules:
 
 ## Object storage and presigning
 
-Core ships no storage SDK. `BlobStore` is a five-verb SPI; the reference implementation is [`@tuddofs/s3`](../packages/s3/README.md).
+Core ships no storage SDK. `BlobStore` is a five-verb SPI; the reference implementation is [`@tuddo/s3`](../packages/s3/README.md).
 
 - **Without `storage`, everything is inline.** Blobs above `inlineMaxBytes` (128 KiB) are rejected rather than stuffed into Postgres. Any deployment expecting real files wants a store.
 - **Presigned URLs embed the endpoint host (§8.3).** SigV4 signs the host, so a URL your server can use is not automatically a URL your _target_ or _browser client_ can use. A LAN-only MinIO means client-direct I/O and target-direct capture are both unavailable, and the honest configuration is the server-relay path.
