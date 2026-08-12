@@ -145,14 +145,20 @@ test('hydrates and verifies through bounded batch writes without per-file transf
   await engine.materialize()
 
   assert.equal(probe.batchWrites.length, 2)
-  assert.deepEqual(probe.batchWrites.map(batch => batch.bytes), [first.length, second.length])
+  assert.deepEqual(
+    probe.batchWrites.map(batch => batch.bytes),
+    [first.length, second.length],
+  )
   assert.ok(probe.batchWrites.every(batch => batch.timeoutMs === 12_345))
   assert.equal(probe.perFileWrites.filter(path => path.includes('deep/')).length, 0)
   assert.equal(probe.perFileReads.length, 0)
   assert.equal(probe.batchReads.length, 1)
   assert.deepEqual(
     new Set(probe.batchReads[0]?.paths),
-    new Set([engine.mirrorPath('project:docs', '/deep/first.bin'), engine.mirrorPath('project:docs', '/deep/second.bin')]),
+    new Set([
+      engine.mirrorPath('project:docs', '/deep/first.bin'),
+      engine.mirrorPath('project:docs', '/deep/second.bin'),
+    ]),
   )
   assert.deepEqual(await fsReadFile(engine.mirrorPath('project:docs', '/deep/first.bin')), first)
 })
@@ -226,4 +232,3 @@ test('capture-loop straggler restage uses one batch write after a swallowed mirr
   assert.deepEqual(probe.batchWrites[0]?.paths, [mirror])
   assert.deepEqual(await fsReadFile(mirror), Buffer.from('after'))
 })
-

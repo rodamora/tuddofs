@@ -139,7 +139,9 @@ after(async () => {
     }
     await pool.query('DELETE FROM tuddo_heads WHERE tenant = $1', [tenant])
     await pool.query('DELETE FROM tuddo_refs WHERE tenant = $1', [tenant])
-    await pool.query('DELETE FROM tuddo_tree_entries WHERE tree_id IN (SELECT id FROM tuddo_trees WHERE tenant = $1)', [tenant])
+    await pool.query('DELETE FROM tuddo_tree_entries WHERE tree_id IN (SELECT id FROM tuddo_trees WHERE tenant = $1)', [
+      tenant,
+    ])
     await pool.query('DELETE FROM tuddo_commits WHERE tenant = $1', [tenant])
     await pool.query('DELETE FROM tuddo_trees WHERE tenant = $1', [tenant])
     await pool.query('DELETE FROM tuddo_blobs WHERE tenant = $1', [tenant])
@@ -153,7 +155,7 @@ after(async () => {
   }
 })
 
-test('MinIO object hydration uses target-direct GET while inline bytes use the SSH tar relay', async () => {
+void test('MinIO object hydration uses target-direct GET while inline bytes use the SSH tar relay', async () => {
   assert.ok(minio)
   assert.ok(storage)
   assert.ok(network)
@@ -161,9 +163,10 @@ test('MinIO object hydration uses target-direct GET while inline bytes use the S
 
   const root = posix.join('/workspace', `hydration-${Date.now()}`)
   roots.push(root)
+  const hydratedStorage = storage
   const session = await createTuddoFs({
     pool,
-    storage,
+    storage: hydratedStorage,
     inlineMaxBytes: 128,
     grants: { resolve: () => Promise.resolve({ read: true, write: 'direct' as const }) },
   }).open({
@@ -175,14 +178,14 @@ test('MinIO object hydration uses target-direct GET while inline bytes use the S
   const docs = session.mount('project:docs')
   const inlineBytes = Buffer.from('inline fixture bytes')
   const objectBytes = Buffer.alloc(256 * 1024, 0x5a)
-  const inlineResult = await docs.write('/inline.txt', inlineBytes)
-  const objectResult = await docs.write('/object.bin', objectBytes)
+  await docs.write('/inline.txt', inlineBytes)
+  await docs.write('/object.bin', objectBytes)
   const objectBatch = Array.from({ length: 200 }, (_, index) => ({
     path: `/object-${String(index).padStart(3, '0')}-${'x'.repeat(128)}.bin`,
     bytes: Buffer.alloc(256, index % 251),
   }))
   for (const object of objectBatch) await docs.write(object.path, object.bytes)
-  storage.getKeys.length = 0
+  hydratedStorage.getKeys.length = 0
 
   const identity = posix.join(keyDir, 'id_ed25519')
   const options = {
@@ -192,7 +195,7 @@ test('MinIO object hydration uses target-direct GET while inline bytes use the S
     user: 'agent',
     identityFile: identity,
     knownHostsFile: posix.join(keyDir, 'known_hosts'),
-    strictHostKeyChecking: 'accept-new',
+    strictHostKeyChecking: 'accept-new' as const,
     execTimeoutMs: 120_000,
   }
   const rawTarget = createSshTarget(options)
@@ -219,8 +222,7 @@ test('MinIO object hydration uses target-direct GET while inline bytes use the S
 
   await engine.materialize()
 
-  assert.deepEqual(storage.getKeys, [])
-  assert.ok(!storage.getKeys.some(key => key.endsWith(objectResult.sha256)))
+  assert.deepEqual(hydratedStorage.getKeys, [])
   assert.deepEqual(relayed, [engine.mirrorPath('project:docs', '/inline.txt')])
   assert.ok(!relayed.includes(engine.mirrorPath('project:docs', '/object.bin')))
   const curl = execs.find(entry => entry.command.includes('curl --parallel'))
@@ -231,4 +233,3 @@ test('MinIO object hydration uses target-direct GET while inline bytes use the S
   assert.ok(curl.stdin.byteLength > 128 * 1024)
   assert.ok(curl.stdin.toString('utf8').includes('http://minio:9000'))
 })
-

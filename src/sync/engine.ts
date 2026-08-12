@@ -413,8 +413,7 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
     }
     for (const request of requests) {
       const claimedSize = request.claimedSize
-      const estimate =
-        claimedSize !== undefined && Number.isFinite(claimedSize) && claimedSize > 0 ? claimedSize : 0
+      const estimate = claimedSize !== undefined && Number.isFinite(claimedSize) && claimedSize > 0 ? claimedSize : 0
       if (chunk.length > 0 && chunkBytes + estimate > MAX_BATCH_PAYLOAD_BYTES) await flush()
       chunk.push(request)
       chunkBytes += estimate
@@ -459,8 +458,6 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
     }
     await flush()
   }
-
-
 
   const hydrate = async (mount: SessionMount): Promise<void> => {
     const handle = session.mount(mount.key)
@@ -587,7 +584,10 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
     // GNU coreutils are required: busybox lacks `--zero`. With the §8.2
     // transport, `stat` and `curl` join them. Fail at acquire, not silently at
     // capture (§7.3 phase 1 step 1).
-    await runExec(probeCommand({ directUpload, requiredBinaries: target.requiredBinaries ?? [] }), 'GNU coreutils probe')
+    await runExec(
+      probeCommand({ directUpload, requiredBinaries: target.requiredBinaries ?? [] }),
+      'GNU coreutils probe',
+    )
     const state = await runExec(hydrationManifestCommand(root), 'workspace state probe')
     const lines = state.output.split('\n').filter(Boolean)
     const stampPresent = lines.includes(STAMP_FILENAME)
@@ -923,7 +923,7 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
       }
 
       const fetched = await readFilesBatched(
-        [...small].map(([path, request]) => ({ path: request.mirror, claimedSize: request.claimedSize })),
+        [...small.values()].map(request => ({ path: request.mirror, claimedSize: request.claimedSize })),
       )
       for (const [path, request] of small) {
         const bytes = fetched.get(request.mirror)

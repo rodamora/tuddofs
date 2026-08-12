@@ -15,14 +15,14 @@
  * mirror write is still pending when `write` resolves.
  */
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, rm, stat } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, stat, writeFile as fsWriteFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test, { after, before, beforeEach } from 'node:test'
 
 import { Pool } from 'pg'
 import { createTuddoFs, type SessionFileSystem } from '../index.js'
-import { createLocalDirectoryTarget, createSyncEngine, migrate } from '../internal.js'
+import { createLocalDirectoryTarget, createSyncEngine, migrate, type SyncTarget } from '../internal.js'
 
 const pool = new Pool({ connectionString: process.env.TUDDOFS_DATABASE_URL })
 const tenant = 'sync-budgets-integration'
@@ -58,6 +58,27 @@ async function freshRoot(): Promise<string> {
   roots.push(root)
   return root
 }
+
+type ExecCounts = { exec: number }
+
+function countExecs(target: SyncTarget): { target: SyncTarget; counts: ExecCounts; reset(): void } {
+  const counts: ExecCounts = { exec: 0 }
+  return {
+    counts,
+    reset() {
+      counts.exec = 0
+    },
+    target: {
+      ...target,
+      exec: (command, options) => {
+        counts.exec += 1
+        return target.exec(command, options)
+      },
+    },
+  }
+}
+
+const BATCH_BYTES = 32 * 1024 * 1024
 
 /** Best of {@link SAMPLES} timed runs, in milliseconds, after {@link WARMUPS} untimed ones. */
 async function best(label: string, run: (iteration: number) => Promise<unknown>): Promise<number> {
@@ -136,6 +157,7 @@ test('§12 exec capture costs nothing visible', async () => {
   await engine.exec("printf triggered > 'project%3Adocs/a.md'")
   const before = captures
   const started = performance.now()
+
   engine.captureAfterExec()
   const elapsed = performance.now() - started
   console.log(`§12 exec capture trigger: ${elapsed.toFixed(3)} ms`)
@@ -146,6 +168,61 @@ test('§12 exec capture costs nothing visible', async () => {
   assert.ok(elapsed <= 1, `exec capture must be invisible, measured ${elapsed.toFixed(3)} ms`)
   await engine.settle()
   assert.equal(await session.mount('project:docs').read('/a.md'), 'triggered')
+})
+test('§12 cold acquire exec count stays O(1) at 200 files', async () => {
+  const root = await freshRoot()
+  const session = await openSession('budget-cold-execs')
+  const counted = countExecs(createLocalDirectoryTarget({ root }))
+  const engine = createSyncEngine({ session, target: counted.target, root })
+  const files = 200
+  const bytes = Buffer.alloc(128 * 1024, 0x61)
+  for (let index = 0; index < files; index += 1) {
+    await session.mount('project:docs').write(`/cold-${index}.bin`, bytes)
+  }
+
+  await engine.materialize()
+
+  const totalBytes = files * bytes.length
+  const chunks = Math.ceil(totalBytes / BATCH_BYTES)
+  console.log(`§12 cold acquire execs: ${counted.counts.exec} (${files} files, ${totalBytes} bytes, ${chunks} chunks)`)
+  assert.equal(counted.counts.exec, 3)
+  assert.ok(counted.counts.exec <= 3 + chunks, `cold acquire must be O(1)+chunks, measured ${counted.counts.exec}`)
+  assert.ok(counted.counts.exec < files, `cold acquire must not execute once per file, measured ${counted.counts.exec}`)
+})
+
+test('§12 capture cycle exec count stays bounded at 50 changed files', async () => {
+  const root = await freshRoot()
+  let captures = 0
+  const session = await openSession('budget-capture-execs')
+  const counted = countExecs(createLocalDirectoryTarget({ root }))
+  const engine = createSyncEngine({
+    session,
+    target: counted.target,
+    root,
+    events: { onCapture: () => (captures += 1) },
+  })
+  const files = 50
+  const bytes = Buffer.from('changed')
+  for (let index = 0; index < files; index += 1) {
+    await session.mount('project:docs').write(`/changed-${index}.txt`, `before-${index}`)
+  }
+  await engine.materialize()
+  counted.reset()
+  for (let index = 0; index < files; index += 1) {
+    await fsWriteFile(engine.mirrorPath('project:docs', `/changed-${index}.txt`), bytes)
+  }
+
+  engine.captureAfterExec()
+  await engine.settle()
+
+  const totalBytes = files * bytes.length
+  const chunks = Math.ceil(totalBytes / BATCH_BYTES)
+  console.log(
+    `§12 capture cycle execs: ${counted.counts.exec} (${files} changed files, ${totalBytes} bytes, ${chunks} chunks)`,
+  )
+  assert.equal(captures, 1)
+  assert.equal(counted.counts.exec, 2)
+  assert.ok(counted.counts.exec <= 3 + chunks, `capture cycle must be 3+chunks execs, measured ${counted.counts.exec}`)
 })
 
 test('§12 warm re-acquire stays inside 0.1 s', async () => {

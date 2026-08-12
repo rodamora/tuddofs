@@ -134,10 +134,7 @@ export function probeCommand(options: { directUpload?: boolean; requiredBinaries
   if (options.directUpload) checks.push('stat --version', 'curl --version')
   for (const binary of new Set(options.requiredBinaries ?? [])) {
     if (typeof binary !== 'string' || !REQUIRED_BINARY_NAME.test(binary)) {
-      throw new InvalidPathError(
-        binary,
-        'required binary name must match /^[A-Za-z0-9._+-]+$/',
-      )
+      throw new InvalidPathError(binary, 'required binary name must match /^[A-Za-z0-9._+-]+$/')
     }
     const check = `${binary} --version`
     if (!checks.includes(check)) checks.push(check)

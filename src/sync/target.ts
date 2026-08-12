@@ -53,10 +53,7 @@ export interface SyncTarget {
    * The timeout caps this one batch operation; the engine may fall back to
    * per-file writes when this optional verb is absent.
    */
-  writeFiles?(
-    files: readonly { path: string; bytes: Buffer }[],
-    options?: { timeoutMs?: number },
-  ): Promise<void>
+  writeFiles?(files: readonly { path: string; bytes: Buffer }[], options?: { timeoutMs?: number }): Promise<void>
 
   /**
    * Read many regular files in one round trip, keyed by requested path. Paths
@@ -65,8 +62,5 @@ export interface SyncTarget {
    * whole call. The timeout caps this one batch operation; the engine may fall
    * back to per-file reads when this optional verb is absent.
    */
-  readFiles?(
-    paths: readonly string[],
-    options?: { timeoutMs?: number },
-  ): Promise<ReadonlyMap<string, Buffer>>
+  readFiles?(paths: readonly string[], options?: { timeoutMs?: number }): Promise<ReadonlyMap<string, Buffer>>
 }

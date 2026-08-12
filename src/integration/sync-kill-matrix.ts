@@ -57,6 +57,8 @@ export interface TargetControls {
   scanOutput: string | null
   /** Number of upcoming capture scans to fail. */
   failScans: number
+  /** Kill the target after the next successful write transfer, once. */
+  killAfterTransfer?: () => Promise<void>
 }
 
 /** One disposable workspace: a root, a target for it, and a way to break both. */
@@ -96,35 +98,49 @@ type SkippedEvent = { mountKey: string; paths: readonly string[] }
  */
 export function controlledTarget(target: SyncTarget): { target: SyncTarget; controls: TargetControls } {
   const controls: TargetControls = { swallowWrites: new Set(), scanOutput: null, failScans: 0 }
-  return {
-    controls,
-    target: {
-      async exec(cmd, opts) {
-        const isScan = cmd.includes('sha256sum --zero')
-        if (isScan && controls.failScans > 0) {
-          controls.failScans -= 1
-          return { exitCode: 1, output: 'simulated scan failure' }
-        }
-        const result = await target.exec(cmd, opts)
-        if (controls.scanOutput !== null && isScan) {
-          const output = controls.scanOutput
-          controls.scanOutput = null
-          return { exitCode: result.exitCode, output }
-        }
-        return result
-      },
-      async readFile(path) {
-        return target.readFile(path)
-      },
-      async writeFile(path, bytes) {
-        if (controls.swallowWrites.has(path)) return
-        return target.writeFile(path, bytes)
-      },
-      async mkdir(path) {
-        return target.mkdir(path)
-      },
+  const afterTransfer = async (): Promise<void> => {
+    const kill = controls.killAfterTransfer
+    if (kill === undefined) return
+    controls.killAfterTransfer = undefined
+    await kill()
+  }
+  const wrapped: SyncTarget = {
+    async exec(cmd, opts) {
+      const isScan = cmd.includes('sha256sum --zero')
+      if (isScan && controls.failScans > 0) {
+        controls.failScans -= 1
+        return { exitCode: 1, output: 'simulated scan failure' }
+      }
+      const result = await target.exec(cmd, opts)
+      if (controls.scanOutput !== null && isScan) {
+        const output = controls.scanOutput
+        controls.scanOutput = null
+        return { exitCode: result.exitCode, output }
+      }
+      return result
+    },
+    async readFile(path) {
+      return target.readFile(path)
+    },
+    async writeFile(path, bytes) {
+      if (controls.swallowWrites.has(path)) return
+      await target.writeFile(path, bytes)
+      await afterTransfer()
+    },
+    async mkdir(path) {
+      return target.mkdir(path)
     },
   }
+  if (target.writeFiles !== undefined) {
+    wrapped.writeFiles = async (files, options) => {
+      await target.writeFiles!(files, options)
+      await afterTransfer()
+    }
+  }
+  if (target.readFiles !== undefined) {
+    wrapped.readFiles = (paths, options) => target.readFiles!(paths, options)
+  }
+  return { controls, target: wrapped }
 }
 
 /**
@@ -162,6 +178,7 @@ export function runKillMatrix(harness: KillMatrixHarness): void {
   async function openSession(sessionId: string, withVirtual = true): Promise<SessionFileSystem> {
     return createTuddoFs({
       pool,
+      inlineMaxBytes: Number.MAX_SAFE_INTEGER,
       grants: {
         resolve: async (_actorInput, mount) => ({ read: mount.key in grants, write: grants[mount.key] ?? 'none' }),
       },
@@ -275,6 +292,34 @@ export function runKillMatrix(harness: KillMatrixHarness): void {
     // The seeded index makes an unchanged workspace a no-op reconcile.
     await warm.reconcile()
     assert.deepEqual(captures, [])
+  })
+
+  test(named('a kill between batch transfers leaves marker and stamp untouched; re-acquire converges'), async () => {
+    const { session, engine, root, disk, workspace, controls, target } = await setup('engine-kill-batch')
+    const files = 3
+    const bytes = Buffer.alloc(11 * 1024 * 1024, 0x61)
+    for (let index = 0; index < files; index += 1) {
+      await session.mount('project:docs').write(`/batch-${index}.bin`, bytes)
+    }
+
+    controls.killAfterTransfer = async () => workspace.kill()
+    await assert.rejects(engine.materialize())
+
+    await workspace.revive()
+    assert.equal(await disk.stat(posix.join(root, '.tuddofs', 'hydrated')), undefined)
+    assert.equal(await disk.stat(posix.join(root, '.tuddofs-stamp')), undefined)
+
+    const resumed = createSyncEngine({ session, target, root })
+    await resumed.materialize()
+
+    assert.ok(await disk.stat(posix.join(root, '.tuddofs', 'hydrated')))
+    assert.ok(await disk.stat(posix.join(root, '.tuddofs-stamp')))
+    for (let index = 0; index < files; index += 1) {
+      const content = await disk.readText(docsFile(root, `batch-${index}.bin`))
+      assert.equal(content.length, bytes.length)
+      assert.equal(content[0], 'a')
+      assert.equal(content.at(-1), 'a')
+    }
   })
 
   test(named('a tool write commits before it mirrors and survives an instant target kill'), async () => {

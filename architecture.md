@@ -202,6 +202,11 @@ interface SyncTarget {
   readFile(path: string): Promise<Buffer>
   writeFile(path: string, bytes: Buffer): Promise<void>
   mkdir(path: string): Promise<void>
+  /** Optional target tools folded into the acquire probe. */
+  readonly requiredBinaries?: readonly string[]
+  /** Optional all-or-error batches; paths remain absolute under the root. */
+  writeFiles?(files: readonly { path: string; bytes: Buffer }[], opts?): Promise<void>
+  readFiles?(paths: readonly string[], opts?): Promise<ReadonlyMap<string, Buffer>>
 }
 ```
 
@@ -210,6 +215,11 @@ The engine never imports a provider SDK. First-party targets, in build order:
 1. **Local directory** (S1) — child-process exec + node:fs. This is a product story in itself (governed workspace for CLI/harness agents on a trusted machine) and makes the whole engine CI-testable with zero infrastructure. Grant confinement protects the FS, NOT the host; sandboxes exist for untrusted code — document this, loudly.
 2. **SSH** (S2) — the cheapest honest remote: real network, real quoting hazards, no vendor SDK. Proves seam portability.
 3. Provider targets (E2B, Blaxel, …) — doc recipes or separate packages, never in core.
+
+The two batch verbs are implementation-free at this seam: a sandbox target may
+map them to a native SDK call, while the SSH target's detail is PAX tar over one
+remote exec. The engine owns the 32 MiB chunk bound and falls back to the
+per-file verbs when a target does not declare the optional methods.
 
 ### 7.2 Engine events
 
@@ -233,6 +243,13 @@ A failed scan is an error event, never an empty diff. Silently treating exec fai
 
 1. Precondition probe: `exec("sha256sum --version && find --version")` — GNU coreutils required (busybox lacks `--zero`). Fail loudly at acquire, not silently at capture.
 2. Per mount: write branch-view files under `<root>/<mountKey>/…`; `chmod -R a-w` read-only mounts; verify (spot-check shas); write hydrated marker LAST; seed index; `touch` stamp. **AMENDED at S1:** the acquire stamp uses the same backdated form as step 6 below, which puts it before the files hydration just wrote, so the first incremental scan re-hashes them once and commits nothing. That waste is deliberate. Stamping from the hydration marker's own mtime removes it and breaks capture: `find -newer` is STRICTLY newer, the marker and the agent's first writes land in the same coarse filesystem tick, and those writes then never reach a Phase-3 scan — measured, three kill-matrix cases go silent. Re-hydrating a frozen mount unfreezes it with `chmod -R a-w,u+w`, the exact inverse of the freeze over the mirror's two legal states (no write bit; owner write only).
+
+**AMENDED at S4:** hydration uses `writeFiles` when the target declares it,
+with the engine's 32 MiB chunk bound; targets without the optional verb keep the
+per-file fallback. Under the declared `transport: 'presigned'`, object-backed
+branch entries arrive through target-direct presigned GETs, while inline blobs
+remain on the relay path. The verify sample is unchanged: read back from the
+target and compare hashes before the marker is written.
 3. Warm re-acquire: liveness probe + index check only — NEVER a per-file probe.
 
 **Phase 2 — write-through (file tools):** kernel commit first (§4.5) → index update → mirror `writeFile` (async; on failure mark path dirty → re-materialize on next touch). Grant refusal happens before the commit; nothing touches disk.
@@ -268,6 +285,8 @@ A failed scan is an error event, never an empty diff. Silently treating exec fai
 ### 7.5 Acceptance (kill matrix)
 
 - Tool write survives instant target kill (commit landed before mirror write).
+- A kill between transfer batches leaves the prior hydration marker and stamp
+  untouched; after the target returns, re-acquire converges the whole mount.
 - Killed exec loses at most itself; reconcile recovers everything on disk.
 - Capture failure re-triggers and surfaces via `onCaptureFailed`; N failures never wedge the slot.
 - Hostile-input suite: path escapes, quoting collapse, symlink exfiltration attempt, mount-escape in scan output.
@@ -285,6 +304,13 @@ Two independent halves. The `BlobStore` SPI already declares `presignPut(key, {t
 ### 8.2 Sync-engine capture path (depends on §7)
 
 Large changed files upload direct from the target via `exec(curl …)` against a presigned PUT with the claimed sha pinned as a signed checksum header (S3/MinIO enforce this). On a store without checksum enforcement: upload to a quarantine key, re-hash server-side via GET stream, then server-side copy to the CAS key. Existence+size alone is NOT verification — a lying target could otherwise poison the CAS entry for a sha other branches later dedupe against.
+
+**AMENDED at S4 — download symmetry:** hydration is the download half of the
+same transfer contract. With `transport: 'presigned'`, object-backed branch
+entries use target-direct presigned GETs and inline entries use the batch relay;
+the one transport declaration governs both upload and download. The target
+still reads back the verify sample and re-hashes it before marking the mount
+hydrated.
 
 ### 8.3 Acceptance
 
@@ -364,16 +390,26 @@ Every row is asserted and printed by one of two suites:
 
 Method (both suites): warm up, run N times, judge the BEST run — a budget describes what the system costs, not what a shared CI runner schedules, and the minimum is the only statistic that survives an unrelated process stealing the core mid-measurement. The numbers below are measurements, not estimates; treat them as the regression line, not the ceiling.
 
+For the count rows, a seam exec is `target.exec` plus one invocation of each
+declared batch verb; local `node:fs` fallback calls are not execs. The count is
+therefore a transport-shape assertion, not a latency proxy.
+
 | Op                      | Budget (asserted)                                                             | Local, measured | Network (ssh), measured |
 | ----------------------- | ----------------------------------------------------------------------------- | --------------- | ----------------------- |
 | Session read            | 1–3 ms (heads index; no per-read provider I/O)                                  | 0.41 ms         | target-independent      |
 | Session write           | 8–20 ms visible (mirror write off the critical path)                            | 1.61 ms         | 3.59 ms                 |
 | Exec capture            | 0 visible (async; one exec per cycle)                                           | 0.02 ms trigger | 0.04 ms trigger         |
 | Warm re-acquire         | ≤ 0.1 s local; one-to-two remote execs (asserted: ≤ 2 execs, 0 transfers, ≤ 1 s) on a network target      | 4.54 ms         | 244 ms                  |
-| Fork / merge            | 10–100 ms once per mount / < 1 s at 100 paths                                   | 1.63 / 9.17 ms  | target-independent      |
+| Cold acquire (200 files)  | O(1) + ⌈bytes/32 MiB⌉ seam execs, never O(files)                         | 3 (25 MiB; 1 chunk)          | 5 (25 MiB; 1 write + 1 verify chunk) |
+| Capture cycle (50 changed small files) | 3 + ⌈changed bytes/32 MiB⌉ seam execs (≤ 4 under 32 MiB) | 2 (fallback scan + stamp)    | 4 (scan + size + 1 fetch + stamp)    |
 | One remote exec         | assumption row: 150–500 ms on a real network (asserted ≤ 500 ms on the fixture)  | —               | 115 ms                  |
 
 Measured 2026-08-11 by a full `npm run test:integration` and `npm run test:ssh`, on a Ryzen 9 9950X3D with PostgreSQL 16 in Docker and the sshd fixture container over loopback. "Target-independent" rows never speak to a target — they are kernel-and-PostgreSQL work, and re-running them through an ssh suite would measure the same code twice and label the second number "SSH". Loopback is the FLOOR of the remote-exec assumption, never its ceiling: a WAN host adds its RTT to every remote-exec row, so the ssh assertions are ceilings on the fixture rather than promises about a datacenter.
+
+The batch-count rows were measured 2026-08-12 by the same suites: local cold
+acquire 3 and capture 2; SSH cold acquire 5 and capture 4. The fixtures used
+200 files (25 MiB total) for acquire and 50 changed small files (350 bytes)
+for capture; all rows were asserted and printed at the seam.
 
 A second data point, from the same suites on a shared GitHub-hosted runner (CI run 31543027690): read 1.50 ms, write 5.26 ms, capture trigger 0.05 ms, warm re-acquire 10.98 ms, fork 3.62 ms, merge at 100 paths 63.05 ms; over ssh, one remote exec 162.98 ms, write 10.63 ms, warm re-acquire 330.30 ms. Every budget holds there too, which is what makes them budgets rather than descriptions of one workstation — and the narrowest margin, the visible write at roughly half its ceiling on the slowest environment observed, is the row to watch in review.
 

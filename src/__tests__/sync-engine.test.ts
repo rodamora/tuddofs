@@ -201,7 +201,10 @@ test('failed presigned hydration leaves the marker absent and retries cleanly', 
     const target = createLocalDirectoryTarget({ root })
     const engine = createSyncEngine({ session, target, root, largeBlobs: { transport: 'presigned' } })
 
-    await assert.rejects(engine.materialize(), error => error instanceof SyncTargetError && /presigned hydration failed/.test(error.message))
+    await assert.rejects(
+      engine.materialize(),
+      error => error instanceof SyncTargetError && /presigned hydration failed/.test(error.message),
+    )
     await assert.rejects(readFile(join(root, '.tuddofs', 'hydrated')))
 
     reachable = true

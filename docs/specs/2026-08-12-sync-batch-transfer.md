@@ -1,6 +1,6 @@
 # Sync transfer batching and presigned hydration
 
-Status: draft for review
+Status: accepted — implemented
 Date: 2026-08-12
 Spec owner: sync engine (`src/sync/`)
 Amends: `architecture.md` §7.1, §7.3 phase 1, §8, §12
@@ -15,7 +15,7 @@ Every bulk transfer in the sync engine pays one target round trip per file, sequ
 
 Additionally, every hydration byte relays store → server → target even when the target could fetch from the object store directly — the download mirror of the problem §8.2 already solved for capture uploads.
 
-The per-file *format* is already optimal (raw `cat` over stdin/stdout, no encoding overhead). The waste is channel shape: round trips proportional to file count, and bytes routed through the server unnecessarily.
+The per-file _format_ is already optimal (raw `cat` over stdin/stdout, no encoding overhead). The waste is channel shape: round trips proportional to file count, and bytes routed through the server unnecessarily.
 
 ## Goals
 
@@ -79,7 +79,7 @@ interface SyncTarget {
 
 ### 3. Tar format (`src/sync/tar.ts`, new, pure)
 
-- In-process PAX (POSIX.1-2001) writer and parser, zero dependencies (~150 lines each). Tar here is a file *format*, not a protocol — §10 rule 3 holds.
+- In-process PAX (POSIX.1-2001) writer and parser, zero dependencies (~150 lines each). Tar here is a file _format_, not a protocol — §10 rule 3 holds.
 - Writer: every entry gets a PAX extended header carrying `path=` (length-prefixed record; arbitrary bytes including newlines and quotes) plus the ustar entry (mode 0644, regular file). Uniform always-PAX avoids ustar name-split edge cases entirely.
 - Parser: handles PAX `path`/`size` records and ustar fields; refuses non-regular entry types for requested paths; refuses members that do not resolve under the expected mirror directories (same re-validation stance as `parseScanRecords`).
 - Golden vectors cross-checked against GNU tar output in the SSH suite.
@@ -131,15 +131,15 @@ Relay mode differs only in step 4: all files ride the tar path.
 
 ## Error handling
 
-| Failure | Behavior |
-| --- | --- |
-| Missing `tar`/`curl` binary | Probe fails at acquire (`SyncTargetError`), never silently at capture |
-| `writeFiles` exec non-zero / stream truncated | Hydrate/restage aborts; marker/stamp untouched; retry re-hydrates (§7.5) |
-| `readFiles` member missing or non-regular | Whole call rejects → capture cycle fails, slot releases, `onCaptureFailed`, stamp untouched — same as today's `readFile` failure |
-| Any presigned GET fails | `curl --fail` → exec non-zero → `materialize()` rejects |
-| Presign refused (inline) | Routed to relay set (expected path, not an error) |
-| Presign refused (no storage / unsupported) | `materialize()` rejects — host misconfiguration surfaced at acquire |
-| Tar parse error on `readFiles` output | Malformed transfer = error, never an empty result (§7.2) |
+| Failure                                       | Behavior                                                                                                                         |
+| --------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| Missing `tar`/`curl` binary                   | Probe fails at acquire (`SyncTargetError`), never silently at capture                                                            |
+| `writeFiles` exec non-zero / stream truncated | Hydrate/restage aborts; marker/stamp untouched; retry re-hydrates (§7.5)                                                         |
+| `readFiles` member missing or non-regular     | Whole call rejects → capture cycle fails, slot releases, `onCaptureFailed`, stamp untouched — same as today's `readFile` failure |
+| Any presigned GET fails                       | `curl --fail` → exec non-zero → `materialize()` rejects                                                                          |
+| Presign refused (inline)                      | Routed to relay set (expected path, not an error)                                                                                |
+| Presign refused (no storage / unsupported)    | `materialize()` rejects — host misconfiguration surfaced at acquire                                                              |
+| Tar parse error on `readFiles` output         | Malformed transfer = error, never an empty result (§7.2)                                                                         |
 
 ## Architecture amendments to land with the change
 
@@ -165,7 +165,7 @@ Relay mode differs only in step 4: all files ride the tar path.
 - **Integration (PG + local target):** fallback loops, capture semantics unchanged.
 - **SSH suite:** exec-count assertions (criteria 1–2), symlink cases (4), hostile names end-to-end (3), kill matrix (7).
 - **MinIO + SSH:** presigned hydration (5), building on the existing `scripts/minio-*.test.ts` fixtures.
-- **Budgets:** new rows in `sync-budgets-ssh.ssh.test.ts` (counts, not latencies, per the §12 method).
+- **Budgets:** new rows in both `sync-budgets.integration.test.ts` and `sync-budgets-ssh.ssh.test.ts` (exec counts at the seam, not latencies).
 
 ## Open decisions (not blocking)
 

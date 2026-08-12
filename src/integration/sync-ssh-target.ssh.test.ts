@@ -19,7 +19,14 @@ import { tmpdir } from 'node:os'
 import posix from 'node:path/posix'
 import test from 'node:test'
 
-import { InvalidPathError, SyncTargetError, createSshTarget, probeCommand, quoteShellArg, type SshTarget } from '../internal.js'
+import {
+  InvalidPathError,
+  SyncTargetError,
+  createSshTarget,
+  probeCommand,
+  quoteShellArg,
+  type SshTarget,
+} from '../internal.js'
 import { externalSshHost, remoteDisk, startContainerSshHost, type SshHost } from './ssh-host.js'
 import { controlledTarget, runKillMatrix, type KillMatrixWorkspace } from './sync-kill-matrix.js'
 
@@ -65,6 +72,12 @@ async function createSshWorkspace(): Promise<KillMatrixWorkspace> {
     },
     async mkdir(path) {
       return simulatedKill ? dead() : raw.mkdir(path)
+    },
+    async writeFiles(files, options) {
+      return simulatedKill ? dead() : raw.writeFiles!(files, options)
+    },
+    async readFiles(paths, options) {
+      return simulatedKill ? dead() : raw.readFiles!(paths, options)
     },
   }
   const controlled = controlledTarget(killable)
@@ -321,7 +334,10 @@ test('[ssh] batch verbs round-trip hostile paths, replace symlinks, and reject s
   ]
 
   await target.writeFiles!(files, { timeoutMs: 30_000 })
-  const read = await target.readFiles!(files.map(file => file.path), { timeoutMs: 30_000 })
+  const read = await target.readFiles!(
+    files.map(file => file.path),
+    { timeoutMs: 30_000 },
+  )
   assert.equal(read.size, files.length)
   for (const file of files) assert.deepEqual(read.get(file.path), file.bytes)
 
@@ -329,10 +345,7 @@ test('[ssh] batch verbs round-trip hostile paths, replace symlinks, and reject s
   const outsidePath = posix.join(sshHost.workspaceBase, `batch-outside-${randomUUID()}.txt`)
   const outside = createSshTarget(sshHost.targetOptions(sshHost.workspaceBase))
   await outside.writeFile(outsidePath, Buffer.from('outside'))
-  assert.equal(
-    (await outside.exec(`ln -s ${quoteShellArg(outsidePath)} ${quoteShellArg(symlinkPath)}`)).exitCode,
-    0,
-  )
+  assert.equal((await outside.exec(`ln -s ${quoteShellArg(outsidePath)} ${quoteShellArg(symlinkPath)}`)).exitCode, 0)
   await target.writeFiles!([{ path: symlinkPath, bytes: Buffer.from('replaced') }])
   assert.deepEqual(await target.readFile(symlinkPath), Buffer.from('replaced'))
   assert.deepEqual(await outside.readFile(outsidePath), Buffer.from('outside'))
@@ -340,8 +353,11 @@ test('[ssh] batch verbs round-trip hostile paths, replace symlinks, and reject s
   const swappedPath = posix.join(root, 'swapped.txt')
   await target.writeFile(swappedPath, Buffer.from('regular'))
   assert.equal(
-    (await outside.exec(`rm -f ${quoteShellArg(swappedPath)} && ln -s ${quoteShellArg(outsidePath)} ${quoteShellArg(swappedPath)}`))
-      .exitCode,
+    (
+      await outside.exec(
+        `rm -f ${quoteShellArg(swappedPath)} && ln -s ${quoteShellArg(outsidePath)} ${quoteShellArg(swappedPath)}`,
+      )
+    ).exitCode,
     0,
   )
   await assert.rejects(target.readFiles!([swappedPath]), SyncTargetError)
@@ -414,10 +430,7 @@ test('[ssh] batch verbs refuse directory symlink traversal without touching the 
     await target.mkdir(posix.join(root, 'mnt'))
     await outside.mkdir(outsideDir)
     await outside.writeFile(outsideFile, Buffer.from('outside bytes'))
-    assert.equal(
-      (await outside.exec(`ln -s ${quoteShellArg(outsideDir)} ${quoteShellArg(link)}`)).exitCode,
-      0,
-    )
+    assert.equal((await outside.exec(`ln -s ${quoteShellArg(outsideDir)} ${quoteShellArg(link)}`)).exitCode, 0)
 
     await assert.rejects(
       target.writeFiles!([{ path: posix.join(link, 'written.txt'), bytes: Buffer.from('must not escape') }]),
@@ -430,7 +443,6 @@ test('[ssh] batch verbs refuse directory symlink traversal without touching the 
     await outside.exec(`rm -rf ${quoteShellArg(base)}`).catch(() => undefined)
   }
 })
-
 
 test('[ssh] batch verbs reject a failed tar and probe tar as a required binary', async () => {
   const sshHost = await host()

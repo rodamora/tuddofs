@@ -10,7 +10,7 @@ import { parsePaxTar, TarParseError, writePaxTar } from '../sync/tar.js'
 
 const hostileEntries = [
   { path: 'mirror/line\nfeed', bytes: Buffer.from('newline') },
-  { path: "mirror/single'quote", bytes: Buffer.from("single") },
+  { path: "mirror/single'quote", bytes: Buffer.from('single') },
   { path: 'mirror/double"quote', bytes: Buffer.from('double') },
   { path: 'mirror/percent%name', bytes: Buffer.from('percent') },
   { path: 'mirror/café-日本語', bytes: Buffer.from('unicode') },
@@ -21,7 +21,10 @@ test('PAX writer round-trips hostile member names and bytes', () => {
   const archive = writePaxTar(hostileEntries)
   const parsed = parsePaxTar(archive, { expectedPrefix: 'mirror' })
 
-  assert.deepEqual([...parsed.keys()], hostileEntries.map(entry => entry.path))
+  assert.deepEqual(
+    [...parsed.keys()],
+    hostileEntries.map(entry => entry.path),
+  )
   for (const entry of hostileEntries) assert.deepEqual(parsed.get(entry.path), entry.bytes)
 })
 
@@ -84,8 +87,10 @@ test('PAX parser accepts GNU tar output and extracts regular file bytes', () => 
     const parsed = parsePaxTar(archive, { expectedPrefix: 'gnu-file.txt' })
     assert.deepEqual(parsed.get('gnu-file.txt'), Buffer.from('from GNU tar'))
 
-    const extracted = spawnSync('tar', ['-xOf', '-', 'gnu-file.txt'], { input: writePaxTar([{ path: 'gnu-file.txt', bytes: Buffer.from('from writer') }]) })
-    if (extracted.error?.code === 'ENOENT') return
+    const extracted = spawnSync('tar', ['-xOf', '-', 'gnu-file.txt'], {
+      input: writePaxTar([{ path: 'gnu-file.txt', bytes: Buffer.from('from writer') }]),
+    })
+    if (extracted.error && 'code' in extracted.error && extracted.error.code === 'ENOENT') return
     assert.equal(extracted.status, 0)
     assert.equal(extracted.stdout.toString(), 'from writer')
   } finally {
@@ -95,12 +100,14 @@ test('PAX parser accepts GNU tar output and extracts regular file bytes', () => 
 
 test('PAX parser invokes caller validation and expected-prefix guard', () => {
   const archive = writePaxTar([{ path: 'mirror/ok.txt', bytes: Buffer.from('ok') }])
+  assert.throws(() => parsePaxTar(archive, { expectedPrefix: 'other', validatePath: () => false }), InvalidPathError)
   assert.throws(
-    () => parsePaxTar(archive, { expectedPrefix: 'other', validatePath: () => false }),
-    InvalidPathError,
-  )
-  assert.throws(
-    () => parsePaxTar(archive, { validatePath: () => { throw new Error('nope') } }),
+    () =>
+      parsePaxTar(archive, {
+        validatePath: () => {
+          throw new Error('nope')
+        },
+      }),
     TarParseError,
   )
 })

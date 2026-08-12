@@ -143,9 +143,7 @@ export function parsePaxTar(archive: Buffer, options: ParsePaxTarOptions = {}): 
       : decodeUstarPath(header, headerOffset)
     validateMemberPath(path, options, headerOffset)
 
-    const size = attributes.has('size')
-      ? parsePaxSize(attributes.get('size')!, headerOffset)
-      : headerSize
+    const size = attributes.has('size') ? parsePaxSize(attributes.get('size')!, headerOffset) : headerSize
     const payload = readPayload(archive, offset, size, headerOffset)
     if (entries.has(path)) throw new TarParseError('duplicate member path', headerOffset, path)
     entries.set(path, Buffer.from(payload))
