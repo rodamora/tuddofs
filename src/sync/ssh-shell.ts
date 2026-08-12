@@ -218,12 +218,19 @@ export function remoteGuardScript(input: RemotePathScriptInput): string {
 }
 
 /**
- * Guard every existing ancestor of each batch member in one remote script.
- * Keeping the checks in the same shell invocation preserves the one-exec
- * property while applying the per-file remote realpath taxonomy to batches.
+ * Guard every unique parent directory of each batch member in one remote
+ * script. The batch guard intentionally checks only existing ancestors, so
+ * sharing a parent makes those checks identical. Every member is still
+ * resolved client-side before deduplication, and the representative path is
+ * quoted by remoteGuardScript.
  */
 function remoteBatchGuardScript(input: RemoteBatchPathScriptInput): string {
-  return input.paths
+  const firstPathByParent = new Map<string, string>()
+  for (const path of input.paths) {
+    const parent = posix.dirname(resolveUnderRoot(input.root, path))
+    if (!firstPathByParent.has(parent)) firstPathByParent.set(parent, path)
+  }
+  return [...firstPathByParent.values()]
     .map(path =>
       remoteGuardScript({
         root: input.root,

@@ -82,10 +82,10 @@ test('presigned hydration relays inline blobs and fetches object blobs on the ta
       },
     } as unknown as SessionFileSystem
     const inner = createLocalDirectoryTarget({ root })
-    const execs: string[] = []
+    const execs: { command: string; stdin?: Buffer }[] = []
     const target: SyncTarget = {
       async exec(command, options) {
-        execs.push(command)
+        execs.push({ command, stdin: options?.stdin })
         return inner.exec(command, options)
       },
       readFile: path => inner.readFile(path),
@@ -108,11 +108,13 @@ test('presigned hydration relays inline blobs and fetches object blobs on the ta
     ])
     assert.equal(await readFile(engine.mirrorPath('project:docs', inlinePath), 'utf8'), inlineBytes.toString('utf8'))
     assert.equal(await readFile(engine.mirrorPath('project:docs', objectPath), 'utf8'), objectBytes.toString('utf8'))
-    const curlExec = execs.find(command => command.includes('curl --parallel'))
+    const curlExec = execs.find(entry => entry.command.includes('curl --parallel'))
     assert.ok(curlExec)
-    assert.match(curlExec, /--config -/)
-    assert.match(curlExec, /quote\\"and\\\\slash\\nline%\.txt/)
-    assert.match(curlExec, /X-Amz-Signature=deadbeef&part=1/)
+    assert.match(curlExec.command, /--config -/)
+    assert.ok(!curlExec.command.includes('X-Amz-Signature=deadbeef'))
+    assert.ok(curlExec.stdin)
+    assert.match(curlExec.stdin.toString('utf8'), /quote\\"and\\\\slash\\nline%\.txt/)
+    assert.match(curlExec.stdin.toString('utf8'), /X-Amz-Signature=deadbeef&part=1/)
   } finally {
     await rm(root, { recursive: true, force: true })
     await rm(sourceDir, { recursive: true, force: true })

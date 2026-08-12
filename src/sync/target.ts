@@ -11,6 +11,8 @@
 export interface ExecOptions {
   /** Hard wall-clock limit; the target kills the command when it elapses. */
   readonly timeoutMs?: number
+  /** Bytes to feed to the command's stdin; omitted means an empty stdin stream. */
+  readonly stdin?: Buffer
 }
 
 /**

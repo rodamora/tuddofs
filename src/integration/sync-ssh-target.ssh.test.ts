@@ -14,7 +14,7 @@
  */
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
-import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import posix from 'node:path/posix'
 import test from 'node:test'
@@ -347,6 +347,58 @@ test('[ssh] batch verbs round-trip hostile paths, replace symlinks, and reject s
   await assert.rejects(target.readFiles!([swappedPath]), SyncTargetError)
 
   await outside.exec(`rm -rf ${quoteShellArg(root)} ${quoteShellArg(outsidePath)}`)
+})
+
+test('[ssh] batch guard script deduplicates repeated parent directories', async () => {
+  const sshHost = await host()
+  const root = posix.join(sshHost.workspaceBase, `batch-guard-scale-${randomUUID()}`)
+  const captureDir = await mkdtemp(posix.join(tmpdir(), 'tuddofs-ssh-guard-'))
+  const wrapper = posix.join(captureDir, 'ssh')
+  const captureScript = posix.join(captureDir, 'script')
+  const directories = Array.from({ length: 5 }, (_, index) => posix.join(root, `dir-${index}`))
+  const largeFiles = Array.from({ length: 200 }, (_, index) => ({
+    path: posix.join(directories[index % directories.length], `large-${index}.txt`),
+    bytes: Buffer.from([index % 256]),
+  }))
+  const smallFiles = Array.from({ length: 10 }, (_, index) => ({
+    path: posix.join(directories[index % directories.length], `small-${index}.txt`),
+    bytes: Buffer.from([index % 256]),
+  }))
+
+  await writeFile(
+    wrapper,
+    `#!/bin/sh
+script=
+for arg do script="$arg"; done
+case "$script" in
+  mkdir\\ -p\\ *) printf '%s\\n' "$TUDDOFS_CAPTURE_ROOT" ;;
+  *) printf '%s' "$script" > "$TUDDOFS_CAPTURE_SCRIPT" ;;
+esac
+`,
+  )
+  await chmod(wrapper, 0o755)
+
+  const target = createSshTarget({
+    ...sshHost.targetOptions(root),
+    sshBinary: wrapper,
+    env: {
+      ...process.env,
+      TUDDOFS_CAPTURE_ROOT: root,
+      TUDDOFS_CAPTURE_SCRIPT: captureScript,
+    },
+  })
+
+  try {
+    await target.writeFiles!(largeFiles)
+    const largeScript = await readFile(captureScript, 'utf8')
+    await target.writeFiles!(smallFiles)
+    const smallScript = await readFile(captureScript, 'utf8')
+
+    assert.equal(largeScript.length, smallScript.length)
+    assert.ok(largeScript.length < 10_000)
+  } finally {
+    await rm(captureDir, { recursive: true, force: true })
+  }
 })
 test('[ssh] batch verbs refuse directory symlink traversal without touching the target', async () => {
   const sshHost = await host()

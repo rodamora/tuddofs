@@ -524,10 +524,11 @@ export function createSyncEngine(options: SyncEngineOptions): SyncEngine {
 
     if (presigned.length > 0) {
       const config = buildCurlGetConfig(presigned)
-      const command =
-        `cd ${quoteShellArg(root)} && ` +
-        `printf %s ${quoteShellArg(config)} | curl --parallel --fail --create-dirs --config -`
-      await runExec(command, 'presigned hydration', { timeoutMs: uploadTimeoutMs })
+      const command = `cd ${quoteShellArg(root)} && curl --parallel --fail --create-dirs --config -`
+      await runExec(command, 'presigned hydration', {
+        timeoutMs: uploadTimeoutMs,
+        stdin: Buffer.from(config, 'utf8'),
+      })
     }
 
     // Spot-check the transfer rather than trusting the target's write (§7.3).

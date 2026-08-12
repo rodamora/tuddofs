@@ -177,6 +177,11 @@ test('MinIO object hydration uses target-direct GET while inline bytes use the S
   const objectBytes = Buffer.alloc(256 * 1024, 0x5a)
   const inlineResult = await docs.write('/inline.txt', inlineBytes)
   const objectResult = await docs.write('/object.bin', objectBytes)
+  const objectBatch = Array.from({ length: 200 }, (_, index) => ({
+    path: `/object-${String(index).padStart(3, '0')}-${'x'.repeat(128)}.bin`,
+    bytes: Buffer.alloc(256, index % 251),
+  }))
+  for (const object of objectBatch) await docs.write(object.path, object.bytes)
   storage.getKeys.length = 0
 
   const identity = posix.join(keyDir, 'id_ed25519')
@@ -191,12 +196,12 @@ test('MinIO object hydration uses target-direct GET while inline bytes use the S
     execTimeoutMs: 120_000,
   }
   const rawTarget = createSshTarget(options)
-  const execs: string[] = []
+  const execs: { command: string; stdin?: Buffer }[] = []
   const relayed: string[] = []
   const target: SyncTarget = {
     ...rawTarget,
     async exec(command, execOptions) {
-      execs.push(command)
+      execs.push({ command, stdin: execOptions?.stdin })
       return rawTarget.exec(command, execOptions)
     },
     async writeFiles(files, writeOptions) {
@@ -204,6 +209,7 @@ test('MinIO object hydration uses target-direct GET while inline bytes use the S
       return rawTarget.writeFiles?.(files, writeOptions)
     },
   }
+
   const engine = createSyncEngine({
     session,
     target,
@@ -217,9 +223,12 @@ test('MinIO object hydration uses target-direct GET while inline bytes use the S
   assert.ok(!storage.getKeys.some(key => key.endsWith(objectResult.sha256)))
   assert.deepEqual(relayed, [engine.mirrorPath('project:docs', '/inline.txt')])
   assert.ok(!relayed.includes(engine.mirrorPath('project:docs', '/object.bin')))
-  const curl = execs.find(command => command.includes('curl --parallel'))
+  const curl = execs.find(entry => entry.command.includes('curl --parallel'))
   assert.ok(curl)
-  assert.match(curl, /curl --parallel --fail --create-dirs --config -/)
-  assert.ok(curl.includes('http://minio:9000'))
+  assert.match(curl.command, /curl --parallel --fail --create-dirs --config -/)
+  assert.ok(!curl.command.includes('http://minio:9000'))
+  assert.ok(curl.stdin)
+  assert.ok(curl.stdin.byteLength > 128 * 1024)
+  assert.ok(curl.stdin.toString('utf8').includes('http://minio:9000'))
 })
 

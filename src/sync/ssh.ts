@@ -215,6 +215,7 @@ export function createSshTarget(options: SshTargetOptions): SshTarget {
       const nonce = randomBytes(16).toString('hex')
       const run = await runSsh({
         script: remoteExecScript({ root, command: cmd, timeoutMs, nonce }),
+        ...(execOptions.stdin === undefined ? {} : { stdin: execOptions.stdin }),
         timeoutMs: timeoutMs + LOCAL_TIMEOUT_SLACK_MS,
       })
       const reported = parseExecSentinel(run.stdout.toString('utf8'), nonce)
