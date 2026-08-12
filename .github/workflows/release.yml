@@ -1,7 +1,7 @@
 name: Release
 
 # Publishing is tag-driven and gated. `v1.2.3` publishes the core package;
-# `s3-v1.2.3` publishes `@tuddofs/s3`. Nothing publishes from a branch, and no
+# `s3-v1.2.3` publishes `@tuddo/s3`. Nothing publishes from a branch, and no
 # job publishes anything its gates did not just prove.
 #
 # The gates are the ones the README's versioning section names: format, lint,
@@ -150,7 +150,7 @@ jobs:
         run: docker rm --force tuddofs-s3-release
 
   s3:
-    name: Publish @tuddofs/s3
+    name: Publish @tuddo/s3
     if: startsWith(github.ref, 'refs/tags/s3-v') || github.event.inputs.package == 's3'
     runs-on: ubuntu-latest
     env:
@@ -175,7 +175,7 @@ jobs:
           tagged="${GITHUB_REF_NAME#s3-v}"
           declared="$(node -p "require('./packages/s3/package.json').version")"
           if [ "$tagged" != "$declared" ]; then
-            echo "tag $GITHUB_REF_NAME does not match @tuddofs/s3 version $declared" >&2
+            echo "tag $GITHUB_REF_NAME does not match @tuddo/s3 version $declared" >&2
             exit 1
           fi
       - name: Check formatting
@@ -201,13 +201,13 @@ jobs:
       - name: Adapter conformance suite against MinIO
         run: npm run test:s3
       - name: Publish dry run
-        run: npm publish --workspace @tuddofs/s3 --dry-run --ignore-scripts
+        run: npm publish --workspace @tuddo/s3 --dry-run --ignore-scripts
       # Keeps its scripts: the package's own `prepublishOnly` re-runs the
       # adapter's build and conformance suite against the MinIO still running
       # below, which is what a manual publish from a laptop also gets.
       - name: Publish
         if: startsWith(github.ref, 'refs/tags/s3-v') && github.event.inputs.dry-run != 'true'
-        run: npm publish --workspace @tuddofs/s3 --provenance --access public
+        run: npm publish --workspace @tuddo/s3 --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
       - name: Stop MinIO

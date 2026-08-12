@@ -7,7 +7,7 @@ Spec: `../architecture.md` §8.4, §10 rule 3 (core ships no storage SDK)
 
 ## Goal
 
-A separate published package (placeholder name `@tuddofs/s3` — confirm before publish, spec §15.3) implementing the full `BlobStore` SPI — including `list`, `presignPut`, `presignGet` — against S3-compatible stores (AWS, MinIO `forcePathStyle`, R2). The SPI's first complete external implementation is what proves the contract.
+A separate published package (settled name `@tuddo/s3` under npm org `tuddo`, spec §15.3) implementing the full `BlobStore` SPI — including `list`, `presignPut`, `presignGet` — against S3-compatible stores (AWS, MinIO `forcePathStyle`, R2). The SPI's first complete external implementation is what proves the contract.
 
 ## Scope
 

@@ -205,11 +205,11 @@ jobs:
       - name: Core package publish dry run
         run: npm publish --dry-run --ignore-scripts
       - name: S3 package publish dry run
-        run: npm publish --workspace @tuddofs/s3 --dry-run --ignore-scripts
+        run: npm publish --workspace @tuddo/s3 --dry-run --ignore-scripts
       - name: Pack S3 package
         id: pack
         run: |
-          filename="$(npm pack --workspace @tuddofs/s3 --pack-destination "$RUNNER_TEMP" --json | node -e "let s='';process.stdin.on('data', d => s += d).on('end', () => process.stdout.write(JSON.parse(s)[0].filename))")"
+          filename="$(npm pack --workspace @tuddo/s3 --pack-destination "$RUNNER_TEMP" --json | node -e "let s='';process.stdin.on('data', d => s += d).on('end', () => process.stdout.write(JSON.parse(s)[0].filename))")"
           tarball="$RUNNER_TEMP/$filename"
           echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
       - name: Install packed S3 package in a scratch project
@@ -221,4 +221,4 @@ jobs:
           cd "$scratch"
           npm init --yes
           npm install "$TUDDOFS_TARBALL"
-          node --input-type=module -e "const pkg = await import('@tuddofs/s3'); if (typeof pkg.S3BlobStore !== 'function') throw new Error('S3BlobStore export missing'); const kit = await import('@tuddofs/s3/conformance'); if (typeof kit.defineBlobStoreConformanceSuite !== 'function') throw new Error('conformance export missing')"
+          node --input-type=module -e "const pkg = await import('@tuddo/s3'); if (typeof pkg.S3BlobStore !== 'function') throw new Error('S3BlobStore export missing'); const kit = await import('@tuddo/s3/conformance'); if (typeof kit.defineBlobStoreConformanceSuite !== 'function') throw new Error('conformance export missing')"

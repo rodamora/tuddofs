@@ -46,7 +46,7 @@ Non-goals: changing capture phases or the slot machinery; multipart; retry polic
 - Gate on the rebased tree: format:check, lint, typecheck, build, 94 unit + 2 adapter unit,
   156 integration (1 skipped without an S3 endpoint), 4 MinIO — all green.
 
-Noted while rebasing, not fixed here: `@tuddofs/s3` (merged as `7e8a6c1`) implements no
+Noted while rebasing, not fixed here: `@tuddo/s3` (merged as `7e8a6c1`) implements no
 `copy`, so §8.1 `writeStream` cannot promote a quarantine object with it. The §8.2 capture
 path is unaffected — S3 enforces `x-amz-checksum-sha256`, so it takes the enforcing arm and
 never needs a copy — but the adapter's own SPI coverage has a hole.
