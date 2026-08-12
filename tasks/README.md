@@ -44,4 +44,4 @@ flowchart LR
 | [s3-session-streaming](s3-session-streaming.md) | S3          | done   | —                                  |
 | [s3-capture-blobs](s3-capture-blobs.md)         | S3          | done   | s1-sync-core                       |
 | [s3-s3-adapter](s3-s3-adapter.md)               | S3          | done   | —                                  |
-| [s4-hardening](s4-hardening.md)                 | S4          | open   | everything above                   |
+| [s4-hardening](s4-hardening.md)                 | S4          | done   | everything above                   |

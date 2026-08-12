@@ -9,20 +9,39 @@
  *
  * The gate is intentionally indiscriminate: it discovers blocks rather than
  * naming them, so a new example cannot be added outside it.
+ *
+ * It also holds the other half of the documented contract that no compiler
+ * sees on its own: the host guide's error-recovery table has to name every
+ * error class the package exports, or a host switching on the class meets one
+ * the document never mentioned.
  */
 import assert from 'node:assert/strict'
 import { readFile, rm, writeFile } from 'node:fs/promises'
-import { dirname, join } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 
 import ts from 'typescript'
+
+import * as publicApi from '../index.js'
+import * as internalApi from '../internal.js'
 
 const ROOT = dirname(dirname(dirname(fileURLToPath(import.meta.url))))
 
 /** Documents whose TypeScript blocks are part of the published contract. */
 const DOCUMENTS = ['README.md', 'docs/host-guide.md', 'packages/s3/README.md'] as const
 
+/**
+ * No `paths` mapping, deliberately. The examples resolve `tuddofs`,
+ * `tuddofs/internal`, and `@tuddofs/s3` exactly the way a consumer does —
+ * through each package's `exports` map, into the BUILT `.d.ts` files. A
+ * mapping onto `src/*.ts` would compile every example against code no consumer
+ * can import: it stays green when the exports map loses a subpath, and it
+ * never sees a declaration the emitter widened or dropped.
+ *
+ * This requires `npm run build` first. The precondition test below says so out
+ * loud rather than letting a stale `dist/` surface as "cannot find module".
+ */
 const COMPILER_OPTIONS: ts.CompilerOptions = {
   target: ts.ScriptTarget.ES2022,
   module: ts.ModuleKind.NodeNext,
@@ -32,13 +51,27 @@ const COMPILER_OPTIONS: ts.CompilerOptions = {
   skipLibCheck: true,
   esModuleInterop: true,
   types: ['node'],
-  baseUrl: ROOT,
-  paths: {
-    tuddofs: ['./src/index.ts'],
-    'tuddofs/internal': ['./src/internal.ts'],
-    '@tuddofs/s3': ['./packages/s3/src/index.ts'],
-    '@tuddofs/s3/conformance': ['./packages/s3/src/conformance.ts'],
-  },
+}
+
+/** A published subpath: the specifier a consumer writes, and the declaration it must land on. */
+interface EntryPoint {
+  readonly specifier: string
+  readonly declaration: string
+}
+
+/** Every subpath `packageDir`'s manifest publishes, read from its `exports` map. */
+async function publishedEntryPoints(packageDir: string): Promise<EntryPoint[]> {
+  const manifest = JSON.parse(await readFile(join(ROOT, packageDir, 'package.json'), 'utf8')) as {
+    name: string
+    exports: Record<string, { types?: string }>
+  }
+  return Object.entries(manifest.exports).map(([subpath, target]) => {
+    assert.ok(target.types, `${manifest.name} publishes ${subpath} without a "types" entry`)
+    return {
+      specifier: subpath === '.' ? manifest.name : `${manifest.name}/${subpath.replace(/^\.\//u, '')}`,
+      declaration: resolve(ROOT, packageDir, target.types),
+    }
+  })
 }
 
 interface DocBlock {
@@ -95,3 +128,35 @@ for (const document of DOCUMENTS) {
     })
   }
 }
+
+test('every published subpath resolves to a built declaration', async () => {
+  const entryPoints = [...(await publishedEntryPoints('.')), ...(await publishedEntryPoints('packages/s3'))]
+  assert.ok(entryPoints.length > 0, 'no published subpaths found; the drift gate would compile against nothing')
+  for (const { specifier, declaration } of entryPoints) {
+    assert.ok(
+      ts.sys.fileExists(declaration),
+      `${specifier} publishes ${declaration}, which does not exist — run \`npm run build\` before the docs gate`,
+    )
+    // Resolved the way a consumer resolves it: through the exports map, from a
+    // file sitting where the examples above are compiled.
+    const resolved = ts.resolveModuleName(specifier, join(ROOT, 'docs-example.ts'), COMPILER_OPTIONS, ts.sys)
+    assert.equal(
+      resolved.resolvedModule?.resolvedFileName,
+      declaration,
+      `${specifier} does not resolve to its published declaration`,
+    )
+  }
+})
+
+test('docs/host-guide.md error table covers every exported error class', async () => {
+  const markdown = await readFile(join(ROOT, 'docs/host-guide.md'), 'utf8')
+  const section = /\n## Error taxonomy and recovery\n([\s\S]*?)\n## /u.exec(markdown)?.[1]
+  assert.ok(section, 'docs/host-guide.md no longer has an "Error taxonomy and recovery" section')
+  const documented = [...section.matchAll(/^\|\s*`([A-Za-z]+Error)`/gmu)].map(match => match[1]).sort()
+  // Both surfaces a host catches from: the Tier-1 classes, plus the internal
+  // subpath's `SyncTargetError` for anyone running the engine.
+  const exported = [...new Set([...Object.keys(publicApi), ...Object.keys(internalApi)])]
+    .filter(name => name.endsWith('Error'))
+    .sort()
+  assert.deepEqual(documented, exported, 'the error-recovery table and the exported error classes have drifted')
+})

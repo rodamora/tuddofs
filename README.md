@@ -311,7 +311,7 @@ Three of those rows are the load-bearing ones:
 
 While the package is `0.x`, semver's pre-1.0 rule applies on top of the table: everything marked _major_ ships as a minor bump, and everything marked _minor_ or _patch_ ships as a patch bump.
 
-Publishing runs from a tag, and the gates below run before `npm publish`: format, lint, typecheck, build, the Tier-1 export-set test (`npm run gate:surface`), the documentation compilation gate (`npm run gate:docs`), the full test suite with skips treated as failures, and the packed-tarball smoke test. `npm publish` also re-runs the build and those two gates through `prepublishOnly`, so a manual publish from a laptop cannot skip them.
+Publishing runs from a tag, and `.github/workflows/release.yml` runs every gate before `npm publish`: format, lint, typecheck, build, the Tier-1 export-set test (`npm run gate:surface`), the documentation compilation gate (`npm run gate:docs`), the units and the S3 adapter suite (`npm test`), the PostgreSQL integration suite, the MinIO streaming acceptance test, the SSH target suite — all four suites with `TUDDOFS_NO_SKIPS=1`, so a skip is a failure — and the clean-container quickstart proof against the packed tarball. The dry-run pack runs with `--ignore-scripts`, since those gates just ran; the real `npm publish` keeps its scripts, so `prepublishOnly` re-runs the build, both gates, and `npm test` in the process that uploads, and a manual publish from a laptop cannot skip them. `@tuddofs/s3` has its own `prepublishOnly` covering the same ground for that package.
 
 ## Integration tests
 

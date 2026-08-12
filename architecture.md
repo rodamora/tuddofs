@@ -369,7 +369,7 @@ Method (both suites): warm up, run N times, judge the BEST run — a budget desc
 | Session read            | 1–3 ms (heads index; no per-read provider I/O)                                  | 0.41 ms         | target-independent      |
 | Session write           | 8–20 ms visible (mirror write off the critical path)                            | 1.61 ms         | 3.59 ms                 |
 | Exec capture            | 0 visible (async; one exec per cycle)                                           | 0.02 ms trigger | 0.04 ms trigger         |
-| Warm re-acquire         | ≤ 0.1 s local; one-to-two remote execs (asserted ≤ 1 s) on a network target      | 4.54 ms         | 244 ms                  |
+| Warm re-acquire         | ≤ 0.1 s local; one-to-two remote execs (asserted: ≤ 2 execs, 0 transfers, ≤ 1 s) on a network target      | 4.54 ms         | 244 ms                  |
 | Fork / merge            | 10–100 ms once per mount / < 1 s at 100 paths                                   | 1.63 / 9.17 ms  | target-independent      |
 | One remote exec         | assumption row: 150–500 ms on a real network (asserted ≤ 500 ms on the fixture)  | —               | 115 ms                  |
 
@@ -419,7 +419,7 @@ Ambiguity or contradiction in this spec → stop, name the confusion, ask. Do no
 1. **Hash canonicalization drift** — mitigated by append-only golden tests pinning exact preimage bytes forever.
 2. **SyncTarget seam leaks provider assumptions** — mitigated by building local + SSH before any provider target; core never imports an SDK.
 3. **Presign contract divergence across stores** (checksum-header enforcement varies) — mitigated by the quarantine-key fallback (§8.2) and MinIO-based contract tests.
-4. **Perf budgets are estimates until measured** — CLOSED at S4. Every §12 row is measured and asserted: the local target since S1, the target-touching rows over a real network target since S2, both consolidated into the §12 table with the machine and method named. The numbers stand as regressions in CI, and the one row the network changes (warm re-acquire) is asserted in remote execs rather than in a wall-clock figure that only holds on loopback.
+4. **Perf budgets are estimates until measured** — CLOSED at S4. Every §12 row is measured and asserted: the local target since S1, the target-touching rows over a real network target since S2, both consolidated into the §12 table with the machine and method named. The numbers stand as regressions in CI, and the one row the network changes (warm re-acquire) is asserted as a remote-exec count — at most two execs and zero file transfers, counted at the §7.1 seam — and not only as a wall-clock figure that a fast loopback would satisfy on its own.
 
 ## 15. Decisions, closed
 

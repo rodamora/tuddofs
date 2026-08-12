@@ -66,7 +66,7 @@
     "format": "prettier --write 'src/**/*.ts' 'scripts/**/*.ts' 'packages/s3/src/**/*.ts' 'packages/s3/test/**/*.ts' 'fixtures/**/*.mjs' '*.mjs' '*.json' 'packages/s3/*.json' 'README.md' 'docs/**/*.md' 'packages/s3/README.md'",
     "format:check": "prettier --check 'src/**/*.ts' 'scripts/**/*.ts' 'packages/s3/src/**/*.ts' 'packages/s3/test/**/*.ts' 'fixtures/**/*.mjs' '*.mjs' '*.json' 'packages/s3/*.json' 'README.md' 'docs/**/*.md' 'packages/s3/README.md'",
     "lint": "eslint .",
-    "prepublishOnly": "npm run build:core && npm run gate:surface && npm run gate:docs && npm test"
+    "prepublishOnly": "npm run build && npm run gate:surface && npm run gate:docs && npm test"
   },
   "devDependencies": {
     "@aws-sdk/client-s3": "^3.1107.0",

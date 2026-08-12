@@ -307,22 +307,23 @@ The engine (`tuddofs/internal`) materializes governed mounts onto a real disk. S
 
 Every exported error maps to one recovery. Switch on the class, never on the message.
 
-| Error                        | Meaning                                                        | Host recovery                                                        |
-| ---------------------------- | -------------------------------------------------------------- | -------------------------------------------------------------------- |
-| `PermissionDeniedError`      | Live grant denied the operation                                | Surface to the user; do not retry                                    |
-| `GrantResolverError`         | Resolver threw, timed out, or returned garbage — failed CLOSED | Alert; this is your authz path failing, not a filesystem fault       |
-| `PreconditionFailedError`    | `ifSha` did not match the current head                         | Re-read and re-apply, or report a conflict to the caller             |
-| `EditMatchError`             | `edit()` matched zero or several times                         | Feed the match count back to the agent; do not fall back to `write`  |
-| `InvalidPathError`           | Path rejected, or a tree-coherence collision                   | Fix the path; nothing "repairs" it. Delete the colliding entry first |
-| `InvalidMountKeyError`       | Mount key outside the §4.4 charset                             | Fix the mount table; keys are embedded in refs and mirror paths      |
-| `NotFoundError`              | Path, commit, or mount not reachable from this session         | Treat as absent; it is also the safe answer for "exists elsewhere"   |
-| `BranchSettledError`         | The session's branch is merged, abandoned, or conflicted       | Open a new session — the message says so; never a dead end           |
-| `MergePendingApprovalError`  | A staged branch needs a `direct` approver                      | Route to approval; re-run `merge({ approver })`                      |
-| `RefConflictError`           | CAS ref update lost its races                                  | Retry the operation; persistent means write contention to fix        |
-| `SchemaDriftError`           | Deployed `tuddo_*` schema differs from the pinned DDL          | Stop the rollout. Do not hand-patch tables                           |
-| `StorageError`               | Object store failed or returned inconsistent bytes             | Retry, then alert; `verify()` will show the blast radius             |
-| `InvariantError`             | The package caught itself violating its own model              | File a bug with the context object; do not retry                     |
-| `SyncTargetError` (internal) | A target op failed — probe, scan, stamp, read                  | Re-materialize the workspace or replace the target                   |
+| Error                         | Meaning                                                              | Host recovery                                                                           |
+| ----------------------------- | -------------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
+| `PermissionDeniedError`       | Live grant denied the operation                                      | Surface to the user; do not retry                                                       |
+| `GrantResolverError`          | Resolver threw, timed out, or returned garbage — failed CLOSED       | Alert; this is your authz path failing, not a filesystem fault                          |
+| `PreconditionFailedError`     | `ifSha` did not match the current head                               | Re-read and re-apply, or report a conflict to the caller                                |
+| `EditMatchError`              | `edit()` matched zero or several times                               | Feed the match count back to the agent; do not fall back to `write`                     |
+| `InvalidPathError`            | Path rejected, or a tree-coherence collision                         | Fix the path; nothing "repairs" it. Delete the colliding entry first                    |
+| `InvalidCommitTimestampError` | Commit timestamp is not canonical ISO-8601 UTC millisecond precision | Fix the injected clock; the §4.2 preimage is pinned forever and accepts no other format |
+| `InvalidMountKeyError`        | Mount key outside the §4.4 charset                                   | Fix the mount table; keys are embedded in refs and mirror paths                         |
+| `NotFoundError`               | Path, commit, or mount not reachable from this session               | Treat as absent; it is also the safe answer for "exists elsewhere"                      |
+| `BranchSettledError`          | The session's branch is merged, abandoned, or conflicted             | Open a new session — the message says so; never a dead end                              |
+| `MergePendingApprovalError`   | A staged branch needs a `direct` approver                            | Route to approval; re-run `merge({ approver })`                                         |
+| `RefConflictError`            | CAS ref update lost its races                                        | Retry the operation; persistent means write contention to fix                           |
+| `SchemaDriftError`            | Deployed `tuddo_*` schema differs from the pinned DDL                | Stop the rollout. Do not hand-patch tables                                              |
+| `StorageError`                | Object store failed or returned inconsistent bytes                   | Retry, then alert; `verify()` will show the blast radius                                |
+| `InvariantError`              | The package caught itself violating its own model                    | File a bug with the context object; do not retry                                        |
+| `SyncTargetError` (internal)  | A target op failed — probe, scan, stamp, read                        | Re-materialize the workspace or replace the target                                      |
 
 Merge conflicts are **not** exceptions: `merge()` returns `{ status: 'conflicts', conflicts }` as data, and resolving them is host UX (§15.2).
 

@@ -171,18 +171,95 @@ test('§12 [ssh] exec capture costs nothing visible', async () => {
   assert.equal(await session.mount(mount).read('/a.md'), 'triggered')
 })
 
+/** How many of each §7.1 seam verb one operation issued. */
+interface VerbCounts {
+  exec: number
+  readFile: number
+  writeFile: number
+  mkdir: number
+}
+
+/**
+ * A target that counts the verbs the engine issues, so a shape claim can be
+ * asserted as a count instead of inferred from a stopwatch. Wall clock alone
+ * cannot tell "one probe" from "a reseed that happened to be fast on
+ * loopback"; the counts can.
+ */
+function counting(target: SyncTarget): { readonly target: SyncTarget; readonly counts: VerbCounts; reset(): void } {
+  const counts = { exec: 0, readFile: 0, writeFile: 0, mkdir: 0 }
+  return {
+    counts,
+    reset() {
+      counts.exec = 0
+      counts.readFile = 0
+      counts.writeFile = 0
+      counts.mkdir = 0
+    },
+    target: {
+      exec: (cmd, opts) => {
+        counts.exec += 1
+        return target.exec(cmd, opts)
+      },
+      readFile: path => {
+        counts.readFile += 1
+        return target.readFile(path)
+      },
+      writeFile: (path, bytes) => {
+        counts.writeFile += 1
+        return target.writeFile(path, bytes)
+      },
+      mkdir: path => {
+        counts.mkdir += 1
+        return target.mkdir(path)
+      },
+    },
+  }
+}
+
 test('§12 [ssh] warm re-acquire is one liveness probe, not a reseed', async () => {
-  const { root, target } = await freshWorkspace()
+  const { root, target: real } = await freshWorkspace()
+  const probe = counting(real)
+  const target = probe.target
   const session = await openSession('budget-ssh-warm')
-  for (let index = 0; index < 25; index += 1) {
+  const files = 25
+  for (let index = 0; index < files; index += 1) {
     await session.mount(mount).write(`/file-${index}.md`, `body ${index}`)
   }
   await createSyncEngine({ session, target, root }).materialize()
+  const cold = { ...probe.counts }
+  console.log(`§12 [ssh] cold hydrate verbs: ${JSON.stringify(cold)}`)
+  // The contrast that makes the warm assertions below mean something: a cold
+  // hydrate of this workspace really does transfer every file — plus the
+  // hydration marker it writes last — so "zero transfers" is a property of the
+  // warm path and not of the counter.
+  assert.equal(
+    cold.writeFile,
+    files + 1,
+    `cold hydrate must transfer ${files} files plus the hydration marker, counted ${cold.writeFile}`,
+  )
 
-  const elapsed = await best('warm re-acquire', () => createSyncEngine({ session, target, root }).materialize())
-  // This is the row where the network shows up, and the only honest budget is
-  // "one remote exec, not 25 file transfers". A reseed of this workspace would
-  // cost dozens of round trips; the ceiling is set well below that and well
-  // above one probe.
+  const worst = { exec: 0, readFile: 0, writeFile: 0, mkdir: 0 }
+  const elapsed = await best('warm re-acquire', async () => {
+    probe.reset()
+    await createSyncEngine({ session, target, root }).materialize()
+    for (const verb of ['exec', 'readFile', 'writeFile', 'mkdir'] as const) {
+      worst[verb] = Math.max(worst[verb], probe.counts[verb])
+    }
+  })
+  console.log(`§12 [ssh] warm re-acquire verbs (worst run): ${JSON.stringify(worst)}`)
+
+  // The shape claim, asserted as a count rather than as a latency: §12 budgets
+  // warm re-acquire at one-to-two remote execs — the GNU-coreutils probe and
+  // the workspace-state probe (§7.3 phase 1 steps 1 and 3) — and the index is
+  // seeded from heads, so nothing is transferred. A reseed of this workspace
+  // would be `files` writeFile round trips; that is the regression this catches
+  // on a fast loopback where the wall clock would not.
+  assert.ok(worst.exec <= 2, `warm re-acquire is one-to-two remote execs, measured ${worst.exec}`)
+  assert.equal(worst.writeFile, 0, `warm re-acquire must transfer nothing, measured ${worst.writeFile} writes`)
+  assert.equal(worst.readFile, 0, `warm re-acquire must read nothing back, measured ${worst.readFile} reads`)
+  assert.equal(worst.mkdir, 0, `warm re-acquire must create no directories, measured ${worst.mkdir}`)
+
+  // And the wall clock stays the coarse backstop: well below a reseed, well
+  // above one probe on a loopback fixture.
   assert.ok(elapsed <= 1_000, `warm re-acquire must stay near one remote exec, measured ${elapsed.toFixed(2)} ms`)
 })

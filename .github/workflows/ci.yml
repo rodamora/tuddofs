@@ -173,6 +173,11 @@ jobs:
           cache: npm
       - name: Install dependencies
         run: npm ci
+      # The docs gate compiles every documented example against the BUILT
+      # declarations, through the packages' exports maps, exactly as a consumer
+      # resolves them — so the build has to come first.
+      - name: Build
+        run: npm run build
       - name: Documentation compilation gate
         run: npm run gate:docs
       # The acceptance claim for the documents: a consumer with only README.md
